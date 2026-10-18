@@ -1,0 +1,25 @@
+{
+  "name": "burialnx",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental independent Switch homebrew loader",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "test": "node tools/test.mjs",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "nacp": {
+    "id": "01a144e6a07a0000",
+    "title": "BurialNX",
+    "author": "BurialNX contributors",
+    "userAccountSaveDataSize": "16777216"
+  },
+  "devDependencies": {
+    "@nx.js/nro": "1.0.0-beta.7",
+    "esbuild": "0.25.12",
+    "jpeg-js": "0.4.4",
+    "pngjs": "7.0.0"
+  }
+}

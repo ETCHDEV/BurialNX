@@ -1,0 +1,14 @@
+node_modules/
+romfs/main.js
+romfs/main.js.map
+*.nro
+*.nsp
+*.log
+.DS_Store
+Game/
+games/
+saves/
+mods/
+# Supply artwork locally only after confirming redistribution rights.
+icon.jpg
+icon.png
