@@ -1,7 +1,6 @@
 # BurialNX
 
-An optimized Nintendo Switch homebrew runtime environment for **The Coffin of
-Andy and Leyley** (TCOAAL), built around nx.js and a targeted RPG Maker MV
+An optimized Nintendo Switch homebrew runtime environment for TCOAAL, built around nx.js and a targeted RPG Maker MV
 compatibility host.
 
 ## Project Scope & Compatibility
