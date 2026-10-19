@@ -17,6 +17,8 @@ test('custom NRO icons: fallback, PNG, JPEG, priority, and invalid input', async
     const png = new PNG({ width: 2, height: 1 });
     png.data.set([255, 0, 0, 255, 0, 255, 0, 0]);
     await writeFile(join(root, 'icon.png'), PNG.sync.write(png));
+    await prepareIcon(root, staging, { defaultIcon: true });
+    await assert.rejects(readFile(join(staging, 'icon.jpg')), { code: 'ENOENT' });
     await prepareIcon(root, staging);
     const converted = jpeg.decode(await readFile(join(staging, 'icon.jpg')), { useTArray: true });
     assert.equal(converted.width, 256);

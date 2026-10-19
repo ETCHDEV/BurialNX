@@ -16,6 +16,21 @@ export function scriptPlan(html: string): string[] {
 	return paths;
 }
 
+/** Start the normal MV entry point, or use its boot scene if no handler exists. */
+export function startGame(runtime: any): 'onload' | 'already-started' | 'scene-boot' {
+	if (typeof runtime.onload === 'function') {
+		runtime.onload.call(runtime, new Event('load'));
+		return 'onload';
+	}
+	const manager = runtime.SceneManager;
+	if (manager?._scene || manager?._nextScene) return 'already-started';
+	if (typeof manager?.run !== 'function' || typeof runtime.Scene_Boot !== 'function') {
+		throw new Error('Game has no load handler or usable Scene_Boot');
+	}
+	manager.run(runtime.Scene_Boot);
+	return 'scene-boot';
+}
+
 /** Compute a centered aspect-preserving destination on the Switch screen. */
 export function viewport(width: number, height: number, outputWidth: number, outputHeight: number) {
 	if (![width, height, outputWidth, outputHeight].every((n) => Number.isFinite(n) && n > 0)) return null;

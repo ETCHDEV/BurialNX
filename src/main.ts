@@ -1,41 +1,57 @@
 import { FolderBrowser } from './folders';
 import { gameAssets } from './game-assets';
-import { scriptPlan } from './runtime-plan';
+import { scriptPlan, startGame } from './runtime-plan';
 import { createBrowserHost } from './browser-host';
 import { installGameCompatibility, languageTable, prepareGameScript, registerFonts } from './game-compat';
 import { PauseMenu } from './menu';
-import { parseSelection, startupSelection, type GameSelection, type SaveLocation } from './settings';
+import { gameSaveFolders, parseSelection, startupSelection, type GameSelection, type SaveLocation } from './settings';
 import { needsPngFix } from './indexed-png';
-import { importSteamSaves, installSdSaves, safeSaveFolder } from './saves';
+import { ensureGameSaveFolder, hasSteamSaveData, importSteamSaves, installSdSaves, safeGameSaveFolder, safeSaveFolder } from './saves';
+import { installMapPrefetch, MapPrefetcher } from './map-prefetch';
 
 declare const __DEBUG__: boolean;
+const debugLines: string[] = [];
+const runtime = globalThis as any;
+const settingsPath = 'sdmc:/switch/burialnx/settings.json';
+const logsPath = 'sdmc:/switch/burialnx/LOGS';
+const hostLogPath = `${logsPath}/native-host.log`;
+// Start diagnostics before accessing the screen or enumerating the SD card.
+try { (Switch as any).mkdirSync?.('sdmc:/switch/burialnx'); } catch { /* report write failures later */ }
+if (__DEBUG__) {
+	try { (Switch as any).mkdirSync?.(logsPath); } catch { /* diagnostics are optional */ }
+	log(`--- BurialNX debug session ${new Date().toISOString()} ---`);
+	log('Initializing screen');
+}
 const ctx = screen.getContext('2d')!;
 const menu = new PauseMenu(__DEBUG__);
-const debugLines: string[] = [];
+if (__DEBUG__) log('Reading SD card folders');
 let browser = new FolderBrowser(Switch, 'game');
 let selectedGame: string | undefined;
 let selectedMod: string | null | undefined;
 let sharedSaves = false;
 let waitForRelease = false;
-let phase: 'picker' | 'notice' | 'save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' = 'picker';
+let phase: 'picker' | 'notice' | 'save-choice' | 'game-save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' = 'picker';
 let pickerPurpose: 'game' | 'startup-mod' | 'menu-mod' | 'startup-saves' | 'menu-saves' = 'game';
 let saveLocation: SaveLocation | undefined;
 let choiceFromMenu = false, importRequested = false;
 let message = '';
 let host: ReturnType<typeof createBrowserHost> | undefined;
+let mapPrefetch: MapPrefetcher | undefined;
 let frames = 0, sampleStart = 0, fps = 0;
 let lastFrame = 0, lastMemoryCheck = 0;
 let fit = true;
-const runtime = globalThis as any;
-const settingsPath = 'sdmc:/switch/burialnx/settings.json';
-const logsPath = 'sdmc:/switch/tcoaal/LOGS';
-const hostLogPath = `${logsPath}/native-host.log`;
-// Keep all loader-created files outside the selected game directory.
-try { (Switch as any).mkdirSync?.('sdmc:/switch/burialnx'); } catch { /* report write failures later */ }
-if (__DEBUG__) try { (Switch as any).mkdirSync?.(logsPath); } catch { /* diagnostics are optional */ }
 let saved: GameSelection | null = null;
 let settingsValid = true;
-let previousButtons: boolean[] = [];
+const previousButtons: boolean[] = Array(16).fill(false);
+function validSaveLocation(location: SaveLocation, root: string, mod: string | null): boolean {
+	if (location.kind === 'switch') return true;
+	if (location.kind === 'game' && !safeGameSaveFolder(location.folder, root, mod)) return false;
+	if (location.kind === 'sd' && !safeSaveFolder(location.folder, root, mod)) return false;
+	try {
+		const entry = Switch.statSync(location.folder);
+		return entry ? (entry.mode & 0o170000) === 0o040000 : location.kind === 'game';
+	} catch { return false; }
+}
 const debugSettingsPath = 'sdmc:/switch/burialnx/debug-settings.json';
 let directScreen = true, directNext = true, debugSettingsValid = true;
 if (__DEBUG__) try {
@@ -56,7 +72,7 @@ try {
 			sharedSaves = selected.sharedSaves;
 			selectedMod = selected.mod || null;
 			saveLocation = selected.saves;
-			if (saveLocation?.kind === 'sd' && (!safeSaveFolder(saveLocation.folder, selected.root, selected.mod || null) || (Switch.statSync(saveLocation.folder)?.mode! & 0o170000) !== 0o040000)) saveLocation = undefined;
+			if (saveLocation && !validSaveLocation(saveLocation, selected.root, selected.mod || null)) saveLocation = undefined;
 			phase = saveLocation ? 'loading' : 'save-choice';
 		}
 	}
@@ -76,16 +92,24 @@ function startOrChooseSaves() {
 }
 function chooseSaves(location: SaveLocation) {
 	if (!selectedGame) return;
-	if (location.kind === 'sd' && !safeSaveFolder(location.folder, selectedGame, selectedMod || null)) {
-		browser.message = 'Choose a folder outside the game and mod folders.'; return;
+	if (!validSaveLocation(location, selectedGame, selectedMod || null)) {
+		message = 'Save folder is unavailable or overlaps the mod.'; waitForRelease = true; phase = 'notice'; return;
 	}
 	const pendingMod = choiceFromMenu && saved?.root === selectedGame ? saved.mod || null : selectedMod || null;
-	if (location.kind === 'sd' && !safeSaveFolder(location.folder, selectedGame, pendingMod)) { browser.message = 'Save folder overlaps the selected mod.'; return; }
+	if (!validSaveLocation(location, selectedGame, pendingMod)) { message = 'Save folder overlaps the selected mod.'; waitForRelease = true; phase = 'notice'; return; }
 	if (!remember({ ...currentSelection(location), mod: pendingMod })) { message = 'Could not save settings; storage unchanged.'; waitForRelease = true; phase = 'notice'; return; }
 	if (choiceFromMenu) {
 		message = 'Save location saved. Restart the loader to apply it.'; phase = 'notice';
 	} else {
-		saveLocation = location; phase = 'import-confirm';
+		saveLocation = location;
+		if (location.kind === 'game') { importRequested = false; waitForRelease = true; void launch(); return; }
+		// No index means there is nothing to import. A filesystem error is not
+		// proof of absence, so keep the prompt if checking fails.
+		let hasSource = true;
+		try { hasSource = hasSteamSaveData(Switch, selectedGame); }
+		catch (error) { log(`Could not check Steam saves: ${String(error)}`); }
+		if (hasSource) phase = 'import-confirm';
+		else { importRequested = false; void launch(); }
 	}
 	waitForRelease = true;
 }
@@ -127,15 +151,35 @@ function hud() {
 function fail(error: unknown) {
 	const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack || ''}` : String(error);
 	log(`FAILURE: ${detail}`);
+	if (phase === 'error') return;
 	snapshotRuntimeLog();
 	message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 	phase = 'error';
+	// Stop game frames from painting over the loader's diagnostic screen.
+	try { runtime.SceneManager?.stop?.(); } catch { /* keep the original error */ }
+}
+function failRequest(error: Error, responseText: string) {
+	fail(error);
+	// A digest compares what the game received without logging or sharing its
+	// contents. Limit the allocation and keep this diagnostic debug-only.
+	if (__DEBUG__ && responseText && responseText.length <= 2 * 1024 * 1024) try {
+		void crypto.subtle.digest('SHA-256', new TextEncoder().encode(responseText)).then((digest) => {
+			const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+			log(`Failed response UTF-8 SHA-256: ${hash}`);
+		}).catch((reason) => log(`Could not fingerprint failed response: ${String(reason)}`));
+	} catch (reason) { log(`Could not fingerprint failed response: ${String(reason)}`); }
 }
 async function launch() {
 	phase = 'loading';
 	try {
 		if (!selectedGame) throw new Error('No game selected');
-		const rawAssets = gameAssets(selectedGame, selectedMod || null, { read: (path) => Switch.readFile(path) });
+		const rawAssets = gameAssets(selectedGame, selectedMod || null, { async read(path) {
+			const bytes = await Switch.readFile(path);
+			// Logical MV names can resolve to hashed on-disk names. Record the
+			// actual source so damaged or conflicting files can be identified.
+			if (__DEBUG__ && bytes && /\/data\//i.test(path)) log(`Read game data: ${path} (${bytes.byteLength} bytes)`);
+			return bytes;
+		} });
 		const assets = { async read(path: string) {
 			const result = await rawAssets.read(path);
 			if (result === null) log(`Asset missing: ${path}`);
@@ -146,13 +190,16 @@ async function launch() {
 		const scripts = scriptPlan(new TextDecoder().decode(index));
 		log(`Game: ${selectedGame}; mod: ${selectedMod || 'none'}; shared saves: ${sharedSaves}`);
 		const [language, , pngFix] = await Promise.all([languageTable(assets), registerFonts(assets, runtime), needsPngFix(log)]);
-		host = createBrowserHost(assets, prepareGameScript, log, pngFix, directScreen);
+		host = createBrowserHost(assets, prepareGameScript, log, pngFix, directScreen, failRequest);
 		for (const path of scripts) { log(`Loading ${path}`); await host.loadScript(path); }
 		await host.settled();
 		installGameCompatibility(runtime, selectedGame, sharedSaves, language, pngFix);
+		mapPrefetch = new MapPrefetcher(assets, log);
+		installMapPrefetch(runtime, mapPrefetch, log);
 		if (!saveLocation) throw new Error('No save location selected');
-		if (saveLocation.kind === 'sd') {
-			if (!safeSaveFolder(saveLocation.folder, selectedGame, selectedMod || null)) throw new Error('Save folder overlaps game or mod folder');
+		if (saveLocation.kind === 'sd' || saveLocation.kind === 'game') {
+			if (!validSaveLocation(saveLocation, selectedGame, selectedMod || null)) throw new Error('Invalid save folder');
+			if (saveLocation.kind === 'game') ensureGameSaveFolder(Switch, saveLocation.folder, selectedGame, selectedMod || null);
 			installSdSaves(runtime, Switch, saveLocation.folder);
 		}
 		if (importRequested) { const count = importSteamSaves(runtime, Switch, selectedGame, saveLocation); log(`Imported ${count} Steam save slots`); }
@@ -194,16 +241,16 @@ async function launch() {
 				return catchException.call(this, error);
 			};
 		}
-		if (typeof runtime.onload !== 'function') throw new Error('Game did not provide window.onload');
 		phase = 'game';
-		runtime.onload.call(runtime, new Event('load'));
-		log('Game started');
+		const startup = startGame(runtime);
+		log(`Game started: ${startup}`);
 	} catch (error) { fail(error); }
 }
 globalThis.addEventListener('error', ((event: ErrorEvent) => fail(event.error || event.message)) as EventListener);
 globalThis.addEventListener('unhandledrejection', ((event: PromiseRejectionEvent) => fail(event.reason)) as EventListener);
 
-let observedScene: any, sceneSince = 0, lastSceneReport = 0, snapshotScene: any;
+let observedScene: any, sceneSince = 0, lastSceneReport = 0;
+let snapshotScene: any = Symbol('no diagnostic snapshot yet');
 function diagnoseScene(now: number) {
 	if (!__DEBUG__) return;
 	const manager = runtime.SceneManager, scene = manager?._scene;
@@ -211,7 +258,7 @@ function diagnoseScene(now: number) {
 		observedScene = scene; sceneSince = lastSceneReport = now;
 		log(`Scene: ${scene?.constructor?.name || 'none'}`);
 	}
-	if (!scene || now - lastSceneReport < 8000) return;
+	if (now - lastSceneReport < 8000) return;
 	lastSceneReport = now;
 	if (scene !== snapshotScene) { snapshotScene = scene; snapshotRuntimeLog(); }
 	const waiting: string[] = [];
@@ -224,7 +271,7 @@ function diagnoseScene(now: number) {
 		}
 		if (waiting.length === 6) break;
 	}
-	log(`Scene status: ${scene.constructor?.name}, started=${!!manager._sceneStarted}, seconds=${Math.round((now - sceneSince) / 1000)}, fps=${fps.toFixed(1)}, map=${runtime.$gameMap?.mapId?.() ?? '?'}, mapData=${!!runtime.$dataMap}, error=${runtime.DataManager?._errorUrl || 'none'}, images=${waiting.join(',') || 'none'}`);
+	log(`Scene status: ${scene?.constructor?.name || 'none'}, next=${manager?._nextScene?.constructor?.name || 'none'}, started=${!!manager?._sceneStarted}, stopped=${!!manager?._stopped}, seconds=${Math.round((now - sceneSince) / 1000)}, fps=${fps.toFixed(1)}, map=${runtime.$gameMap?.mapId?.() ?? '?'}, mapData=${!!runtime.$dataMap}, error=${runtime.DataManager?._errorUrl || 'none'}, images=${waiting.join(',') || 'none'}`);
 }
 
 function frame(now: number) {
@@ -240,14 +287,20 @@ function frame(now: number) {
 						const previousMod = saved?.root === result ? saved.mod || null : null;
 						selectedMod = previousMod;
 						saveLocation = saved?.root === result ? saved.saves : undefined;
-						if (saveLocation?.kind === 'sd' && (!safeSaveFolder(saveLocation.folder, result, previousMod) || (Switch.statSync(saveLocation.folder)?.mode! & 0o170000) !== 0o040000)) saveLocation = undefined;
+						if (saveLocation && !validSaveLocation(saveLocation, result, previousMod)) saveLocation = undefined;
 						remember(currentSelection());
 						if (__DEBUG__) { browser = new FolderBrowser(Switch, 'mod'); pickerPurpose = 'startup-mod'; waitForRelease = true; }
 						else startOrChooseSaves();
-					} else if (pickerPurpose === 'startup-mod') { selectedMod = result; if (saveLocation?.kind === 'sd' && !safeSaveFolder(saveLocation.folder, selectedGame!, selectedMod)) saveLocation = undefined; startOrChooseSaves(); }
+					} else if (pickerPurpose === 'startup-mod') {
+						selectedMod = result;
+						if (saveLocation && !validSaveLocation(saveLocation, selectedGame!, selectedMod)) saveLocation = undefined;
+						// Debug users must be able to change storage even if the game
+						// cannot reach the in-game Minus menu.
+						choiceFromMenu = false; waitForRelease = true; phase = 'save-choice';
+					}
 					else if (pickerPurpose === 'menu-mod' && selectedGame) {
 						const pendingSaves = saved?.root === selectedGame ? saved.saves : saveLocation;
-						if (result && pendingSaves?.kind === 'sd' && !safeSaveFolder(pendingSaves.folder, selectedGame, result)) { browser.message = 'Mod folder contains the save folder.'; }
+						if (pendingSaves && !validSaveLocation(pendingSaves, selectedGame, result)) { browser.message = 'Mod overlaps or invalidates the save folder.'; }
 						else {
 						const ok = remember({ ...currentSelection(pendingSaves), mod: result });
 						message = ok ? 'Mod saved. Restart the loader to apply it.' : 'Could not save mod selection; settings unchanged.';
@@ -264,13 +317,21 @@ function frame(now: number) {
 				'Up/Down: highlight  A: open  B: parent  X: select', browser.mode === 'game' ? 'Y: select with old shared saves' : browser.mode === 'mod' ? 'Y: no mod' : 'B at SD root: cancel; choose a folder outside the game.', browser.message,
 				...browser.entries.slice(first, first + 12).map((name, index) => `${first + index === browser.selected ? '> ' : '  '}${name}/`)], true);
 		} else if (phase === 'save-choice') {
-			panel(['BurialNX — save location', 'A: Switch user save data', 'X: choose an SD-card folder', ...(choiceFromMenu ? ['B: cancel'] : ['Select where new saves will be stored.'])], true);
+			panel(['BurialNX — save location', 'A: Switch user save data', 'X: choose an SD-card folder', 'Y: use the game’s save folder', ...(choiceFromMenu ? ['B: cancel'] : ['Select where new saves will be stored.'])], true);
 			if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
 			else if (!waitForRelease && buttons?.[1]?.pressed && !previousButtons[1]) chooseSaves({ kind: 'switch' });
 			else if (!waitForRelease && buttons?.[3]?.pressed && !previousButtons[3]) { browser = new FolderBrowser(Switch, 'saves'); pickerPurpose = choiceFromMenu ? 'menu-saves' : 'startup-saves'; waitForRelease = true; phase = 'picker'; }
+			else if (!waitForRelease && buttons?.[2]?.pressed && !previousButtons[2]) { waitForRelease = true; phase = 'game-save-choice'; }
 			else if (!waitForRelease && choiceFromMenu && buttons?.[0]?.pressed && !previousButtons[0]) { menu.dismiss(); phase = 'game'; }
+		} else if (phase === 'game-save-choice') {
+			const folders = gameSaveFolders(selectedGame!);
+			panel(['BurialNX — use game-folder saves', 'Saves will be written in the game folder. Back them up first.', `A: ${folders[0]}`, ...(folders[1] ? [`X: ${folders[1]}`] : []), 'A missing save folder will be created. B: back.'], true);
+			if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
+			else if (!waitForRelease && buttons?.[1]?.pressed && !previousButtons[1]) chooseSaves({ kind: 'game', folder: folders[0] });
+			else if (!waitForRelease && folders[1] && buttons?.[3]?.pressed && !previousButtons[3]) chooseSaves({ kind: 'game', folder: folders[1] });
+			else if (!waitForRelease && buttons?.[0]?.pressed && !previousButtons[0]) { waitForRelease = true; phase = 'save-choice'; }
 		} else if (phase === 'import-confirm') {
-			panel(['BurialNX — Steam saves', `Current destination: ${saveLocation?.kind === 'sd' ? saveLocation.folder : 'Switch user save data'}`, 'A: import game-folder Steam saves into this empty location', 'B: skip', 'Existing saves are never overwritten.'], true);
+			panel(['BurialNX — Steam saves', `Current destination: ${saveLocation && saveLocation.kind !== 'switch' ? saveLocation.folder : 'Switch user save data'}`, 'A: import game-folder Steam saves into this empty location', 'B: skip', 'Existing saves are never overwritten.'], true);
 			if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
 			else if (!waitForRelease && ((buttons?.[1]?.pressed && !previousButtons[1]) || (buttons?.[0]?.pressed && !previousButtons[0]))) {
 				const wantsImport = !!buttons?.[1]?.pressed;
@@ -300,6 +361,13 @@ function frame(now: number) {
 			if (!sampleStart) sampleStart = now;
 			frames++; if (now - sampleStart >= 1000) { fps = frames * 1000 / (now - sampleStart); sampleStart = now; frames = 0; }
 			const action = menu.step(buttons, now);
+			// Speculation must not contend with a transition, paused menu, or
+			// a scene already struggling to meet its frame budget.
+			if (mapPrefetch && fps >= 50 && !menu.blocksInput && typeof runtime.Scene_Map === 'function' &&
+				runtime.SceneManager?._scene instanceof runtime.Scene_Map && runtime.SceneManager._sceneStarted &&
+				!runtime.SceneManager._nextScene && !runtime.SceneManager._stopped && runtime.$dataMap && !runtime.$gamePlayer?.isTransferring?.()) {
+				mapPrefetch.tick(now, true);
+			}
 			if (action === 'load' && runtime.SceneManager && runtime.Scene_Load) runtime.SceneManager.push(runtime.Scene_Load);
 			if (action === 'resolution' && host) fit = host.toggleFit();
 			if (action === 'mod') { browser = new FolderBrowser(Switch, 'mod'); pickerPurpose = 'menu-mod'; waitForRelease = true; phase = 'picker'; }
@@ -315,10 +383,10 @@ function frame(now: number) {
 			// the overlay afterwards. Direct rendering draws it in Graphics.render.
 			if (menu.blocksInput || !host?.direct()) hud();
 		}
-		previousButtons = Array.from({ length: 16 }, (_, index) => !!buttons?.[index]?.pressed);
+		for (let index = 0; index < 16; index++) previousButtons[index] = !!buttons?.[index]?.pressed;
 	} catch (error) { fail(error); }
 	requestAnimationFrame(frame);
 }
-if (__DEBUG__) log(`--- BurialNX debug session ${new Date().toISOString()} ---`);
+if (__DEBUG__) log(`Startup ready: ${phase}`);
 if (phase === 'loading') void launch();
 requestAnimationFrame(frame);

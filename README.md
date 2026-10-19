@@ -1,7 +1,7 @@
 # BurialNX
 
-An optimized Nintendo Switch homebrew runtime environment for **The Coffin of
-Andy and Leyley** (TCOAAL), built around nx.js and a targeted RPG Maker MV
+An optimized Nintendo Switch homebrew runtime environment for **TCOAAL**,
+built around nx.js and a targeted RPG Maker MV
 compatibility host.
 
 ## Project Scope & Compatibility
@@ -33,11 +33,13 @@ investigation, implementation, tests, and documentation. See
   which builds on libnx, and supplies the browser-facing interfaces required by
   the game. The packaged application does not need Node.js on the console.
 - **Memory-aware optimization:** A bounded 16 MiB cache reduces repeated
-  reads of small assets and map data; large audio files are excluded. The
-  renderer reuses appropriate canvas surfaces to reduce allocation churn.
+  reads of small assets and map data; nearby map data can be warmed in idle
+  scenes. Large audio files are excluded. The renderer reuses appropriate
+  canvas surfaces to reduce allocation churn.
 - **File-system routing:** Resolves game resources and TCOAAL's hashed asset
   paths from a user-selected SD-card directory, with an optional unpacked mod
-  overlay. Saves and loader settings are kept separate from the game files.
+  overlay. Loader settings stay separate from game files; saves use the
+  explicitly selected storage location.
 - **Input and display:** Maps Switch controller input to game-facing controls,
   provides fit/native display modes, and offers a long-press Minus menu for
   loader settings and FPS display.
@@ -46,9 +48,10 @@ investigation, implementation, tests, and documentation. See
 
 ## Installation and Usage
 
-1. Build `burialnx.nro` using [Building & Debugging](<Building & Debugging.md>).
-   A separate `burialnx-debug.nro` is available for troubleshooting. No game
-   content is needed to build the loader.
+1. Download `burialnx.nro` from a project release or build it using
+   [Building & Debugging](<Building & Debugging.md>). A separate
+   `burialnx-debug.nro` is available for troubleshooting. No game content is
+   needed to build the loader.
 2. Copy the NRO to `sdmc:/switch/burialnx/` on a homebrew-enabled Switch.
    Launch it in application mode rather than the memory-limited Album applet
    mode, and select your Switch user.
@@ -71,11 +74,16 @@ investigation, implementation, tests, and documentation. See
    `index.html` and `js/rpg_core.js` also works. Use Up/Down to highlight, A
    to open a folder, and B to go back. Press Y instead of X when selecting a
    game only if you need the earlier loader's shared save keys.
-4. Choose Switch user save data or an existing separate SD-card folder. You
-   can optionally import compatible Steam saves from the game's `save/` folder
-   into an **empty** destination; existing saves are not overwritten. The
-   release build remembers the selected game and save location, prompting
-   again if unavailable. The debug build asks for the game and mod on startup.
+4. Choose Switch user save data, an existing separate SD-card folder, or
+   explicitly select a game-folder save location. For game-folder saves, press
+   Y and choose either `save/` next to `www/` or `www/save/`. The exact path
+   is shown before selection. A missing save folder is created on launch;
+   saving in-game writes there, including to existing slots. Back it up first.
+   For Switch or separate SD storage, you can optionally import compatible
+   Steam saves into an **empty** destination; the import is skipped when no
+   save slots are found. The release build remembers the selected game and
+   save location, prompting again if unavailable. The debug build asks for
+   the game, mod, and save location on startup.
 
 Hold Minus during gameplay to open the loader menu; navigate with Up/Down and
 A, and close with B. The menu provides the game's load screen, display mode,
@@ -87,14 +95,15 @@ supported. Use only trusted games and mods: their scripts run with native
 runtime privileges, and the loader is not a security sandbox. See
 [SECURITY.md](SECURITY.md).
 
-Switch saves belong to the selected user and application ID; an SD save folder
-is shared between users. Game-path-specific save keys depend on the selected
-path, so moving the game can change which saves appear. Loader settings are in
+Switch saves belong to the selected user and application ID; an SD or game
+save folder is shared between users. Do not use the same game-folder saves on
+PC and Switch at the same time. Game-path-specific Switch save keys depend on
+the selected path, so moving the game can change which saves appear. Loader settings are in
 `sdmc:/switch/burialnx/settings.json`; they are not save files. Back up saves
 with a trusted save manager before testing or changing storage. See
 [Building & Debugging](<Building & Debugging.md>) for log collection and
 reporting instructions. Debug diagnostics are stored under
-`sdmc:/switch/tcoaal/LOGS/`; nx.js may also write
+`sdmc:/switch/burialnx/LOGS/`; nx.js may also write
 `sdmc:/switch/nxjs-debug.log`.
 
 **Known limitation:** The Credits scene can hang or crash on Switch. Its title

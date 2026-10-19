@@ -20,11 +20,10 @@ export function resourceFetch(assets: Reader, nativeFetch: typeof fetch, log: (s
 		}
 		const path = url.replace(/^romfs:\//, '').replace(/^\.\//, '');
 		if (!assetPath(path)) throw new TypeError('Unsafe resource path');
-		if (/^img\//i.test(path)) log(`Image fetch started: ${path}`);
 		let bytes: ArrayBuffer | null;
 		try { bytes = await assets.read(path); }
-		catch (error) { log(`Image asset read failed: ${path}: ${String(error)}`); throw error; }
-		if (/^img\//i.test(path)) log(`Image fetch finished: ${path} (${bytes?.byteLength ?? 'missing'} bytes)`);
+		catch (error) { log(`Asset read failed: ${path}: ${String(error)}`); throw error; }
+		if (bytes === null) log(`Asset fetch missing: ${path}`);
 		return bytes === null ? new Response('Not found', { status: 404 }) : new Response(pngFix ? fixIndexedPng(bytes) : bytes);
 	};
 }
@@ -34,7 +33,7 @@ export function resourceFetch(assets: Reader, nativeFetch: typeof fetch, log: (s
  * audio, images and timers; this supplies only the missing document and local
  * resource APIs. It is not a general browser.
  */
-export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s: string) => void, pngFix = false, directScreen = true) {
+export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s: string) => void, pngFix = false, directScreen = true, reportRequestError?: (error: Error, responseText: string) => void) {
 	let document: any;
 	let gameCanvas: CanvasNode | undefined;
 	const screenContext = screen.getContext('2d')!;
@@ -101,26 +100,35 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 			const saved: (RepeatedPattern | null)[] = [];
 			const owner = this;
 			const drawing = new Set(['clearRect', 'strokeRect', 'fillText', 'strokeText', 'putImageData', 'fill', 'stroke']);
+			// Canvas methods are accessed many times per frame. Reuse wrappers
+			// instead of allocating a new bound function for every draw call.
+			const methods = new Map<PropertyKey, Function>();
 			this.context = new Proxy(target, { get(object, key) {
+				if (key === 'fillStyle' && pattern) return pattern;
+				const cached = methods.get(key);
+				if (cached) return cached;
 				const value = (object as any)[key];
-				if (key === 'createPattern') return (image: any, repeat = 'repeat') => {
+				let method: Function | undefined;
+				if (key === 'createPattern') method = (image: any, repeat = 'repeat') => {
 					const source = image instanceof CanvasNode ? image.surface() : image;
 					if (!source?.width || !source?.height) return null;
 					return new RepeatedPattern(source, repeat, () => image instanceof CanvasNode ? image.revision : 0);
 				};
-				if (key === 'fillStyle' && pattern) return pattern;
-				if (key === 'save') return () => { saved.push(pattern); object.save(); };
-				if (key === 'restore') return () => { if (saved.length) pattern = saved.pop()!; object.restore(); };
-				if (key === 'fillRect') return (x: number, y: number, w: number, h: number) => {
+				else if (key === 'save') method = () => { saved.push(pattern); object.save(); };
+				else if (key === 'restore') method = () => { if (saved.length) pattern = saved.pop()!; object.restore(); };
+				else if (key === 'fillRect') method = (x: number, y: number, w: number, h: number) => {
 					owner.revision++;
 					return pattern ? pattern.fill(object, x, y, w, h, (width, height) => new OffscreenCanvas(width, height)) : object.fillRect(x, y, w, h);
 				};
-				if (key === 'drawImage') return (image: any, ...args: any[]) => { owner.revision++; return value.call(object, image instanceof CanvasNode ? image.surface() : image, ...args); };
-				if (typeof key === 'string' && drawing.has(key)) return (...args: any[]) => { owner.revision++; return value.apply(object, args); };
-				return typeof value === 'function' ? value.bind(object) : value;
+				else if (key === 'drawImage') method = (image: any, ...args: any[]) => { owner.revision++; return value.call(object, image instanceof CanvasNode ? image.surface() : image, ...args); };
+				else if (typeof key === 'string' && drawing.has(key)) method = (...args: any[]) => { owner.revision++; return value.apply(object, args); };
+				else if (typeof value === 'function') method = value.bind(object);
+				if (method) { methods.set(key, method); return method; }
+				return value;
 			}, set(object, key, value) {
 				if (key === 'fillStyle' && value instanceof RepeatedPattern) { pattern = value; return true; }
 				if (key === 'fillStyle') pattern = null;
+				methods.delete(key);
 				(object as any)[key] = value; return true;
 			} });
 			return this.context;
@@ -164,7 +172,21 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 		try { const prepared = filter(path, source); if (prepared !== null) (0, eval)(`${prepared}\n//# sourceURL=${path}`); }
 		finally { document.currentScript = null; }
 	});
-	class XHR extends LocalRequest { constructor() { super(assets); } }
+	class XHR extends LocalRequest {
+		constructor() { super(assets); }
+		override send() {
+			const request = super.send();
+			if (reportRequestError) void request.catch((error: unknown) => {
+				const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				if (this.responseText) log(`Failed response: ${this.responseURL} (${this.responseText.length} characters)`);
+				// Game callbacks run asynchronously. Report their URL and handle the
+				// rejection, otherwise nx.js may terminate before drawing the error.
+				try { reportRequestError(new Error(`Request ${this.responseURL}: ${detail}`), this.responseText); }
+				catch (reportError) { log(`Could not report request error: ${String(reportError)}`); }
+			});
+			return request;
+		}
+	}
 	Object.assign(globalThis, { document, XMLHttpRequest: XHR, HTMLElement: Node, HTMLCanvasElement: CanvasNode,
 		location: { href: 'game:/index.html', pathname: '/index.html', search: '', hash: '', reload() {} },
 		innerWidth: screen.width, innerHeight: screen.height, devicePixelRatio: 1 });
@@ -192,7 +214,6 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 					set: (value: string) => { empty = !value; if (!empty) source.set!.call(image, value); },
 				});
 			}
-			image.addEventListener('load', () => log(`Image decoded: ${image.src}`));
 			image.addEventListener('error', () => log(`Image decode failed: ${image.src}`));
 			return image;
 		};

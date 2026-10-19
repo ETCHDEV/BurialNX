@@ -7,8 +7,9 @@ import { execFileSync } from 'node:child_process';
 import { prepareIcon } from './icon.mjs';
 
 const flags = process.argv.slice(2);
-if (flags.some((flag) => flag !== '--debug')) throw new Error('Usage: npm run build -- [--debug]');
+if (flags.some((flag) => flag !== '--debug' && flag !== '--default-icon')) throw new Error('Usage: npm run build -- [--debug] [--default-icon]');
 const debug = flags.includes('--debug');
+const defaultIcon = flags.includes('--default-icon');
 const project = resolve('.');
 const staging = await mkdtemp(join(tmpdir(), 'burialnx-build-'));
 try {
@@ -19,7 +20,7 @@ try {
   meta.nacp.title = debug ? 'BurialNX-Debug' : 'BurialNX';
   await writeFile(join(staging, 'package.json'), JSON.stringify(meta));
   await copyFile(join(project, 'romfs', 'nxjs.ini'), join(staging, 'romfs', 'nxjs.ini'));
-  await prepareIcon(project, staging);
+  await prepareIcon(project, staging, { defaultIcon });
   await build({
     entryPoints: [join(project, 'src', 'main.ts')],
     outfile: join(staging, 'romfs', 'main.js'),

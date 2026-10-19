@@ -4,7 +4,8 @@ import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
 
 // The NRO packager expects a 256x256 JPEG. Keep image conversion build-only.
-export async function prepareIcon(project, staging) {
+export async function prepareIcon(project, staging, { defaultIcon = false } = {}) {
+  if (defaultIcon) return; // Explicitly ignore local artwork for public builds.
   let name;
   for (const candidate of ['icon.jpg', 'icon.png']) {
     try { await stat(join(project, candidate)); name = candidate; break; }

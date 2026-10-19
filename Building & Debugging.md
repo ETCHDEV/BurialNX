@@ -82,6 +82,32 @@ An image found online is not automatically licensed for redistribution. Local
 NROs built with artwork of unknown origin must not be treated as public
 releases until the rights are confirmed. The image is not included in Git.
 
+To explicitly use the nx.js placeholder even if a local icon is present, build
+the release artifacts with:
+
+```sh
+npm run build -- --default-icon
+npm run build -- --debug --default-icon
+```
+
+The flag does not remove or change local artwork. Confirm the license and
+notice obligations for the exact bundled runtime and its components before
+publishing either NRO; a placeholder icon alone is not a complete rights review.
+
+## Preparing a GitHub release
+
+Commit the source and documentation, but not game files, saves, mods, logs,
+dependencies, local artwork, or NROs. The NROs are ignored by Git; attach the
+two built files separately to a GitHub Release for the matching version tag.
+The release build is intended for normal play, and the debug build is intended
+for diagnosing problems. Both contain the same application ID to preserve the
+existing Switch save namespace.
+
+Check that the NRO version matches `package.json`, review the exact bundled
+runtime and font notices, and test the builds on hardware when possible. An
+automated test or a successful build does not establish performance, long-term
+stability, or legal permission to redistribute the packaged components.
+
 ## Runtime and development files
 
 The build uses a unique temporary staging directory and removes it afterward.
@@ -95,7 +121,7 @@ notices before distributing a release; see [NOTICE.md](NOTICE.md).
 1. Back up your saves. Build `burialnx-debug.nro` with the debug command above,
    copy it to `sdmc:/switch/burialnx/`, launch it in application mode, and
    select the same Switch user used for the affected save.
-2. The debug build asks for the game and mod on every launch. Choose the same
+2. The debug build asks for the game, mod, and save location on every launch. Choose the same
    game, save location and mod used when the problem occurred. To isolate a
    mod issue, repeat with no mod when practical.
 3. Reproduce the problem and note exactly what you did, what you expected,
@@ -107,10 +133,10 @@ notices before distributing a release; see [NOTICE.md](NOTICE.md).
    FPS display and a direct-screen setting that applies on the next launch.
 5. Before launching the loader again or another nx.js application, copy:
 
-   - `sdmc:/switch/tcoaal/LOGS/native-host.log` — loader output, appended
+   - `sdmc:/switch/burialnx/LOGS/native-host.log` — loader output, appended
      across sessions. Include the latest `BurialNX debug session` header and
      all following lines. An early startup failure can leave no new session.
-   - The newest `sdmc:/switch/tcoaal/LOGS/nxjs-debug-<timestamp>.log` snapshot,
+   - The newest `sdmc:/switch/burialnx/LOGS/nxjs-debug-<timestamp>.log` snapshot,
      if one exists. Snapshots can be older than the crash.
    - `sdmc:/switch/nxjs-debug.log` — nx.js's live log, which may contain newer
      runtime information than the last snapshot.

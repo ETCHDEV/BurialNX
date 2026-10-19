@@ -1,20 +1,97 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { assetPath, overlayReader } from '../src/library';
 import { interactionTextY } from '../src/dialogue';
 import { PauseMenu } from '../src/menu';
 import { FolderBrowser, gameRoot } from '../src/folders';
-import { scriptPlan, viewport } from '../src/runtime-plan';
+import { scriptPlan, startGame, viewport } from '../src/runtime-plan';
 import { listExistingSlots, saveKey } from '../src/save-slots';
 import { ScriptQueue } from '../src/script-queue';
 import { LocalRequest } from '../src/request';
 import { gameAssetNames, gameAssets, unpackGameAsset } from '../src/game-assets';
+import { installMapPrefetch, MapPrefetcher } from '../src/map-prefetch';
 import { fixIndexedPng } from '../src/indexed-png';
-import { parseSelection, startupSelection } from '../src/settings';
+import { gameSaveFolders, parseSelection, startupSelection } from '../src/settings';
 import { prepareGameScript, translate, installGameCompatibility } from '../src/game-compat';
 import { createBrowserHost, resourceFetch } from '../src/browser-host';
 import { RepeatedPattern } from '../src/repeated-pattern';
-import { importSteamSaves, installSdSaves, safeSaveFolder } from '../src/saves';
+import { ensureGameSaveFolder, hasSteamSaveData, importSteamSaves, installSdSaves, safeGameSaveFolder, safeSaveFolder, steamSaveSources } from '../src/saves';
+
+test('map prefetch warms only bounded direct transfers and waits for an idle frame', async () => {
+	let now = 0;
+	const reads: string[] = [];
+	let finish!: (value: ArrayBuffer) => void;
+	const pending = new Promise<ArrayBuffer>((resolve) => { finish = resolve; });
+	const reader = { async read(path: string) { reads.push(path); return reads.length === 1 ? pending : new ArrayBuffer(1); } };
+	const prefetch = new MapPrefetcher(reader, () => {}, () => now);
+	const command = (mode: number, id: unknown) => ({ code: 201, parameters: [mode, id] });
+	prefetch.plan({ events: [null, { pages: [{ list: [command(1, 9), command(0, '9'), command(0, -1), command(0, 2), command(0, 2), command(0, 3), command(0, 4), command(0, 5)] }] }] });
+	prefetch.tick(999, true); prefetch.tick(1000, false);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reads, []);
+	now = 1000; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reads, ['data/Map002.json']);
+	prefetch.tick(2000, true); // Never start a second read while one is pending.
+	assert.equal(reads.length, 1);
+	finish(new ArrayBuffer(1));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	now = 1249; prefetch.tick(now, true);
+	now = 1250; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	now = 1500; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	now = 1750; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reads, ['data/Map002.json', 'data/Map003.json', 'data/Map004.json']);
+});
+
+test('map prefetch cancels stale queues and observes only actual map loads', async () => {
+	let now = 0, release!: (value: ArrayBuffer) => void;
+	const reads: string[] = [], failures: string[] = [];
+	const reader = { read(path: string) {
+		reads.push(path);
+		if (reads.length === 1) return new Promise<ArrayBuffer>((resolve) => { release = resolve; });
+		return Promise.reject(new Error('disk error'));
+	} };
+	const prefetch = new MapPrefetcher(reader, (line) => failures.push(line), () => now);
+	const map = (ids: number[]) => ({ events: [{ pages: [{ list: ids.map((id) => ({ code: 201, parameters: [0, id] })) }] }] });
+	const runtime: any = { $dataMap: map([1, 2]), DataManager: { calls: 0, onLoad() { this.calls++; return 'original'; } } };
+	assert.equal(installMapPrefetch(runtime, prefetch, () => {}), true);
+	assert.equal(runtime.DataManager.onLoad({}), 'original');
+	prefetch.tick(2000, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reads, []);
+	runtime.DataManager.onLoad(runtime.$dataMap);
+	now = 1000; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	runtime.$dataMap = map([7]); runtime.DataManager.onLoad(runtime.$dataMap);
+	release(new ArrayBuffer(1));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	prefetch.tick(1999, true); now = 2000; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reads, ['data/Map001.json', 'data/Map007.json']);
+	assert.equal(runtime.DataManager.calls, 3);
+	assert.ok(failures[0].includes('disk error'));
+	assert.equal(installMapPrefetch({}, prefetch, () => {}), false);
+});
+
+test('map warm-up uses the existing mod-aware cache without a second disk read', async () => {
+	let now = 0;
+	const diskReads: string[] = [];
+	const assets = gameAssets('game', 'mod', { async read(path) {
+		diskReads.push(path);
+		return path === 'mod/data/Map002.json' ? new Uint8Array([1, 2, 3]).buffer : null;
+	} });
+	const prefetch = new MapPrefetcher(assets, () => {}, () => now);
+	prefetch.plan({ events: [{ pages: [{ list: [{ code: 201, parameters: [0, 2] }] }] }] });
+	now = 1000; prefetch.tick(now, true);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(diskReads, ['mod/data/Map002.json']);
+	assert.deepEqual([...new Uint8Array((await assets.read('data/Map002.json'))!)], [1, 2, 3]);
+	assert.deepEqual(diskReads, ['mod/data/Map002.json']);
+});
 
 test('rejects absolute, malformed, and encoded traversal paths', () => {
 	for (const value of ['', '/etc', 'sdmc:/test', 'a/../b', 'a/%2e%2e/b', 'a/%5cb', 'a/%00b', 'a//b', 'bad%zz', 'a/%0ab', 'a/%E2%80%A8b', 'a/b:c']) assert.equal(assetPath(value), null);
@@ -33,6 +110,22 @@ test('resource fetch refuses external URLs, native filesystem URLs, and non-GET 
 	await assert.rejects(load('data/a.json', { method: 'POST' }));
 	assert.equal(await (await load('blob:local-id')).text(), 'local blob');
 	assert.deepEqual(calls, ['blob:local-id']);
+});
+
+test('resource fetch keeps failure diagnostics without logging successful image loads', async () => {
+	const logs: string[] = [];
+	const reader = { async read(path: string) {
+		if (path === 'img/missing.png') return null;
+		if (path === 'img/error.png') throw new Error('disk failure');
+		return new Uint8Array([1, 2]).buffer;
+	} };
+	const load = resourceFetch(reader, fetch, (line) => logs.push(line));
+	assert.equal((await load('img/ok.png')).status, 200);
+	assert.deepEqual(logs, []);
+	assert.equal((await load('img/missing.png')).status, 404);
+	await assert.rejects(load('img/error.png'), /disk failure/);
+	assert.ok(logs.some((line) => line.includes('img/missing.png')));
+	assert.ok(logs.some((line) => line.includes('img/error.png') && line.includes('disk failure')));
 });
 
 test('mod overlay wins without writing or changing the game directory', async () => {
@@ -57,6 +150,7 @@ test('interaction text is raised and never pushed outside its content box', () =
 
 test('release menu excludes debug actions and closes only with B', () => {
 	const menu = new PauseMenu(false);
+	const buttonsBuffer = (menu as any).pressed;
 	const press = (i: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === i }));
 	menu.step(press(8), 0); menu.step(press(8), 801);
 	assert.equal(menu.open, true);
@@ -64,6 +158,7 @@ test('release menu excludes debug actions and closes only with B', () => {
 	assert.deepEqual(menu.items, ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod']);
 	menu.step(press(0), 2001); assert.equal(menu.open, false);
 	menu.step(null, 2002); assert.equal(menu.blocksInput, false);
+	assert.equal((menu as any).pressed, buttonsBuffer);
 	assert.ok(new PauseMenu(true).items.includes('snapshot'));
 	menu.open = true; menu.dismiss();
 	assert.equal(menu.blocksInput, true);
@@ -92,6 +187,30 @@ test('entry point scripts stay ordered and cannot escape the game folder', () =>
 	assert.throws(() => scriptPlan('<script src="js/rpg_core.js"></script><script src="../bad.js"></script>'));
 	assert.throws(() => scriptPlan('<script src="https://example.invalid/a.js"></script>'));
 	assert.throws(() => scriptPlan('<script src="js/main.js"></script>'));
+});
+
+test('game startup prefers onload and only falls back when no scene has started', () => {
+	let loads = 0, runs = 0;
+	function Boot() {}
+	const runtime: any = {
+		Scene_Boot: Boot,
+		SceneManager: { _scene: null, _nextScene: null, run(scene: unknown) { assert.equal(scene, Boot); runs++; } },
+		onload(event: Event) { assert.equal(this, runtime); assert.equal(event.type, 'load'); loads++; },
+	};
+	assert.equal(startGame(runtime), 'onload');
+	assert.equal(loads, 1); assert.equal(runs, 0);
+	delete runtime.onload;
+	assert.equal(startGame(runtime), 'scene-boot');
+	assert.equal(runs, 1);
+	runtime.SceneManager._scene = {};
+	assert.equal(startGame(runtime), 'already-started');
+	runtime.SceneManager._scene = null; runtime.SceneManager._nextScene = {};
+	assert.equal(startGame(runtime), 'already-started');
+	assert.equal(runs, 1);
+	runtime.SceneManager._nextScene = null;
+	delete runtime.Scene_Boot;
+	assert.throws(() => startGame(runtime), /no load handler or usable Scene_Boot/);
+	assert.throws(() => startGame({}), /no load handler or usable Scene_Boot/);
 });
 
 test('viewport keeps the correct aspect ratio', () => {
@@ -139,6 +258,45 @@ test('save folder cannot overlap the game or mod, including case and traversal',
 		assert.equal(safeSaveFolder(path, root, 'sdmc:/mods/test'), false, path);
 });
 
+test('game-folder saves require an explicit supported path and do not overlap mods', () => {
+	const root = 'sdmc:/games/title/www';
+	assert.deepEqual(gameSaveFolders(root), ['sdmc:/games/title/save', 'sdmc:/games/title/www/save']);
+	assert.deepEqual(gameSaveFolders('sdmc:/games/title'), ['sdmc:/games/title/save']);
+	assert.equal(safeGameSaveFolder('sdmc:/games/title/save', root, null), true);
+	for (const bad of ['sdmc:/games/title', 'sdmc:/games/title/save/other', 'sdmc:/games/other/save', 'sdmc:/games/title/../save'])
+		assert.equal(safeGameSaveFolder(bad, root, null), false, bad);
+	assert.equal(safeGameSaveFolder('sdmc:/games/title/save', root, 'sdmc:/games/title/save/mod'), false);
+	assert.equal(safeGameSaveFolder('sdmc:/games/title/save', root, 'sdmc:/games/title'), false);
+	assert.equal(safeGameSaveFolder('sdmc:/games/title/save', root, 'sdmc:/mods/a'), true);
+	const saved = parseSelection('{"root":"sdmc:/games/title/www","sharedSaves":false,"saves":{"kind":"game","folder":"sdmc:/games/title/save"}}');
+	assert.deepEqual(saved.saves, { kind: 'game', folder: 'sdmc:/games/title/save' });
+	assert.throws(() => parseSelection('{"root":"sdmc:/games/title/www","sharedSaves":false,"saves":{"kind":"game","folder":"sdmc:/other"}}'));
+});
+
+test('game-folder saves create only the chosen directory and preserve existing saves', () => {
+	const fs = new MemorySaveFiles();
+	const directories = new Set(['sdmc:/game', 'sdmc:/game/www']);
+	const originalStat = fs.statSync.bind(fs);
+	fs.statSync = (path) => directories.has(path) ? { mode: 0o040000 } : originalStat(path);
+	const made: string[] = [];
+	const withMkdir = Object.assign(fs, { mkdirSync: (path: string) => { made.push(path); directories.add(path); } });
+	const root = 'sdmc:/game/www', folder = 'sdmc:/game/save';
+	assert.throws(() => ensureGameSaveFolder(withMkdir, 'sdmc:/other', root, null));
+	assert.deepEqual(made, []);
+	ensureGameSaveFolder(withMkdir, folder, root, null);
+	ensureGameSaveFolder(withMkdir, folder, root, null);
+	assert.deepEqual(made, [folder]);
+	fs.files.set(`${folder}/file1.rpgsave`, 'existing');
+	const runtime: any = { StorageManager: {}, LZString: { compressToBase64: (s: string) => s, decompressFromBase64: (s: string) => s }, DataManager: { maxSavefiles: () => 2 } };
+	installSdSaves(runtime, fs, folder);
+	assert.equal(runtime.StorageManager.load(1), 'existing');
+	assert.equal(fs.files.get(`${folder}/file1.rpgsave`), 'existing');
+	assert.deepEqual(fs.writes, []);
+	runtime.StorageManager.save(1, 'updated by game');
+	assert.equal(fs.files.get(`${folder}/file1.rpgsave`), 'updated by game');
+	assert.throws(() => importSteamSaves(runtime, fs, root, { kind: 'game', folder }), /no import is needed/);
+});
+
 test('SD saves preserve old data and leave recoverable journals after failure', () => {
 	const fs = new MemorySaveFiles();
 	const runtime: any = { StorageManager: {}, LZString: { compressToBase64: (s: string) => s, decompressFromBase64: (s: string) => s }, DataManager: { maxSavefiles: () => 2 } };
@@ -183,6 +341,32 @@ test('Steam import copies only to an empty target and never writes source files'
 	assert.throws(() => importSteamSaves(runtime, fs, 'sdmc:/game/www', { kind: 'sd', folder: 'sdmc:/game/save' }), /overlaps/);
 });
 
+test('Steam save discovery handles missing, present, and ambiguous indexes without writes', () => {
+	const fs = new MemorySaveFiles();
+	assert.deepEqual(steamSaveSources(fs, 'sdmc:/game/www'), []);
+	fs.files.set('sdmc:/game/save/global.rpgsave', 'index');
+	assert.deepEqual(steamSaveSources(fs, 'sdmc:/game/www'), ['sdmc:/game/save']);
+	fs.files.set('sdmc:/game/www/save/global.rpgsave', 'another index');
+	assert.deepEqual(steamSaveSources(fs, 'sdmc:/game/www'), ['sdmc:/game/save', 'sdmc:/game/www/save']);
+	assert.deepEqual(steamSaveSources(fs, 'sdmc:/game'), ['sdmc:/game/save']);
+	assert.deepEqual(fs.writes, []);
+});
+
+test('Steam import prompt is skipped when there are no save slots', () => {
+	const fs = new MemorySaveFiles();
+	const dirs = new Map<string, string[]>();
+	const reader = Object.assign(fs, { readDirSync: (path: string) => dirs.get(path) || null });
+	assert.equal(hasSteamSaveData(reader, 'sdmc:/game/www'), false);
+	fs.files.set('sdmc:/game/save/global.rpgsave', 'index');
+	dirs.set('sdmc:/game/save', ['global.rpgsave', 'config.rpgsave']);
+	assert.equal(hasSteamSaveData(reader, 'sdmc:/game/www'), false);
+	dirs.set('sdmc:/game/save', ['global.rpgsave', 'file1.rpgsave']);
+	assert.equal(hasSteamSaveData(reader, 'sdmc:/game/www'), true);
+	dirs.delete('sdmc:/game/save');
+	assert.equal(hasSteamSaveData(reader, 'sdmc:/game/www'), true);
+	assert.deepEqual(fs.writes, []);
+});
+
 test('interrupted Steam import never creates the destination index first', () => {
 	const fs = new MemorySaveFiles();
 	fs.files.set('sdmc:/game/save/global.rpgsave', JSON.stringify([null, {}, {}]));
@@ -223,6 +407,31 @@ test('local requests preserve binary bytes and surface callback errors', async (
 	assert.equal(absent.status, 404);
 });
 
+test('browser request callback errors report the resource without becoming unhandled rejections', async () => {
+	const names = ['screen', 'Image', 'document', 'XMLHttpRequest', 'HTMLElement', 'HTMLCanvasElement', 'location', 'innerWidth', 'innerHeight', 'devicePixelRatio', 'fetch', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'focus', 'blur', 'close'];
+	const previous = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+	const errors: Error[] = [];
+	try {
+		Object.assign(globalThis, { screen: { width: 1280, height: 720, getContext: () => ({}) }, Image: undefined });
+		createBrowserHost({ read: async () => new TextEncoder().encode('{bad').buffer }, (_path, source) => source, () => {}, false, true, (error) => errors.push(error));
+		const request = new (globalThis as any).XMLHttpRequest();
+		request.open('GET', 'data/Actors.json');
+		request.onload = () => JSON.parse(request.responseText);
+		// MV does not await send(). The host must still handle callback errors.
+		request.send();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(errors.length, 1);
+		assert.match(errors[0].message, /data\/Actors\.json/);
+		assert.match(errors[0].message, /SyntaxError/);
+	} finally {
+		for (const name of names) {
+			const descriptor = previous.get(name);
+			if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+			else Reflect.deleteProperty(globalThis, name);
+		}
+	}
+});
+
 test('hashed asset lookup prefers mod files and retains independent cache copies', async () => {
 	const logical = 'img/picture.png';
 	const hashed = (await gameAssetNames(logical)).at(-1)!;
@@ -234,6 +443,36 @@ test('hashed asset lookup prefers mod files and retains independent cache copies
 	assert.deepEqual([...new Uint8Array((await reader.read(logical))!)], [1]);
 	const plain = new Uint8Array([0, 1, 2]).buffer;
 	assert.equal(unpackGameAsset(plain, 'x'), plain);
+});
+
+test('simultaneous image requests share a read but never share mutable buffers', async () => {
+	let reads = 0;
+	let finish!: (data: ArrayBuffer) => void;
+	const disk = { read: async () => { reads++; return new Promise<ArrayBuffer>((resolve) => { finish = resolve; }); } };
+	const reader = gameAssets('sdmc:/game', null, disk);
+	const first = reader.read('img/example.png');
+	const second = reader.read('img/example.png');
+	assert.equal(reads, 1);
+	finish(new Uint8Array([1, 2, 3]).buffer);
+	const [one, two] = await Promise.all([first, second]);
+	assert.notEqual(one, two);
+	new Uint8Array(one!)[0] = 99;
+	assert.deepEqual([...new Uint8Array(two!)], [1, 2, 3]);
+	assert.deepEqual([...new Uint8Array((await reader.read('img/example.png'))!)], [1, 2, 3]);
+	assert.equal(reads, 1);
+});
+
+test('failed shared asset reads are not cached and can be retried', async () => {
+	let attempts = 0;
+	const reader = gameAssets('sdmc:/game', null, { async read() {
+		if (++attempts === 1) throw new Error('temporary disk error');
+		return new Uint8Array([4]).buffer;
+	} });
+	const results = await Promise.allSettled([reader.read('data/example.json'), reader.read('data/example.json')]);
+	assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected']);
+	assert.equal(attempts, 1);
+	assert.deepEqual([...new Uint8Array((await reader.read('data/example.json'))!)], [4]);
+	assert.equal(attempts, 2);
 });
 
 test('hashed filenames with a literal percent sign are decoded only once', async () => {
@@ -295,6 +534,35 @@ test('game adapters retain collision plugin and isolate save keys', () => {
 	assert.equal(runtime.Input.gamepadMapper[1], 'ok');
 });
 
+test('region plugin bootstrap removal preserves both supported layouts', () => {
+	const path = 'js/plugins/YEP_RegionRestrictions.js';
+	const bootstrap = "(function(){ const z = 'zlib'; Buffer['from']('unreachable'); })();";
+	const oldLayout = [
+		'var Yanfly = { RR: {} };',
+		'Yanfly.RR.region = function() {',
+		'  return 42;',
+		`};${bootstrap}`,
+		'globalThis.result = Yanfly.RR.region();',
+	].join('\n');
+	const newLayout = [
+		'var Yanfly = {};',
+		`Yanfly.RR = Yanfly.RR || {};${bootstrap}`,
+		'Yanfly.RR.region = function() { return 42; };',
+		'globalThis.result = Yanfly.RR.region();',
+	].join('\n');
+	for (const input of [oldLayout, newLayout, newLayout.replace(/\n/g, '\r\n')]) {
+		const output = prepareGameScript(path, input)!;
+		const context: { result?: number } = {};
+		runInNewContext(output, context);
+		assert.equal(context.result, 42);
+		assert.ok(!output.includes('Buffer['));
+	}
+	const unchanged = 'var Yanfly = { RR: {} };';
+	assert.equal(prepareGameScript(path, unchanged), unchanged);
+	assert.throws(() => prepareGameScript(path, `other(); Yanfly.RR = Yanfly.RR || {};${bootstrap}`));
+	assert.throws(() => prepareGameScript(path, `${newLayout}\n};${bootstrap}`));
+});
+
 test('unreliable credits stay disabled and cannot trap the title menu', () => {
 	let starts = 0, activations = 0, buzzes = 0;
 	function Title(this: any) { this._commandWindow = { activate: () => activations++ }; }
@@ -340,6 +608,35 @@ test('clearing an image does not pass an empty URL to the native decoder', () =>
 		image.src = 'img/test.png'; image.src = '';
 		assert.equal(image.src, '');
 		assert.equal(nativeWrites, 1);
+	} finally {
+		for (const name of names) {
+			const descriptor = previous.get(name);
+			if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+			else Reflect.deleteProperty(globalThis, name);
+		}
+	}
+});
+
+test('canvas method wrappers are reused and still track drawing and replacements', () => {
+	const names = ['screen', 'OffscreenCanvas', 'Image', 'document', 'XMLHttpRequest', 'HTMLElement', 'HTMLCanvasElement', 'location', 'innerWidth', 'innerHeight', 'devicePixelRatio', 'fetch', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'focus', 'blur', 'close'];
+	const previous = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+	let draws = 0, replacements = 0;
+	class FakeCanvas {
+		constructor(public width: number, public height: number) {}
+		getContext() { return { drawImage() { draws++; }, fillRect() {}, save() {}, restore() {} }; }
+	}
+	try {
+		Object.assign(globalThis, { screen: { width: 1280, height: 720, getContext: () => ({}) }, OffscreenCanvas: FakeCanvas, Image: undefined });
+		createBrowserHost({ read: async () => null }, (_path, source) => source, () => {});
+		const canvas = (globalThis as any).document.createElement('canvas');
+		const ctx = canvas.getContext('2d');
+		assert.equal(ctx.drawImage, ctx.drawImage);
+		assert.equal(ctx.fillRect, ctx.fillRect);
+		ctx.drawImage(new FakeCanvas(1, 1), 0, 0);
+		assert.equal(draws, 1); assert.equal(canvas.revision, 1);
+		ctx.drawImage = () => { replacements++; };
+		ctx.drawImage(new FakeCanvas(1, 1), 0, 0);
+		assert.equal(replacements, 1); assert.equal(canvas.revision, 2);
 	} finally {
 		for (const name of names) {
 			const descriptor = previous.get(name);

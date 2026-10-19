@@ -1,4 +1,4 @@
-export type SaveLocation = { kind: 'switch' } | { kind: 'sd'; folder: string };
+export type SaveLocation = { kind: 'switch' } | { kind: 'sd' | 'game'; folder: string };
 export type GameSelection = { root: string; sharedSaves: boolean; mod?: string | null; saves?: SaveLocation };
 
 export function safeSdPath(value: unknown): value is string {
@@ -6,6 +6,13 @@ export function safeSdPath(value: unknown): value is string {
 	const rest = value.slice(6).replace(/\/+$/, '');
 	return !!rest && !/[\\:\u0000-\u001f\u007f\u2028\u2029]/.test(rest) &&
 		!rest.split('/').some((part) => !part || part === '..' || part === '.');
+}
+
+/** The two locations used by PC deployments; a non-www root has only one. */
+export function gameSaveFolders(root: string): string[] {
+	const clean = root.replace(/\/+$/, '');
+	const parent = /\/www$/i.test(clean) ? clean.slice(0, -4) : clean;
+	return [...new Set([`${parent}/save`, `${clean}/save`])];
 }
 
 /** Reject corrupt or unsafe settings rather than guessing or overwriting them. */
@@ -18,6 +25,7 @@ export function parseSelection(text: string): GameSelection {
 	if (data.saves !== undefined) {
 		if (data.saves?.kind === 'switch') selection.saves = { kind: 'switch' };
 		else if (data.saves?.kind === 'sd' && safeSdPath(data.saves.folder)) selection.saves = { kind: 'sd', folder: data.saves.folder.replace(/\/+$/, '') };
+		else if (data.saves?.kind === 'game' && safeSdPath(data.saves.folder) && gameSaveFolders(selection.root).some((p) => p.toLowerCase() === data.saves.folder.replace(/\/+$/, '').toLowerCase())) selection.saves = { kind: 'game', folder: data.saves.folder.replace(/\/+$/, '') };
 		else throw new Error('Invalid save location');
 	}
 	return selection;

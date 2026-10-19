@@ -2,7 +2,9 @@
 
 BurialNX is an unofficial Switch homebrew loader. Keep the loader separate
 from game content and do not copy game assets, scripts, saves, mods, or local
-logs into the repository. Never write into the selected game directory.
+logs into the repository. Never write game assets or scripts. The sole
+exception inside the selected game directory is its explicitly selected save
+folder; exercise that mode only with simulated or disposable test files.
 
 Preserve user saves and settings. Changes to storage identifiers, save keys,
 or import/export behavior require a documented migration and tests; never

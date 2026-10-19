@@ -21,8 +21,9 @@ Switch network scan or independent audit of nx.js and its native dependencies
 has been performed.
 
 Path checks reject traversal and control characters in loader-managed paths.
-Game and mod folders are treated as read-only by loader code; the SD-save
-backend avoids recursive deletion of directories and keeps recovery copies
+Game assets and mod folders are treated as read-only by loader code. If the
+user explicitly selects a game-folder save directory, saves and recovery
+files are written there. The file-save backend avoids recursive deletion of directories and keeps recovery copies
 for interrupted writes. None of these measures confines code from a game or
 mod, nor should they replace backups or a review of third-party files.
 

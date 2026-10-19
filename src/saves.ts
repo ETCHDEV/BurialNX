@@ -1,4 +1,4 @@
-import { safeSdPath, type SaveLocation } from './settings';
+import { gameSaveFolders, safeSdPath, type SaveLocation } from './settings';
 
 export interface SaveFiles {
 	readFileSync(path: string): ArrayBuffer | null;
@@ -20,6 +20,28 @@ export function safeSaveFolder(folder: string, root: string, mod: string | null)
 	const destination = normal(folder);
 	const game = normal(root).endsWith('/www') ? normal(root).slice(0, -4) : normal(root);
 	return ![game, ...(mod ? [normal(mod)] : [])].some((p) => destination === p || destination.startsWith(p + '/'));
+}
+
+/** Only an explicitly selected game save directory may overlap the game. */
+export function safeGameSaveFolder(folder: string, root: string, mod: string | null): boolean {
+	if (!safeSdPath(folder) || !safeSdPath(root) || (mod !== null && !safeSdPath(mod))) return false;
+	const normal = (p: string) => p.replace(/\/+$/, '').toLowerCase();
+	const destination = normal(folder);
+	if (!gameSaveFolders(root).some((p) => normal(p) === destination)) return false;
+	if (!mod) return true;
+	const overlay = normal(mod);
+	return destination !== overlay && !destination.startsWith(overlay + '/') && !overlay.startsWith(destination + '/');
+}
+
+/** Create the explicitly selected save directory only; do not touch saves. */
+export function ensureGameSaveFolder(fs: Pick<SaveFiles, 'statSync'> & { mkdirSync(path: string): void }, folder: string, root: string, mod: string | null): void {
+	if (!safeGameSaveFolder(folder, root, mod)) throw new Error('Invalid game save folder');
+	const parent = folder.slice(0, folder.lastIndexOf('/'));
+	const parentInfo = fs.statSync(parent);
+	if (!parentInfo || (parentInfo.mode & 0o170000) !== 0o040000) throw new Error('Game save parent folder is unavailable');
+	let info = fs.statSync(folder);
+	if (!info) { fs.mkdirSync(folder); info = fs.statSync(folder); }
+	if (!info || (info.mode & 0o170000) !== 0o040000) throw new Error('Game save path is not a directory');
 }
 
 /** MV uses the same LZString base64 format on disk and in localStorage. */
@@ -85,11 +107,25 @@ export function installSdSaves(runtime: any, fs: SaveFiles, folder: string): voi
 	};
 }
 
+/** Locate possible Steam save indexes without changing the source folders. */
+export function steamSaveSources(fs: Pick<SaveFiles, 'statSync'>, root: string): string[] {
+	return gameSaveFolders(root).filter((dir) => fs.statSync(`${dir}/global.rpgsave`) !== null);
+}
+
+/** A save index alone is not a saved game; don't prompt when no slots exist. */
+export function hasSteamSaveData(fs: Pick<SaveFiles, 'statSync'> & { readDirSync(path: string): string[] | null }, root: string): boolean {
+	return steamSaveSources(fs, root).some((dir) => {
+		const entries = fs.readDirSync(dir);
+		// An unreadable directory is not proof that no saves exist.
+		return !entries || entries.some((entry) => /^file[1-9]\d{0,2}\.rpgsave$/i.test(entry));
+	});
+}
+
 /** Copy only into an entirely empty destination; source files are never written. */
 export function importSteamSaves(runtime: any, fs: SaveFiles, root: string, location: SaveLocation): number {
+	if (location.kind === 'game') throw new Error('Game-folder saves are already in use; no import is needed');
 	if (location.kind === 'sd' && !safeSaveFolder(location.folder, root, null)) throw new Error('Save folder overlaps game folder');
-	const parent = root.endsWith('/www') ? root.slice(0, -4) : root;
-	const candidates = [...new Set([`${parent}/save`, `${root}/save`])].filter((dir) => fs.statSync(`${dir}/global.rpgsave`) !== null);
+	const candidates = steamSaveSources(fs, root);
 	if (candidates.length !== 1) throw new Error(candidates.length ? 'Steam saves found in two folders; keep only one source' : 'No Steam global.rpgsave found in the game save folder');
 	const max = runtime.DataManager.maxSavefiles();
 	if (!Number.isInteger(max) || max < 1 || max > 999) throw new Error('Invalid save slot count');

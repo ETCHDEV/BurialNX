@@ -5,7 +5,7 @@ export class PauseMenu {
 	open = false;
 	fps = false;
 	selected = 0;
-	private pressed: boolean[] = [];
+	private pressed: boolean[] = Array(16).fill(false);
 	private start: number | undefined;
 	private armed = true;
 	private waitForRelease = false;
@@ -33,8 +33,8 @@ export class PauseMenu {
 				if (action === 'fps') this.fps = !this.fps;
 				if (action === 'continue' || action === 'load') { this.open = false; this.waitForRelease = true; }
 			}
-		} else if (this.waitForRelease && ![0, 1, 12, 13].some(down)) this.waitForRelease = false;
-		this.pressed = Array.from({ length: 16 }, (_, index) => down(index));
+		} else if (this.waitForRelease && !down(0) && !down(1) && !down(12) && !down(13)) this.waitForRelease = false;
+		for (let index = 0; index < 16; index++) this.pressed[index] = down(index);
 		return action;
 	}
 }

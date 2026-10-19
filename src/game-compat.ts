@@ -10,14 +10,18 @@ import { fixIndexedPng } from './indexed-png';
 export function prepareGameScript(path: string, source: string): string | null {
 	if (path.endsWith('/AudioStreaming.js')) return null;
 	if (path.endsWith('/YEP_RegionRestrictions.js') && source.includes("'zlib'") && source.includes('Buffer[')) {
-		// The injected payload occupies one line after the closing `};` of a
-		// real method. The rest of the plugin follows on later lines and must
-		// remain intact (it defines the movement and region helpers).
+		// Keep the code before the single-line desktop bootstrap. Depending on
+		// the game build it closes a method or initializes the RR namespace.
+		// Reject unfamiliar layouts rather than deleting real plugin code.
 		const lines = source.split('\n');
 		const injected = lines.flatMap((line, index) =>
-			line.startsWith('};(function(') && line.includes("'zlib'") && line.includes('Buffer[') ? [index] : []);
+			line.includes("'zlib'") && line.includes('Buffer[') ? [index] : []);
 		if (injected.length !== 1) throw new Error('Unrecognized region plugin: cannot remove Node payload safely');
-		lines[injected[0]] = '};';
+		const line = lines[injected[0]];
+		const prefix = /^(};)\(function\(/.exec(line)?.[1]
+			|| /^(\s*Yanfly\.RR\s*=\s*Yanfly\.RR\s*\|\|\s*\{\s*\};)\s*\(function\(/.exec(line)?.[1];
+		if (!prefix) throw new Error('Unrecognized region plugin: cannot remove Node payload safely');
+		lines[injected[0]] = prefix;
 		return lines.join('\n');
 	}
 	return source;
