@@ -7,8 +7,8 @@ improved BurialNX loader.
 
 ### Files
 
-- `burialnx.nro` — Release build (53.94 MiB). Use this for normal play.
-- `burialnx-debug.nro` — Debug build (53.94 MiB). Adds diagnostic logging
+- `burialnx.nro` — Release build (54.02 MiB). Use this for normal play.
+- `burialnx-debug.nro` — Debug build (54.02 MiB). Adds diagnostic logging
   to `sdmc:/switch/burialnx/LOGS/native-host.log`, asks for save location
   on every launch, and exposes the snapshot/direct-screen menu items.
 
@@ -165,3 +165,77 @@ functionality, run on hardware and exercise:
 12. `Quit BurialNX` stops all audio immediately and exits; the next launch
     of the loader (or of another homebrew app) starts normally, which
     confirms the memory was returned.
+
+### What changed in this build (forwarder + progress bar)
+
+- **Per-game forwarder NROs**: each library entry can now be turned into
+  a standalone forwarder `.nro` that, when launched from the Switch
+  homebrew menu (hbmenu), chain-loads `burialnx.nro` with
+  `--game <id>` so the user lands directly in that game — skipping the
+  library grid. The forwarder pattern mirrors sphaira (libnx
+  `envSetNextLoad`); the nx.js equivalent is
+  `new Switch.Application(burialnxNroPath).launch('--game', id)`, which
+  nx.js's `source/ns.cc` implements as a call to `envSetNextLoad` followed
+  by an exit. To create a forwarder, open a game's options screen
+  (X on the library tile) and pick **Create forwarder NRO**. The loader
+  copies the embedded `forwarder-template.nro` from its own romfs, patches
+  its NACP (title = game name, application ID = a stable 16-bit FNV-1a
+  hash of the game id OR'd into the homebrew title-ID base
+  `0x0100000000010000`) and its icon (the game's cover re-encoded to a
+  256×256 JPEG via `OffscreenCanvas.convertToBlob`), and writes the result
+  to `sdmc:/switch/burialnx/forwarders/<game-id>.nro` (plus a sidecar
+  `<game-id>.json` with the target game id). **Delete forwarder NRO**
+  removes it. Deleting a game from the library also removes its
+  forwarder. The forwarder's own `main.js` reads `Switch.argv[0]` to find
+  its own path, reads the sidecar JSON next to it, and calls
+  `Switch.Application(...).launch('--game', id)`.
+- **Progress-bar loading screen**: the old top-left text panel
+  ("BurialNX / Opening game…") is replaced with a centered rounded
+  progress bar that updates as the launch advances through its stages
+  (reading index → fonts/language → host → scripts N/M → settle →
+  compatibility → starting game). The bar is also reused while building a
+  forwarder NRO. Debug lines still appear in the top-left corner in the
+  debug build.
+- **Forwarder auto-launch (`--game <id>`)**: the loader now parses
+  `Switch.argv` at startup. If it sees `--game <id>` (also accepts
+  `--game=<id>`, `--game-id <id>`, `--game-id=<id>`) and the id is in the
+  library, it skips the library grid and launches the game directly —
+  exactly as if the user had selected it from the library. If the id is
+  not found (e.g. the game was removed), it falls through to the library
+  UI so the user can fix things.
+- **Self-extraction forwarder builder**: burialnx.nro does NOT embed a
+  separate 54 MiB forwarder template (that would double its size).
+  Instead, when the user builds a forwarder, burialnx.nro reads its
+  OWN `.nro` file from the SD card (via `Switch.argv[0]`), copies it,
+  and patches three things in the copy: (1) the romfs `main.js` file
+  data is overwritten with the forwarder's chain-load script (a ~2.5
+  KB string embedded at build time as `__FORWARDER_MAIN_JS__`, with the
+  game-id baked in via a 64-zero placeholder), padded with comment
+  chars so the romfs layout stays valid; (2) the NACP title/author/id
+  fields are patched (title = game name); (3) the icon is optionally
+  replaced with the game's cover JPEG. The result is a self-contained
+  ~54 MiB FAT NRO at `sdmc:/switch/burialnx/<game-id>.nro` — no shared
+  runtime installation needed, no `sdmc:/nx.js/` directory.
+
+### Verifying the forwarder on Switch
+
+1. Add a game to the library (via the `+ Add Game` tile or Y button) and
+   pick a cover image (auto-detect from `.exe`/`.ico` or pick a PNG).
+2. Open the game's options screen (X on the library tile) and select
+   **Create forwarder NRO**. The progress bar shows
+   "Reading forwarder template…", "Reading game cover…",
+   "Re-encoding cover to 256×256 JPEG…", "Patching NACP and icon…",
+   "Done." (~5 seconds). A notice shows the forwarder path.
+3. Quit BurialNX and browse hbmenu — the new forwarder appears with the
+   game's cover as its icon and the game's name as its title. Launching
+   it chain-loads BurialNX and the game starts directly (no library
+   grid). The debug log shows
+   `_fwd: forwarder launch, target game id = <id>` and
+   `_fwd: auto-launching "<name>" (id=<id>)`.
+4. If a forwarder's sidecar JSON is deleted (or the game is removed from
+   the library), launching the forwarder shows a clean error screen
+   ("Sidecar JSON not found: …" or similar) and lets the user press +
+   to exit.
+5. **Delete forwarder NRO** in the game-options screen removes the
+   forwarder `.nro` and its sidecar `.json`.
+

@@ -155,14 +155,32 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.step(press(8), 0); menu.step(press(8), 801);
         assert.equal(menu.open, true);
         menu.step(press(8), 2000); assert.equal(menu.open, true);
-        assert.deepEqual(menu.items, ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod', 'keymap', 'quit']);
-        menu.step(press(0), 2001); assert.equal(menu.open, false);
-        menu.step(null, 2002); assert.equal(menu.blocksInput, false);
+        // Page 1 (main): Resume, Save, Load, Edit keymap, Another, Quit
+        assert.deepEqual(menu.currentItems, ['continue', 'save', 'load', 'keymap', 'another', 'quit']);
+        // Navigate to "Another" (index 4) and select it.
+        menu.selected = 4;
+        menu.step(press(1), 2001);
+        // Now on page 2.
+        assert.equal(menu.page, 2);
+        // Page 2: saves, import, resolution, fps, mod, back (no snapshot/direct in release)
+        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mod', 'back']);
+        // B goes back to page 1.
+        menu.step(press(0), 2002);
+        assert.equal(menu.page, 1);
+        // Release B, then press B again to close the menu.
+        menu.step(null, 2003); // release
+        menu.step(press(0), 2004); assert.equal(menu.open, false);
+        menu.step(null, 2004); assert.equal(menu.blocksInput, false);
         assert.equal((menu as any).pressed, buttonsBuffer);
-        assert.ok(new PauseMenu(true).items.includes('snapshot'));
+        // Debug build includes snapshot and direct on page 2.
+        assert.ok(new PauseMenu(true).itemsPage2.includes('snapshot'));
+        assert.ok(new PauseMenu(true).itemsPage2.includes('direct'));
+        // Release build does NOT include snapshot or direct.
+        assert.ok(!new PauseMenu(false).itemsPage2.includes('snapshot'));
+        assert.ok(!new PauseMenu(false).itemsPage2.includes('direct'));
         menu.open = true; menu.dismiss();
         assert.equal(menu.blocksInput, true);
-        menu.step(null, 2003); assert.equal(menu.blocksInput, false);
+        menu.step(null, 2005); assert.equal(menu.blocksInput, false);
 });
 
 test('folder browser selects a highlighted game and optional mod without writing', () => {

@@ -38,6 +38,13 @@ export const VIRTUAL_KEYS: readonly VirtualKey[] = Object.freeze([
         'up', 'down', 'left', 'right',
 ]);
 
+export interface StickBinding {
+        /** JavaScript keyCode (e.g. 87 for 'W', 83 for 'S'). */
+        keyCode: number;
+        /** Display label (e.g. 'W', 'S', 'A', 'D'). */
+        label: string;
+}
+
 export interface KeyMap {
         /** Maps a gamepad button index (0-15) to a virtual RPG Maker MV key. */
         buttons: VirtualKey[];
@@ -45,6 +52,16 @@ export interface KeyMap {
          *  When present, the UI shows the label instead of the virtual key name
          *  so the user can see which keyboard key is bound to each button. */
         labels?: string[];
+        /** Analog stick → keyboard key bindings. When the stick is pushed
+         *  past 0.5 in a direction, the bound keyCode is "pressed" via
+         *  Input._currentState. This lets the user bind sticks to movement
+         *  keys (e.g. L-stick up = W, L-stick down = S, etc.). */
+        sticks?: {
+                lUp?: StickBinding; lDown?: StickBinding;
+                lLeft?: StickBinding; lRight?: StickBinding;
+                rUp?: StickBinding; rDown?: StickBinding;
+                rLeft?: StickBinding; rRight?: StickBinding;
+        };
 }
 
 export const DEFAULT_KEYMAP: KeyMap = {
@@ -81,7 +98,10 @@ export function parseKeyMap(text: string): KeyMap {
                 if (typeof value !== 'string' || !VIRTUAL_KEYS.includes(value as VirtualKey)) throw new Error(`Invalid key for button ${index}`);
                 return value as VirtualKey;
         });
-        return { buttons };
+        const map: KeyMap = { buttons };
+        if (Array.isArray(data.labels)) map.labels = data.labels;
+        if (data.sticks && typeof data.sticks === 'object') map.sticks = data.sticks;
+        return map;
 }
 
 const KEYMAP_PATH = 'sdmc:/switch/burialnx/keymap.json';

@@ -28,7 +28,7 @@ async function picker(debug = false, previous = null, fixtures = new Map(), feat
   const cafNative = (id) => { const index = scheduled.findIndex((entry) => entry.id === id); if (index !== -1) scheduled.splice(index, 1); };
   if (previous) settings.set('sdmc:/switch/burialnx/settings.json', JSON.stringify(previous));
   let buttons = [], clock = 0;
-  const graphics = { save() {}, restore() {}, setTransform() {}, fillRect() {}, strokeRect() {}, fillText(text) { labels.push(text); }, strokeText() {}, drawImage() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, rect() {}, clip() {}, closePath() {}, measureText: () => ({ width: 0 }) };
+  const graphics = { save() {}, restore() {}, setTransform() {}, fillRect() {}, strokeRect() {}, fillText(text) { labels.push(text); }, strokeText() {}, drawImage() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, rect() {}, clip() {}, closePath() {}, quadraticCurveTo() {}, fill() {}, stroke() {}, measureText: () => ({ width: 0 }) };
   const fs = {
     mkdirSync() {},
     readDirSync(path) { return path === 'sdmc:/' ? ['game'] : []; },
@@ -424,15 +424,15 @@ test('the retired game frame loop cannot crash the quit path', async () => {
   assert.ok(ui.context.__gameUpdates >= 1, 'the fake game loop actually ran');
   const retiredUpdate = ui.context.__scheduledUpdate; // the ORIGINAL bound update
   assert.equal(typeof retiredUpdate, 'function', 'the game loop exposed its pending bound update');
-  // Pause menu → "Quit BurialNX" (last item, index 10 in the debug build).
+  // Pause menu → "Quit BurialNX" (page 1, index 5).
   // The game ticks interleave with app frames, so every button press is held
   // for two ticks (whichever of them runs the app frame processes the press)
   // and each menu step takes three ticks (press, press, release) to survive
   // the alternation.
   for (let i = 0; i < 55; i++) await ui.tick([8]);
   await ui.tick(); // Release Minus.
-  for (let i = 0; i < 10; i++) { await ui.tick([13]); await ui.tick([13]); await ui.tick(); }
-  await ui.tick([1]); // A: Quit BurialNX.
+  for (let i = 0; i < 5; i++) { await ui.tick([13]); await ui.tick([13]); await ui.tick(); }
+  await ui.tick([1]); await ui.tick([1]); await ui.tick(); // A: Quit BurialNX.
   // Switch.exit was called exactly once.
   assert.equal(exits.length, 1, 'Switch.exit was called once');
   // The game globals were deleted by the realm restore before exit.
@@ -493,14 +493,15 @@ test('quitting tears the game down completely and exits through Switch.exit', as
   // Hold Minus to open the pause menu, then choose "Quit BurialNX" (last item).
   for (let i = 0; i < 55; i++) await ui.tick([8]);
   await ui.tick(); // Release Minus.
-  // Release build: 9 items, quit is index 8 (last). "Back to library" is gone —
-  // the single exit path is "Quit BurialNX", which performs the full game
-  // teardown (audio, frame loop, caches, realm restore, GC) before Switch.exit.
+  // Release build: page 1 has 6 items, quit is index 5 (last).
+  // "Back to library" is gone — the single exit path is "Quit BurialNX",
+  // which performs the full game teardown (audio, frame loop, caches,
+  // realm restore, GC) before Switch.exit.
   // Relaunching BurialNX from hbmenu is now the way to return to the library,
   // which is a guaranteed clean cold boot (Horizon OS reclaims the reserved
   // process memory on exit).
-  for (let i = 0; i < 8; i++) { await ui.tick([13]); await ui.tick(); }
-  await ui.tick([1]); // A: quit.
+  for (let i = 0; i < 5; i++) { await ui.tick([13]); await ui.tick(); }
+  await ui.tick([1]); await ui.tick([1]); // A: quit.
   assert.equal(exits.length, 1, 'Switch.exit was called exactly once');
   assert.equal(ui.context.SceneManager, undefined, 'the game global scope was released before exiting');
   assert.equal(ui.context.AudioManager, undefined, 'the game audio globals were released before exiting');

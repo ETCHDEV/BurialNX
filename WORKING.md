@@ -109,6 +109,26 @@ falls back to a fixed top band without geometry.
 - `src/saves.ts` supports separate SD or explicitly selected game-folder
   storage, retains recovery copies on interrupted writes, and imports Steam
   files only into an empty separate destination.
+- `src/forwarder.ts` builds per-game forwarder NROs at runtime. A forwarder
+  is a small self-contained nx.js NRO whose `main.js` reads a sidecar JSON
+  next to itself and chain-loads `burialnx.nro` with `--game <id>` (via
+  `Switch.Application(...).launch`, which nx.js implements as a call to
+  libnx `envSetNextLoad` — the same primitive sphaira's `nro_launch` uses).
+  The module is pure JS (no Switch access at module top level): it decodes
+  the NRO0/ASET layout, patches the NACP title/author/id, re-encodes a
+  256×256 JPEG icon from the game cover via `OffscreenCanvas.convertToBlob`,
+  and rebuilds the asset section. The template NRO is embedded at build
+  time into burialnx.nro's own romfs (`romfs:/forwarder-template.nro`,
+  see `forwarder-template/`), so the runtime builder only needs to copy +
+  patch it per game.
+- `main.ts` now also parses `Switch.argv` for `--game <id>` at startup and,
+  if found and the id is in the library, auto-launches the game directly
+  (the entry point for forwarder chain-loads). The launch flow reports
+  per-stage progress to a centered progress bar (`renderLoading`) instead
+  of the old top-left text panel. The new `forwarder-building` phase
+  drives `buildForwarder()` with the same progress bar, and ignores the
+  Plus button so a multi-MiB NRO write is never interrupted mid-write.
+
 
 ## Why compatibility code is needed
 

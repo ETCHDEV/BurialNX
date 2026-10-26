@@ -11,6 +11,7 @@ import { installMapPrefetch, MapPrefetcher } from './map-prefetch';
 import { entryFromSelection, libraryIdFromRoot, loadLibrary, markPlayed, removeGame, toSelection, upsertGame, type LibraryEntry, type LibraryFile, type LibraryAccess } from './game-library';
 import { BUTTON_NAMES, DEFAULT_KEYMAP, applyKeyMap, loadKeyMap, PRESETS, saveKeyMap, setButton, setButtonWithLabel, VIRTUAL_KEYS, type KeyMap, type VirtualKey } from './keymap';
 import { COVERS_DIR, coverPathFor, deriveDefaultCover, saveUserCover, saveUserCoverLogged } from './cover';
+import { buildForwarder, deleteForwarder, forwarderExists, forwarderPathFor, forwarderDirFor, sanitizeGameName, BURIALNX_NRO_PATH, BURIALNX_DEBUG_NRO_PATH } from './forwarder';
 
 declare const __DEBUG__: boolean;
 const debugLines: string[] = [];
@@ -128,7 +129,7 @@ let selectedGame: string | undefined;
 let selectedMod: string | null | undefined;
 let sharedSaves = false;
 let waitForRelease = false;
-let phase: 'library' | 'picker' | 'game-options' | 'keymap' | 'cover-confirm' | 'notice' | 'save-choice' | 'game-save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' | 'rename' | 'rename-kb' = 'library';
+let phase: 'library' | 'picker' | 'game-options' | 'keymap' | 'cover-confirm' | 'notice' | 'save-choice' | 'game-save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' | 'rename' | 'rename-kb' | 'add-game-name' | 'forwarder-building' = 'library';
 let pickerPurpose: 'game' | 'startup-mod' | 'menu-mod' | 'game-mod' | 'startup-saves' | 'menu-saves' | 'add-game' | 'cover-image' = 'game';
 let noticeReturnPhase: 'library' | 'game-options' = 'library';
 let saveLocation: SaveLocation | undefined;
@@ -145,12 +146,122 @@ const previousButtons: boolean[] = Array(16).fill(false);
 let marqueeOffset = 0; // scrolling text offset for long game names
 let gameStopped = false; // when true, SceneManager.updateMain override returns early (no game update)
 
+// === Loading progress bar state =======================================
+// Replaces the old top-left text panel ("BurialNX / Opening game…") with a
+// centered progress bar that updates as launch() advances through its
+// stages. The bar is also reused while building a forwarder NRO.
+//  - loadingLabel: short human line under the bar ("Loading scripts 3/47…")
+//  - loadingProgress: 0..1 (clamped). NaN/Infinity is treated as 0.
+//  - loadingTitle: title shown above the bar (defaults to "BurialNX")
+//  - loadingSubtext: optional small grey line under the label (e.g. the
+//    path of the script currently being loaded).
+let loadingLabel = '';
+let loadingSubtext = '';
+let loadingProgress = 0;
+let loadingTitle = 'BurialNX';
+/** Update the loading screen state. The frame loop picks these up and
+ *  renders the bar on the next vsync. `progress` is clamped to [0,1]. */
+function setLoadingProgress(progress: number, label?: string, subtext?: string) {
+        if (Number.isFinite(progress)) loadingProgress = Math.max(0, Math.min(1, progress));
+        if (label !== undefined) loadingLabel = label;
+        if (subtext !== undefined) loadingSubtext = subtext;
+}
+/** Reset the loading screen to its initial state for a new operation. */
+function resetLoading(title = 'BurialNX', initialLabel = 'Starting…') {
+        loadingTitle = title; loadingLabel = initialLabel; loadingSubtext = ''; loadingProgress = 0;
+}
+/** Draw the centered loading screen. Renders over whatever the game/host
+ *  had on screen so the user sees a clean transition into the launch. */
+function renderLoading() {
+        if (!ctx) return;
+        try {
+                ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+                ctx.fillStyle = '#161823'; ctx.fillRect(0, 0, screen.width, screen.height);
+                const cx = screen.width / 2;
+                // Title
+                ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+                ctx.fillStyle = '#f4f3ef'; ctx.font = '34px sans-serif';
+                ctx.fillText(loadingTitle, cx, screen.height / 2 - 80);
+                // Label (current stage)
+                ctx.fillStyle = '#c9cdd6'; ctx.font = '22px sans-serif';
+                ctx.fillText(loadingLabel, cx, screen.height / 2 + 60);
+                // Subtext (e.g. script path)
+                if (loadingSubtext) {
+                        ctx.fillStyle = '#6e7681'; ctx.font = '18px sans-serif';
+                        // Truncate the subtext to fit within ~80% of the screen width.
+                        const maxW = screen.width * 0.8;
+                        let text = loadingSubtext;
+                        if (ctx.measureText(text).width > maxW) {
+                                let lo = 0, hi = text.length;
+                                while (lo < hi) {
+                                        const mid = (lo + hi + 1) >> 1;
+                                        if (ctx.measureText(text.slice(0, mid) + '…').width <= maxW) lo = mid; else hi = mid - 1;
+                                }
+                                text = text.slice(0, lo) + '…';
+                        }
+                        ctx.fillText(text, cx, screen.height / 2 + 88);
+                }
+                // Progress bar: a rounded-rectangle track + filled portion + %.
+                const barW = Math.min(820, screen.width - 160);
+                const barH = 26;
+                const barX = (screen.width - barW) / 2;
+                const barY = screen.height / 2 - 24;
+                const radius = Math.max(2, Math.min(barH / 2, 13));
+                // Track (outline)
+                ctx.lineWidth = 2; ctx.strokeStyle = '#3a3f4b'; ctx.fillStyle = '#1f2229';
+                roundedRectPath(barX, barY, barW, barH, radius);
+                ctx.fill(); ctx.stroke();
+                // Fill
+                const fillW = Math.max(0, Math.min(barW - 4, (barW - 4) * loadingProgress));
+                if (fillW > 0) {
+                        ctx.fillStyle = '#3fb950';
+                        // Inset by 2px on each side so the track stays visible.
+                        roundedRectPath(barX + 2, barY + 2, fillW, barH - 4, Math.max(2, radius - 2));
+                        ctx.fill();
+                }
+                // Percentage text, centered inside the bar
+                ctx.fillStyle = '#f4f3ef'; ctx.font = '18px sans-serif'; ctx.textBaseline = 'middle';
+                const pct = `${Math.round(loadingProgress * 100)}%`;
+                ctx.fillText(pct, cx, barY + barH / 2 + 1);
+                ctx.textBaseline = 'alphabetic';
+                // Debug lines, if any, in the top-left corner so devs still get
+                // diagnostics without losing the new bar UI.
+                if (__DEBUG__ && debugLines.length) {
+                        ctx.textAlign = 'left'; ctx.fillStyle = '#6e7681'; ctx.font = '16px sans-serif';
+                        let y = 24;
+                        for (const line of debugLines.slice(-12)) { ctx.fillText(line, 20, y); y += 20; }
+                }
+                ctx.restore();
+        } catch (error) { log(`_loading: renderLoading failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+/** Trace a rounded-rectangle path on the current 2D context. nx.js's canvas
+ *  does not expose ctx.roundRect, so we approximate it with quadratic curves
+ *  (matches the Geometry in the WHATWG roundRect proposal). */
+function roundedRectPath(x: number, y: number, w: number, h: number, r: number) {
+        if (!ctx) return;
+        const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.lineTo(x + w - rr, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+        ctx.lineTo(x + w, y + h - rr);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+        ctx.lineTo(x + rr, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+        ctx.lineTo(x, y + rr);
+        ctx.quadraticCurveTo(x, y, x + rr, y);
+        ctx.closePath();
+}
+
 // === Plus-button exit guard state ======================================
 let exitArmed = false;
 let exitArmedAt = 0;
 let exitNoticeArmed = false;
 let allowExit = false;
 const realExit = typeof (Switch as any).exit === 'function' ? (Switch as any).exit.bind(Switch) : null;
+// Plus(+) hold timer — the quit dialog only appears when + is held
+// for 500ms (like Minus for the pause menu). Prevents accidental exits.
+let plusHoldStart = 0;
 
 // === Game session snapshot ============================================
 // The game runs in THIS JavaScript realm: its scripts are eval'd at global
@@ -369,13 +480,45 @@ function teardownGame() {
 }
 
 function quitApp() {
-        // Return all memory and shut everything down before exiting: stop the
-        // game (audio + frame loop + image buffers) and run a final GC pass,
-        // then let the runtime tear the process down — nx.js unmounts save
-        // data and releases its native arenas from Switch.exit().
-        try { teardownGame(); } catch { /* best-effort */ }
-        if (realExit) { allowExit = true; realExit(); }
-        else { /* fall back to letting the runtime handle it */ }
+        // Return all memory and shut everything down: stop the game
+        // (audio + frame loop + image buffers) and run a final GC pass.
+        try { teardownGame(); } catch (e) { log(`quitApp: teardown threw: ${e instanceof Error ? e.message : String(e)}`); }
+        forwarderTargetId = null;
+        phase = 'library';
+        exitNoticeArmed = false;
+        plusHoldStart = 0;
+        // FOR FORWARDER LAUNCHES: the forwarder called
+        // envSetNextLoad(burialnx.nro, "--game gameId") which may be
+        // PERSISTENT (not consumed when burialnx.nro was loaded).
+        // When we call Switch.exit(), hbloader sees the stale
+        // next-load and RE-LOADS burialnx.nro with --game → the
+        // game restarts in a loop.
+        //
+        // FIX: override the stale next-load by calling
+        // Switch.Application.launch(burialnx.nro) WITHOUT --game.
+        // This sets a NEW next-load (burialnx.nro without game) and
+        // exits the process. hbloader loads burialnx.nro (no --game)
+        // → burialnx shows the library briefly → then the user can
+        // press HOME to go to the Switch HOME menu.
+        //
+        // If the launch call fails (burialnx.nro not found), fall
+        // back to Switch.exit().
+        try {
+                const SwitchAny = (Switch as any);
+                let nroPath = BURIALNX_NRO_PATH;
+                let app: any;
+                try { app = new SwitchAny.Application(nroPath); }
+                catch { nroPath = BURIALNX_DEBUG_NRO_PATH; app = new SwitchAny.Application(nroPath); }
+                allowExit = true;
+                // Launch burialnx.nro WITHOUT --game → shows library.
+                // This overrides the stale next-load from the forwarder.
+                app.launch(nroPath);
+                // launch() is `never` — if it returns, the chain failed.
+                // Fall through to Switch.exit().
+        } catch (e) {
+                log(`quitApp: launch failed, falling back to Switch.exit: ${e instanceof Error ? e.message : String(e)}`);
+                if (realExit) { allowExit = true; realExit(); }
+        }
 }
 
 // === Library state ======================================================
@@ -397,6 +540,16 @@ let renameBuffer = '';
 let renameCursor = 0;
 let renameSubmitted = false;
 let renamePreview = '';
+
+// === Add-game-name state ==============================================
+// When the user picks a game folder via +Add Game, we open the software
+// keyboard so they can name the game before it's added to the library.
+// The suggested name is derived from the folder name or a .exe file in
+// the parent folder.
+let addGamePath = '';
+let addGameDefaultName = '';
+let addGameSubmitted = false;
+let addGamePreview = '';
 
 // === Keymap state =======================================================
 // Two keymaps are tracked separately:
@@ -499,6 +652,129 @@ function startOrChooseSaves() {
         if (saveLocation) void launch();
         else { choiceFromMenu = false; waitForRelease = true; phase = 'save-choice'; }
 }
+
+// === Add-game-name helpers ============================================
+/** Suggest a game name from the picked folder path. Looks for a .exe
+ *  file in the parent folder (RPG Maker MV games usually have one next
+ *  to the www/ folder). If found, uses the .exe filename without the
+ *  extension. Otherwise, uses the folder name. */
+function suggestGameName(root: string): string {
+        try {
+                // RPG Maker MV's www/ contains the web assets; the .exe usually
+                // lives next to it. Look one level up when the root is www/.
+                const clean = root.replace(/\/+$/, '');
+                const parent = /\/www$/i.test(clean) ? clean.slice(0, -4) : clean;
+                const dir = parent;
+                let entries: string[] | null = null;
+                try { entries = (Switch as any).readDirSync?.(`${dir}/`) as string[] | null; } catch { /* unreadable */ }
+                if (entries) {
+                        for (const name of entries) {
+                                if (name && /\.exe$/i.test(name)) {
+                                        // Use the .exe filename without the extension.
+                                        return name.replace(/\.exe$/i, '');
+                                }
+                        }
+                }
+        } catch { /* best-effort */ }
+        // Fall back to the folder name.
+        return root.replace(/\/+$/, '').split('/').pop() || 'Game';
+}
+
+/** Finish the add-game flow: create the library entry with the given
+ *  name, try to auto-detect a cover, and return to the library. */
+function finishAddGame(name: string): void {
+        if (!addGamePath) { waitForRelease = true; phase = 'library'; return; }
+        const id = libraryIdFromRoot(addGamePath);
+        const trimmedName = name.trim() || addGameDefaultName || (addGamePath.split('/').pop() || 'Game');
+        // Try to derive a cover from the folder.
+        let cover: string | null = null;
+        try { cover = deriveDefaultCover(Switch as unknown as LibraryAccess & { readDirSync(path: string): string[] | null }, id, addGamePath); }
+        catch (error) { log(`Cover auto-detect failed: ${String(error)}`); }
+        const entry: LibraryEntry = { id, name: trimmedName, root: addGamePath, sharedSaves: false, mod: null, ...(cover ? { cover } : { cover: null }) };
+        if (rememberLibrary(entry)) { library = loadLibrary(Switch as unknown as LibraryAccess); invalidateCoverCache(); }
+        // Pre-select the new game.
+        const idx = library.games.findIndex((g) => g.id === id);
+        if (idx >= 0) libraryCursor = idx;
+        libraryPage = Math.floor(libraryCursor / LIBRARY_PAGE_SIZE);
+        // Clean up.
+        addGamePath = '';
+        addGameDefaultName = '';
+        addGameSubmitted = false;
+        addGamePreview = '';
+        try { navigator?.virtualKeyboard?.removeEventListener?.('change', () => {}); } catch { /* best-effort */ }
+        try { navigator?.virtualKeyboard?.removeEventListener?.('submit', () => {}); } catch { /* best-effort */ }
+        waitForRelease = true; phase = 'library';
+}
+
+// === Forwarder builder entrypoint =====================================
+// Drives the buildForwarder() pipeline from main.ts. Reads the embedded
+// template NRO from romfs, reads the game's cover PNG from the SD card
+// (if present), and hands them to buildForwarder(), updating the loading
+// progress bar at each stage so the user sees what's happening. On
+// completion it shows a notice with the result. The whole operation runs
+// while phase === 'forwarder-building', so the frame loop renders the
+// progress bar and B is ignored (we don't want to interrupt a half-written
+// NRO).
+async function startForwarderBuild(entry: LibraryEntry) {
+        const SwitchAny = (Switch as any);
+        if (!SwitchAny?.writeFileSync || !SwitchAny?.readFileSync) {
+                message = 'Switch filesystem unavailable — cannot build forwarder.'; waitForRelease = true; phase = 'notice'; return;
+        }
+        // Defer one tick so the new phase paints before the (sync) SD reads
+        // start blocking. The phase renders the progress bar.
+        waitForRelease = true; phase = 'forwarder-building';
+        resetLoading(`Forwarder: ${entry.name}`, 'Reading burialnx.nro…');
+        // Yield to the next frame so the loading screen paints.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        try {
+                // Read burialnx.nro's OWN file (the running app) to use as the
+                // forwarder base. Switch.argv[0] is the path hbmenu used to
+                // launch us. The forwarder is built by patching a copy of
+                // this NRO: overwrite main.js in the romfs with the forwarder's
+                // chain-load script, patch the NACP (title = game name), and
+                // optionally patch the icon. No embedded template needed —
+                // burialnx.nro stays at ~54 MiB.
+                const selfPath = SwitchAny.argv?.[0] as string | undefined;
+                if (!selfPath) {
+                        message = 'Could not determine the burialnx.nro path (Switch.argv[0] is empty).'; waitForRelease = true; phase = 'notice'; return;
+                }
+                setLoadingProgress(0.05, 'Reading burialnx.nro…', selfPath);
+                const baseNro = SwitchAny.readFileSync(selfPath) as ArrayBuffer | null;
+                if (!baseNro || baseNro.byteLength === 0) {
+                        message = `Could not read ${selfPath}. Make sure burialnx.nro is at that path.`; waitForRelease = true; phase = 'notice'; return;
+                }
+                if (__DEBUG__) log(`forwarder: base NRO loaded from ${selfPath}, ${baseNro.byteLength} bytes`);
+                setLoadingProgress(0.35, 'Reading game cover…');
+                const coverPath = entry.cover || coverPathFor(entry.id);
+                const coverExists = coverPath ? !!(Switch as unknown as LibraryAccess).statSync?.(coverPath) : false;
+                if (__DEBUG__) log(`forwarder: cover path = ${coverPath || '(none)'}, exists = ${coverExists}`);
+                setLoadingProgress(0.50, coverExists ? 'Decoding cover image…' : 'No cover — keeping BurialNX icon…', coverPath || '(none)');
+                setLoadingProgress(0.65, 'Patching NACP + main.js + game id…');
+                const outputPath = forwarderPathFor(entry.name, entry.id);
+                const result = await buildForwarder({
+                        game: entry,
+                        cover: coverExists ? { path: coverPath } : null,
+                        baseNro,
+                        outputPath,
+                        log,
+                });
+                setLoadingProgress(1, 'Done.');
+                if (result.ok) {
+                        const mib = result.bytes ? (result.bytes / 1024 / 1024).toFixed(1) : '?';
+                        message = `Forwarder built: ${outputPath} (${mib} MiB). Reboot to hbmenu to see it.`;
+                        if (__DEBUG__) log(`forwarder build ok: ${outputPath} (${result.bytes} bytes)`);
+                } else {
+                        message = `Forwarder build failed: ${result.error || 'unknown error'}`;
+                        if (__DEBUG__) log(`forwarder build failed: ${result.error}`);
+                }
+                waitForRelease = true; phase = 'notice';
+        } catch (error) {
+                const msg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+                log(`startForwarderBuild threw: ${msg}`);
+                message = `Forwarder build error: ${msg}`;
+                waitForRelease = true; phase = 'notice';
+        }
+}
 function chooseSaves(location: SaveLocation) {
         if (!selectedGame) return;
         if (!validSaveLocation(location, selectedGame, selectedMod || null)) {
@@ -558,9 +834,125 @@ function panel(lines: string[], full = false) {
 function hud() {
         if (phase !== 'game') return;
         if (menu.open) {
-                const labels: Record<string, string> = { continue: 'Resume', load: 'Load existing save', saves: 'Choose save location (restart)', import: 'Import Steam saves to current location', resolution: `Display: ${fit ? 'fit' : 'native size'}`, fps: `FPS: ${menu.fps ? 'on' : 'off'}`, mod: 'Select mod for next launch', direct: `Direct screen next start: ${directNext ? 'on' : 'off'}`, snapshot: 'Write diagnostic snapshot', keymap: 'Edit joycon key bindings', quit: 'Quit BurialNX (exit to hbmenu)' };
-                panel(['BurialNX  |  Up/Down: select  A: choose  B: close', `${fps.toFixed(1)} FPS`, ...menu.items.map((item, i) => `${i === menu.selected ? '> ' : '  '}${labels[item]}`)]);
-        } else if (menu.fps) panel([`${fps.toFixed(1)} FPS`]);
+                renderPauseMenu();
+        } else if (menu.fps) {
+                // FPS counter only (compact, top-left, no background).
+                ctx.save();
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.globalAlpha = 1;
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.font = '18px sans-serif';
+                ctx.fillStyle = '#3fb950';
+                ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+                ctx.fillText(`${fps.toFixed(1)} FPS`, 28, 28);
+                ctx.restore();
+        }
+}
+
+/** Compact pause menu (hold Minus). The background only covers the
+ *  menu items, not the full screen — the game is visible around it. */
+function renderPauseMenu(): void {
+        if (!ctx) return;
+        const labels: Record<string, string> = {
+                continue: 'Resume', save: 'Save', load: 'Load',
+                keymap: 'Edit joycon key bindings',
+                another: 'Another...', back: 'Back',
+                quit: 'Quit BurialNX',
+                saves: 'Choose save location', import: 'Import Steam saves',
+                resolution: `Display: ${fit ? 'fit' : 'native'}`,
+                fps: `FPS: ${menu.fps ? 'on' : 'off'}`,
+                mod: 'Select mod for next launch',
+                direct: `Direct screen: ${directNext ? 'on' : 'off'}`,
+                snapshot: 'Diagnostic snapshot',
+        };
+        const items = menu.currentItems;
+        // Top bar (always visible when menu is open).
+        const topBar = 'BurialNX  |  Up/Down: select  A: choose  B: back/close'
+                + (menu.fps ? `  |  ${fps.toFixed(1)} FPS` : '');
+        // FIXED panel size — accommodates the larger page (page 2 with
+        // 8 items in debug, 6 in release). Using a fixed size means
+        // the opaque panel always covers the same screen area, so
+        // switching pages doesn't leave ghosting from the old panel.
+        // The actual items are vertically CENTERED within the panel.
+        const maxItems = __DEBUG__ ? 8 : 6;
+        const itemH = 26;
+        const topH = 30;
+        const padding = 12;
+        const panelH = topH + maxItems * itemH + padding * 2;
+        const panelW = Math.min(620, screen.width - 80);
+        const panelX = Math.floor((screen.width - panelW) / 2);
+        const panelY = Math.floor((screen.height - panelH) / 2);
+        // Center the actual items between the separator line and the
+        // panel bottom (minus padding). This ensures the items column
+        // is visually centered in the panel's content area.
+        const itemsAreaStart = panelY + padding + topH + 4; // small gap below separator
+        const itemsAreaEnd = panelY + panelH - padding;     // panel bottom minus padding
+        const itemsAreaH = itemsAreaEnd - itemsAreaStart;
+        const actualItemsH = items.length * itemH;
+        const itemsOffset = Math.max(0, Math.floor((itemsAreaH - actualItemsH) / 2));
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        // OPAQUE panel background — no full-screen clear needed.
+        // The game is visible AROUND the panel (outside its area).
+        // The opaque panel covers any previous content underneath.
+        ctx.fillStyle = '#161823';
+        roundedRectPath(panelX, panelY, panelW, panelH, 8);
+        ctx.fill();
+        ctx.strokeStyle = '#3a3f4b'; ctx.lineWidth = 1;
+        ctx.stroke();
+        // Top bar.
+        ctx.font = '18px sans-serif';
+        ctx.fillStyle = '#9aa0b4';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.fillText(topBar, panelX + padding, panelY + padding + 18);
+        // Separator.
+        ctx.fillStyle = '#3a3f4b';
+        ctx.fillRect(panelX + padding, panelY + padding + topH, panelW - padding * 2, 1);
+        // Items (vertically centered between separator and panel bottom).
+        ctx.font = '22px sans-serif';
+        for (let i = 0; i < items.length; i++) {
+                const isSel = i === menu.selected;
+                const y = itemsAreaStart + itemsOffset + (i + 1) * itemH;
+                ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
+                const prefix = isSel ? '> ' : '  ';
+                ctx.fillText(prefix + labels[items[i]], panelX + padding, y);
+        }
+        ctx.restore();
+}
+
+/** Centered quit-confirmation dialog. NO background overlay — the game
+ *  is fully visible behind the dialog box. */
+function renderQuitDialog(): void {
+        if (!ctx) return;
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        // NO full-screen overlay — the game shows through.
+        // Compact dialog box (centered, opaque).
+        const boxW = 440, boxH = 140;
+        const boxX = Math.floor((screen.width - boxW) / 2);
+        const boxY = Math.floor((screen.height - boxH) / 2);
+        ctx.fillStyle = '#1f2229';
+        roundedRectPath(boxX, boxY, boxW, boxH, 10);
+        ctx.fill();
+        ctx.strokeStyle = '#3a3f4b'; ctx.lineWidth = 1;
+        ctx.stroke();
+        // Title.
+        ctx.font = '24px sans-serif';
+        ctx.fillStyle = '#f4f3ef';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+        ctx.fillText('Quit BurialNX?', screen.width / 2, boxY + 50);
+        // Buttons.
+        ctx.font = '18px sans-serif';
+        ctx.fillStyle = '#3fb950';
+        ctx.fillText('A: Yes', screen.width / 2 - 70, boxY + 95);
+        ctx.fillStyle = '#f85149';
+        ctx.fillText('B: No', screen.width / 2 + 70, boxY + 95);
+        ctx.textAlign = 'left';
+        ctx.restore();
 }
 function fail(error: unknown, async = false) {
         const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack || ''}` : String(error);
@@ -854,7 +1246,15 @@ function renderLibrary() {
         }
         // Footer hint
         ctx.fillStyle = '#9aa0b4';
-        ctx.fillText('A: Play  X: Options  Y: Add game  B/Minus: Settings menu  Plus: Quit', 28, screen.height - 24);
+        ctx.fillText('A: Play  X: Options  Y: Add game  Hold Minus: Menu  Hold Plus: Quit', 28, screen.height - 24);
+        // Version string (bottom-right) so the user can verify they're
+        // running the latest build.
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#6e7681';
+        ctx.font = '14px sans-serif';
+        ctx.fillText('v0.1.3-fwd ' + (__DEBUG__ ? 'debug' : 'release'), screen.width - 28, screen.height - 24);
+        ctx.textAlign = 'left';
+        ctx.font = '20px sans-serif';
         ctx.restore();
 }
 function drawPlaceholderCover(x: number, y: number, w: number, h: number) {
@@ -873,36 +1273,113 @@ function drawPlaceholderCover(x: number, y: number, w: number, h: number) {
 }
 
 // === Game options UI ===================================================
+// Compact, scrollable layout. With 14 menu items (after adding the
+// forwarder entries) the old fixed-height panel overflowed the screen.
+// The new layout:
+//   - Title (1 line, 20px, white)
+//   - 6 header info lines (18px, grey — combined to save vertical space)
+//   - A separator line
+//   - A scrollable window of menu items (22px, white/green cursor) that
+//     auto-scrolls to keep the cursor visible. ▲/▼ indicators on the
+//     right margin show when more items exist above/below.
 function renderGameOptions() {
         if (!currentEntry) { phase = 'library'; return; }
+        if (!ctx) return;
         const hasPerGameKeymap = !!currentEntry.keymap;
         const hasMod = currentEntry.mod !== undefined && currentEntry.mod !== null;
         const modOn = hasMod && currentEntry.modEnabled !== false;
-        const lines = [
+        const hasForwarder = forwarderExists(Switch as unknown as LibraryAccess, currentEntry.name, currentEntry.id);
+        // --- Header info (combined to 6 lines to save vertical space). ---
+        const coverLabel = currentEntry.cover ? currentEntry.cover.split('/').pop() || currentEntry.cover : '(none)';
+        const modLabel = hasMod ? `${modOn ? 'ON' : 'OFF'} — ${currentEntry.mod!.split('/').pop() || currentEntry.mod}` : '(none)';
+        const saveLabel = currentEntry.saves ? (currentEntry.saves.kind === 'switch' ? 'Switch user data' : (currentEntry.saves.folder.split('/').pop() || currentEntry.saves.folder)) : '(not set)';
+        const fwdLabel = hasForwarder ? 'created' : '(none)';
+        const headers: string[] = [
                 `Game: ${currentEntry.name}`,
-                `Path: ${currentEntry.root}`,
-                `Cover: ${currentEntry.cover || '(none — auto-detect or pick)'}`,
-                `Shared saves: ${currentEntry.sharedSaves ? 'yes' : 'no'}`,
-                `Mod: ${hasMod ? (modOn ? 'ON' : 'OFF') + ' — ' + currentEntry.mod : '(none)'}`,
-                `Save: ${currentEntry.saves ? (currentEntry.saves.kind === 'switch' ? 'Switch user data' : currentEntry.saves.folder) : '(not set)'}`,
-                `Keymap: ${hasPerGameKeymap ? 'per-game (overrides global)' : 'global default'}`,
-                '',
-                `> Play`,
-                '  Pick cover image',
-                '  Auto-detect cover from .exe/.ico',
-                '  Edit keymap (this game)',
-                hasPerGameKeymap ? '  Reset to global keymap' : '  (no per-game keymap to reset)',
-                '  Rename game',
-                hasMod ? '  Change mod folder' : '  Select mod folder',
-                modOn ? '  Disable mod' : (hasMod ? '  Enable mod' : '  (no mod to toggle)'),
-                '  Toggle shared saves',
-                '  Change save folder',
-                '  Delete from library',
-                '  Back to library (B)',
+                `Path: ${truncateForDisplay(currentEntry.root, 70)}`,
+                `Cover: ${coverLabel}  |  Shared saves: ${currentEntry.sharedSaves ? 'yes' : 'no'}`,
+                `Mod: ${modLabel}  |  Keymap: ${hasPerGameKeymap ? 'per-game' : 'global'}`,
+                `Save: ${saveLabel}  |  Forwarder: ${fwdLabel}`,
         ];
-        const start = 8;
-        lines[start + gameOptionsCursor] = lines[start + gameOptionsCursor].replace(/^  /, '> ');
-        panel(['BurialNX — game options', ...lines], true);
+        // --- Menu items (14 total). ---
+        const items: string[] = [
+                'Play',
+                'Pick cover image',
+                'Auto-detect cover from .exe/.ico',
+                'Edit keymap (this game)',
+                hasPerGameKeymap ? 'Reset to global keymap' : '(no per-game keymap to reset)',
+                'Rename game',
+                hasMod ? 'Change mod folder' : 'Select mod folder',
+                modOn ? 'Disable mod' : (hasMod ? 'Enable mod' : '(no mod to toggle)'),
+                'Toggle shared saves',
+                'Change save folder',
+                hasForwarder ? 'Recreate forwarder NRO' : 'Create forwarder NRO',
+                hasForwarder ? 'Delete forwarder NRO' : '(no forwarder to delete)',
+                'Delete from library',
+                'Back to library (B)',
+        ];
+        // --- Layout constants. ---
+        const titleY = 26;
+        const headerFont = '18px sans-serif';
+        const headerSpacing = 20;
+        const headerStartY = 50;
+        const itemsStartY = headerStartY + headers.length * headerSpacing + 30; // + separator gap (enough room below the line)
+        const itemFont = '22px sans-serif';
+        const itemSpacing = 26;
+        const bottomMargin = 14;
+        const visibleItems = Math.max(1, Math.floor((screen.height - itemsStartY - bottomMargin) / itemSpacing));
+        const maxScroll = Math.max(0, items.length - visibleItems);
+        // Adjust scroll so the cursor stays visible.
+        if (gameOptionsCursor < gameOptionsScroll) gameOptionsScroll = gameOptionsCursor;
+        else if (gameOptionsCursor >= gameOptionsScroll + visibleItems) gameOptionsScroll = gameOptionsCursor - visibleItems + 1;
+        gameOptionsScroll = Math.max(0, Math.min(gameOptionsScroll, maxScroll));
+        // --- Draw. ---
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = '#161823';
+        ctx.fillRect(0, 0, screen.width, screen.height);
+        // Title.
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.font = '20px sans-serif';
+        ctx.fillStyle = '#f4f3ef';
+        ctx.fillText('BurialNX — game options', 28, titleY);
+        // Header info.
+        ctx.font = headerFont;
+        ctx.fillStyle = '#9aa0b4';
+        headers.forEach((h, i) => ctx.fillText(h, 28, headerStartY + i * headerSpacing, screen.width - 56));
+        // Separator.
+        const sepY = headerStartY + headers.length * headerSpacing + 6;
+        ctx.fillStyle = '#3a3f4b';
+        ctx.fillRect(28, sepY, screen.width - 56, 1);
+        // Menu items.
+        ctx.font = itemFont;
+        const maxItemW = screen.width - 80; // leave room for the scroll indicators
+        for (let i = 0; i < visibleItems; i++) {
+                const idx = gameOptionsScroll + i;
+                if (idx >= items.length) break;
+                const isCursor = idx === gameOptionsCursor;
+                const y = itemsStartY + i * itemSpacing;
+                ctx.fillStyle = isCursor ? '#3fb950' : '#c9cdd6';
+                const prefix = isCursor ? '> ' : '  ';
+                ctx.fillText(prefix + items[idx], 28, y, maxItemW);
+        }
+        // Scroll indicators (right margin).
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#6e7681';
+        ctx.textAlign = 'center';
+        if (gameOptionsScroll > 0) ctx.fillText('▲', screen.width - 30, itemsStartY + 6);
+        if (gameOptionsScroll < maxScroll) ctx.fillText('▼', screen.width - 30, itemsStartY + (visibleItems - 1) * itemSpacing + 6);
+        ctx.textAlign = 'left';
+        ctx.restore();
+}
+
+/** Truncate a string to at most `max` characters, appending '…' if it
+ *  was shortened. Used by renderGameOptions for long paths. */
+function truncateForDisplay(s: string, max: number): string {
+        if (s.length <= max) return s;
+        return s.slice(0, max - 1) + '…';
 }
 
 // === Keymap UI =========================================================
@@ -978,16 +1455,21 @@ const KEYBOARD_LAYOUT: KeyDef[] = [
         { label: 'Alt', keyCode: 18, x: 2.75, y: 5.3, w: 1.25, h: 1 }, { label: 'Space', keyCode: 32, x: 4, y: 5.3, w: 6, h: 1 },
         { label: 'Alt', keyCode: 18, x: 10, y: 5.3, w: 1.25, h: 1 }, { label: 'Win', keyCode: 92, x: 11.25, y: 5.3, w: 1.25, h: 1 },
         { label: 'Menu', keyCode: 93, x: 12.5, y: 5.3, w: 1.25, h: 1 }, { label: 'Ctrl', keyCode: 17, x: 13.75, y: 5.3, w: 1.25, h: 1 },
-        // Navigation cluster (x=15.5..17.5)
-        { label: 'Prt', keyCode: 44, x: 15.5, y: 0, w: 1, h: 1 }, { label: 'Scr', keyCode: 145, x: 16.5, y: 0, w: 1, h: 1 },
-        { label: 'Pause', keyCode: 19, x: 17.5, y: 0, w: 1, h: 1 },
-        { label: 'Ins', keyCode: 45, x: 15.5, y: 1.3, w: 1, h: 1 }, { label: 'Home', keyCode: 36, x: 16.5, y: 1.3, w: 1, h: 1 },
-        { label: 'PgUp', keyCode: 33, x: 17.5, y: 1.3, w: 1, h: 1 },
-        { label: 'Del', keyCode: 46, x: 15.5, y: 2.3, w: 1, h: 1 }, { label: 'End', keyCode: 35, x: 16.5, y: 2.3, w: 1, h: 1 },
-        { label: 'PgDn', keyCode: 34, x: 17.5, y: 2.3, w: 1, h: 1 },
-        { label: '↑', keyCode: 38, x: 16.5, y: 4.3, w: 1, h: 1 },
-        { label: '←', keyCode: 37, x: 15.5, y: 5.3, w: 1, h: 1 }, { label: '↓', keyCode: 40, x: 16.5, y: 5.3, w: 1, h: 1 },
-        { label: '→', keyCode: 39, x: 17.5, y: 5.3, w: 1, h: 1 },
+        // Navigation cluster — keys have 1.3-unit spacing (0.3 gap between
+        // adjacent keys in each row) for visual clarity.
+        { label: 'Prt', keyCode: 44, x: 15.5, y: 0, w: 1, h: 1 }, { label: 'Scr', keyCode: 145, x: 16.8, y: 0, w: 1, h: 1 },
+        { label: 'Pause', keyCode: 19, x: 18.1, y: 0, w: 1, h: 1 },
+        { label: 'Ins', keyCode: 45, x: 15.5, y: 1.3, w: 1, h: 1 }, { label: 'Home', keyCode: 36, x: 16.8, y: 1.3, w: 1, h: 1 },
+        { label: 'PgUp', keyCode: 33, x: 18.1, y: 1.3, w: 1, h: 1 },
+        { label: 'Del', keyCode: 46, x: 15.5, y: 2.3, w: 1, h: 1 }, { label: 'End', keyCode: 35, x: 16.8, y: 2.3, w: 1, h: 1 },
+        { label: 'PgDn', keyCode: 34, x: 18.1, y: 2.3, w: 1, h: 1 },
+        // Arrow keys (back at original y positions, same 1.3-unit spacing).
+        { label: '↑', keyCode: 38, x: 16.8, y: 4.3, w: 1, h: 1 },
+        { label: '←', keyCode: 37, x: 15.5, y: 5.3, w: 1, h: 1 }, { label: '↓', keyCode: 40, x: 16.8, y: 5.3, w: 1, h: 1 },
+        { label: '→', keyCode: 39, x: 18.1, y: 5.3, w: 1, h: 1 },
+        // "none" key — clears the binding (keyCode 0 → 'none' fallback).
+        // Positioned right of Esc with same spacing as Esc→backtick.
+        { label: 'none', keyCode: 0, x: 1, y: 0, w: 1, h: 1 },
 ];
 // RPG Maker MV default keyMapper: keyCode → virtual key.
 // Number keys (48-57) are not in the default MV keyMapper, but we map them
@@ -1074,19 +1556,35 @@ function renderButtonGrid(targetLabel: string) {
         ctx.fillText('BurialNX — Joycon key bindings', 28, 36);
         ctx.fillStyle = '#9aa0b4';
         ctx.fillText(`Editing: ${targetLabel}`, 28, 60);
-        ctx.fillText('D-pad: move  A: pick key  L/R/ZL/ZR: presets 1-4  B: back', 28, 84);
-        // Grid: 4 columns × 4 rows = 16 buttons. Each cell 280×120 with 10px gaps.
+        ctx.fillText('D-pad: move  A: pick key  X: clear  L/R/ZL/ZR: presets  B: back', 28, 84);
+        // Grid: 4 columns × 6 rows = 24 entries (16 buttons + 8 stick dirs).
+        // Smaller cells to fit 6 rows on screen.
         const cols = 4;
-        const cellW = 280, cellH = 120, gap = 10;
+        const totalEntries = 24;
+        const stickNames = ['L↑', 'L↓', 'L←', 'L→', 'R↑', 'R↓', 'R←', 'R→'];
+        const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
+        const cellW = 280, cellH = 85, gap = 8;
         const gridW = cols * cellW + (cols - 1) * gap;
         const startX = Math.floor((screen.width - gridW) / 2);
-        const startY = 110;
-        for (let i = 0; i < 16; i++) {
+        const startY = 108;
+        for (let i = 0; i < totalEntries; i++) {
                 const c = i % cols, r = Math.floor(i / cols);
                 const x = startX + c * (cellW + gap), y = startY + r * (cellH + gap);
                 const selected = i === keymapCursor;
-                const key = editingKeymap.buttons[i];
-                const color = KEYMAP_COLORS[key] || '#6e7681';
+                const isStick = i >= 16;
+                // Get the display label and color.
+                let displayLabel: string;
+                let color: string;
+                if (isStick) {
+                        const dir = stickDirs[i - 16];
+                        const binding = editingKeymap.sticks?.[dir];
+                        displayLabel = binding ? binding.label : 'none';
+                        color = KEYMAP_COLORS[displayLabel as VirtualKey] || '#6e7681';
+                } else {
+                        const key = editingKeymap.buttons[i];
+                        displayLabel = editingKeymap.labels?.[i] || key;
+                        color = KEYMAP_COLORS[key] || '#6e7681';
+                }
                 ctx.fillStyle = selected ? '#3a3f5c' : '#252840';
                 ctx.fillRect(x, y, cellW, cellH);
                 ctx.fillStyle = color;
@@ -1095,12 +1593,10 @@ function renderButtonGrid(targetLabel: string) {
                 ctx.lineWidth = selected ? 3 : 1;
                 ctx.strokeRect(x + 1, y + 1, cellW - 2, cellH - 2);
                 ctx.fillStyle = '#f4f3ef'; ctx.textAlign = 'left';
-                ctx.fillText(BUTTON_NAMES[i], x + 16, y + 26);
-                // Show the keyboard key label (e.g. '5', 'U', 'Enter') if available,
-                // otherwise show the virtual key name (e.g. 'ok', 'cancel').
-                const displayLabel = editingKeymap.labels?.[i] || key;
+                const name = isStick ? stickNames[i - 16] : BUTTON_NAMES[i];
+                ctx.fillText(name, x + 16, y + 24);
                 ctx.fillStyle = color; ctx.textAlign = 'center';
-                ctx.fillText(displayLabel, x + cellW / 2, y + cellH / 2 + 18);
+                ctx.fillText(displayLabel, x + cellW / 2, y + cellH / 2 + 16);
                 ctx.fillStyle = '#6e7681'; ctx.textAlign = 'left';
                 ctx.fillText(`#${i}`, x + 12, y + cellH - 8);
         }
@@ -1110,9 +1606,18 @@ function renderButtonGrid(targetLabel: string) {
 }
 
 function renderKeyboardPicker(targetLabel: string) {
-        const btn = BUTTON_NAMES[keymapCursor];
-        const curKey = editingKeymap.buttons[keymapCursor];
-        const curLabel = editingKeymap.labels?.[keymapCursor] || curKey;
+        const isStick = keymapCursor >= 16;
+        const stickNames = ['L↑', 'L↓', 'L←', 'L→', 'R↑', 'R↓', 'R←', 'R→'];
+        const btn = isStick ? stickNames[keymapCursor - 16] : BUTTON_NAMES[keymapCursor];
+        const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
+        let curLabel: string;
+        if (isStick) {
+                const dir = stickDirs[keymapCursor - 16];
+                curLabel = editingKeymap.sticks?.[dir]?.label || 'none';
+        } else {
+                const curKey = editingKeymap.buttons[keymapCursor];
+                curLabel = editingKeymap.labels?.[keymapCursor] || curKey;
+        }
         // Header
         ctx.fillStyle = '#f4f3ef'; ctx.textAlign = 'left';
         ctx.fillText(`Pick a key for: ${btn}`, 28, 36);
@@ -1160,10 +1665,11 @@ function renderKeyboardPicker(targetLabel: string) {
  * ever covers. */
 function renderRenameKb() {
         const vk = (navigator as any).virtualKeyboard;
-        const text = typeof vk?.value === 'string' ? vk.value : renamePreview;
+        const isAddGame = phase === 'add-game-name';
+        const text = typeof vk?.value === 'string' ? vk.value : (isAddGame ? addGamePreview : renamePreview);
         const caret = Math.max(0, Math.min(text.length, Number(vk?.cursorIndex) || 0));
         const max = Number(vk?.maxLength) || 64;
-        const oldName = currentEntry?.name ?? '';
+        const oldName = isAddGame ? addGameDefaultName : (currentEntry?.name ?? '');
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalAlpha = 1;
@@ -1173,10 +1679,12 @@ function renderRenameKb() {
         ctx.textBaseline = 'alphabetic';
         ctx.fillStyle = '#f4f3ef';
         ctx.font = '24px sans-serif';
-        ctx.fillText('BurialNX — rename game', 28, 44);
+        ctx.fillText(isAddGame ? 'BurialNX — name game' : 'BurialNX — rename game', 28, 44);
         ctx.fillStyle = '#9aa0b4';
         ctx.font = '20px sans-serif';
-        ctx.fillText(oldName ? `Renaming “${oldName}”. Type below — your text appears in this field as you type.` : 'Type below — your text appears in this field as you type.', 28, 78);
+        ctx.fillText(isAddGame
+                ? `Adding game from: ${addGamePath}. Type a name below.`
+                : (oldName ? `Renaming "${oldName}". Type below — your text appears in this field as you type.` : 'Type below — your text appears in this field as you type.'), 28, 78);
         // Geometry: the applet reports its touch rectangles in show(), so the
         // height is real hardware data. The keyboard hugs the bottom edge;
         // anchor the input field just above it (counter + hint below the
@@ -1223,6 +1731,10 @@ function renderRenameKb() {
 async function launch() {
         phase = 'loading';
         gameStopped = false; // reset for new game launch
+        // Reset the progress bar for a fresh launch. The title is the game's
+        // display name when known (so the bar shows "The Coffin of Andy and
+        // Leyley" instead of just "BurialNX"), falling back to the loader name.
+        resetLoading(currentEntry?.name || 'BurialNX', 'Preparing game…');
         try {
                 // Snapshot the global scope before anything game-related is installed:
                 // every global the game, its fonts, its timers or its host add on top
@@ -1230,6 +1742,7 @@ async function launch() {
                 // app, so no game data survives into the next cold boot.
                 beginGameSession();
                 if (!selectedGame) throw new Error('No game selected');
+                setLoadingProgress(0.04, 'Reading game index…', selectedGame);
                 const rawAssets = gameAssets(selectedGame, selectedMod || null, { async read(path) {
                         const bytes = await Switch.readFile(path);
                         if (__DEBUG__ && bytes && /\/data\//i.test(path)) log(`Read game data: ${path} (${bytes.byteLength} bytes)`);
@@ -1244,10 +1757,23 @@ async function launch() {
                 if (!index) throw new Error('Game index.html is missing');
                 const scripts = scriptPlan(new TextDecoder().decode(index));
                 log(`Game: ${selectedGame}; mod: ${selectedMod || 'none'}; shared saves: ${sharedSaves}`);
+                setLoadingProgress(0.12, 'Loading fonts and language…');
                 const [language, , pngFix] = await Promise.all([languageTable(assets), registerFonts(assets, runtime), needsPngFix(log)]);
+                setLoadingProgress(0.20, 'Preparing runtime host…');
                 host = createBrowserHost(assets, prepareGameScript, log, pngFix, directScreen, failRequest);
-                for (const path of scripts) { log(`Loading ${path}`); await host.loadScript(path); }
+                // Script loading dominates the launch time for RPG Maker MV
+                // games (often 40+ scripts, several hundred KiB each). Reserve
+                // the 0.20..0.90 range for it and update per-script.
+                const total = scripts.length;
+                for (let i = 0; i < total; i++) {
+                        const path = scripts[i];
+                        log(`Loading ${path}`);
+                        setLoadingProgress(0.20 + 0.70 * (i + 1) / total, `Loading scripts ${i + 1}/${total}…`, path);
+                        await host.loadScript(path);
+                }
+                setLoadingProgress(0.92, 'Settling runtime…');
                 await host.settled();
+                setLoadingProgress(0.95, 'Installing compatibility…');
                 installGameCompatibility(runtime, selectedGame, sharedSaves, language, pngFix, currentEntry?.keymap || globalKeymap);
                 mapPrefetch = new MapPrefetcher(assets, log);
                 installMapPrefetch(runtime, mapPrefetch, log);
@@ -1258,6 +1784,7 @@ async function launch() {
                         installSdSaves(runtime, Switch, saveLocation.folder);
                 }
                 if (importRequested) { const count = importSteamSaves(runtime, Switch, selectedGame, saveLocation); log(`Imported ${count} Steam save slots`); }
+                setLoadingProgress(0.98, 'Starting game…');
                 if (runtime.Graphics?.render) {
                         const render = runtime.Graphics.render;
                         runtime.Graphics.render = function(...args: unknown[]) { const result = render.apply(this, args); hud(); return result; };
@@ -1279,7 +1806,9 @@ async function launch() {
                                 // When returning to library, skip the game's update entirely.
                                 // The game's rAF callback still fires but does nothing,
                                 // preventing crashes from accessing stopped/undefined state.
-                                if (gameStopped) { this.requestUpdate(); return; }
+                                // Also skip during the Plus(+) quit-confirmation notice
+                                // so the game doesn't render over the dialog panel.
+                                if (gameStopped || (phase === 'notice' && exitNoticeArmed)) { this.requestUpdate(); return; }
                                 const now = performance.now();
                                 if (lastFrame && now - lastFrame > 2000) {
                                         this._accumulator = 0;
@@ -1313,6 +1842,64 @@ async function launch() {
 // listeners further up (sessionErrorListener & co.); they are registered at
 // the bottom of this file, after every state variable is initialized.
 
+// === Save/Load keymap override ========================================
+// During Scene_Save and Scene_Load, override the gamepad keymap to the
+// DEFAULT layout (A=ok, B=cancel) so the user always gets standard
+// confirm/cancel buttons in the save menu, even if they remapped
+// buttons for gameplay. When the scene changes back to the game
+// (Scene_Map etc.), the per-game keymap is restored.
+let saveLoadKeymapActive = false;
+let savedGamepadMapper: any = null;
+function overrideKeymapForSaveLoadScene(): void {
+        const manager = runtime.SceneManager;
+        const scene = manager?._scene;
+        if (!scene || !runtime.Scene_Save || !runtime.Input) return;
+        const isSaveLoad = scene instanceof runtime.Scene_Save || (runtime.Scene_Load && scene instanceof runtime.Scene_Load);
+        if (isSaveLoad && !saveLoadKeymapActive) {
+                // Entering save/load scene — save the current mapper and
+                // replace it with the default (A=ok, B=cancel, etc.).
+                savedGamepadMapper = runtime.Input.gamepadMapper;
+                runtime.Input.gamepadMapper = { ...DEFAULT_KEYMAP.buttons.reduce((m, key, i) => { m[i] = key; return m; }, {} as Record<number, string>) };
+                saveLoadKeymapActive = true;
+                if (__DEBUG__) log('save/load keymap: overridden to default (A=ok, B=cancel)');
+        } else if (!isSaveLoad && saveLoadKeymapActive) {
+                // Leaving save/load scene — restore the per-game keymap.
+                if (savedGamepadMapper) runtime.Input.gamepadMapper = savedGamepadMapper;
+                savedGamepadMapper = null;
+                saveLoadKeymapActive = false;
+                if (__DEBUG__) log('save/load keymap: restored per-game keymap');
+        }
+}
+
+// === Analog stick bindings ============================================
+// Polls the gamepad analog sticks and simulates keyboard key presses
+// for the bound keyCodes via Input._currentState. This lets the user
+// bind L-stick/R-stick directions to movement keys (W/S/A/D, etc.).
+function pollStickBindings(): void {
+        const input = runtime.Input;
+        if (!input?._currentState) return;
+        const km = (currentEntry?.keymap) || globalKeymap;
+        if (!km.sticks) return;
+        const pad = (navigator as any).getGamepads?.()?.[0];
+        if (!pad || !pad.axes || pad.axes.length < 4) return;
+        const threshold = 0.5;
+        const lx = pad.axes[0] || 0, ly = pad.axes[1] || 0;
+        const rx = pad.axes[2] || 0, ry = pad.axes[3] || 0;
+        const s = km.sticks;
+        const apply = (binding: { keyCode: number; label: string } | undefined, active: boolean) => {
+                if (!binding) return;
+                if (active) input._currentState[binding.keyCode] = true;
+                else if (input._currentState[binding.keyCode] !== undefined) input._currentState[binding.keyCode] = false;
+        };
+        apply(s.lUp, ly < -threshold);
+        apply(s.lDown, ly > threshold);
+        apply(s.lLeft, lx < -threshold);
+        apply(s.lRight, lx > threshold);
+        apply(s.rUp, ry < -threshold);
+        apply(s.rDown, ry > threshold);
+        apply(s.rLeft, rx < -threshold);
+        apply(s.rRight, rx > threshold);
+}
 
 let observedScene: any, sceneSince = 0, lastSceneReport = 0;
 let snapshotScene: any = Symbol('no diagnostic snapshot yet');
@@ -1340,10 +1927,11 @@ function diagnoseScene(now: number) {
 }
 
 let gameOptionsCursor = 0;
+let gameOptionsScroll = 0; // index of the first visible menu item (auto-adjusted when the cursor moves)
 // Play, Pick cover, Auto-detect, Edit keymap, Reset keymap, Rename game,
 // Change mod folder, Toggle mod, Toggle shared saves, Change save folder,
-// Delete, Back = 12 options, indices 0..11.
-const GAME_OPTIONS_COUNT = 12;
+// Create/Recreate forwarder, Delete forwarder, Delete, Back = 14 options, indices 0..13.
+const GAME_OPTIONS_COUNT = 14;
 
 function libraryTileCount() { return library.games.length + LIBRARY_ACTION_TILES; }
 
@@ -1379,7 +1967,7 @@ function frame(now: number) {
                                         }
                                 } else if (edge(3) && entry) {
                                         loadEntryIntoState(entry);
-                                        gameOptionsCursor = 0;
+                                        gameOptionsCursor = 0; gameOptionsScroll = 0;
                                         waitForRelease = true; phase = 'game-options';
                                 } else if (edge(2)) {
                                         // Y = Add game from anywhere in the library.
@@ -1516,15 +2104,31 @@ function frame(now: number) {
                                                 waitForRelease = true;
                                                 phase = 'save-choice';
                                         } else if (gameOptionsCursor === 10) {
+                                                // Create / Recreate forwarder NRO
+                                                if (currentEntry) void startForwarderBuild(currentEntry);
+                                        } else if (gameOptionsCursor === 11) {
+                                                // Delete forwarder NRO
+                                                if (currentEntry) {
+                                                        const had = forwarderExists(Switch as unknown as LibraryAccess, currentEntry.name, currentEntry.id);
+                                                        const removed = deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id);
+                                                        if (had && removed) message = `Forwarder deleted. (${forwarderPathFor(currentEntry.name, currentEntry.id)})`;
+                                                        else if (had && !removed) message = 'Forwarder file present but could not be removed.';
+                                                        else message = 'No forwarder to delete.';
+                                                        waitForRelease = true; phase = 'notice';
+                                                }
+                                        } else if (gameOptionsCursor === 12) {
                                                 // Delete
                                                 if (currentEntry) {
+                                                        // Also remove the forwarder if present, so the SD card
+                                                        // doesn't keep a stale shortcut to a deleted game.
+                                                        try { deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id); } catch { /* non-fatal */ }
                                                         library = removeGame(Switch as unknown as LibraryAccess, library, currentEntry.id);
                                                         invalidateCoverCache();
                                                         currentEntry = null;
                                                         message = 'Game removed from library.';
                                                         waitForRelease = true; phase = 'library';
                                                 }
-                                        } else if (gameOptionsCursor === 11) {
+                                        } else if (gameOptionsCursor === 13) {
                                                 // Back
                                                 waitForRelease = true; phase = 'library';
                                         }
@@ -1544,7 +2148,16 @@ function frame(now: number) {
                                         if (edge(1)) {
                                                 const def = getAllPickKeys()[keymapPickCursor];
                                                 if (def && def.label) {
-                                                        editingKeymap = setButtonWithLabel(editingKeymap, keymapCursor, def.vkey, def.label);
+                                                        if (keymapCursor < 16) {
+                                                                // Face button binding
+                                                                editingKeymap = setButtonWithLabel(editingKeymap, keymapCursor, def.vkey, def.label);
+                                                        } else {
+                                                                // Stick direction binding
+                                                                const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
+                                                                const dir = stickDirs[keymapCursor - 16];
+                                                                if (!editingKeymap.sticks) editingKeymap.sticks = {};
+                                                                editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label };
+                                                        }
                                                         saveEditingKeymap();
                                                         keymapPicking = false;
                                                         waitForRelease = true;
@@ -1553,15 +2166,24 @@ function frame(now: number) {
                                         // B: back to button grid
                                         if (edge(0)) { keymapPicking = false; waitForRelease = true; }
                                 } else {
-                                        // Phase 1: button grid navigation
-                                        if (edge(12)) keymapCursor = (keymapCursor + 12) % 16;
-                                        if (edge(13)) keymapCursor = (keymapCursor + 4) % 16;
+                                        // Phase 1: button grid navigation (24 entries: 16 buttons + 8 stick dirs)
+                                        if (edge(12)) keymapCursor = (keymapCursor + 20) % 24;
+                                        if (edge(13)) keymapCursor = (keymapCursor + 4) % 24;
                                         if (edge(14)) { const r = keymapCursor % 4; keymapCursor = r === 0 ? keymapCursor + 3 : keymapCursor - 1; }
                                         if (edge(15)) { const r = keymapCursor % 4; keymapCursor = r === 3 ? keymapCursor - 3 : keymapCursor + 1; }
-                                        // A: enter keyboard picker for this button
+                                        // A: enter keyboard picker for this button/stick
                                         if (edge(1)) { keymapPicking = true; keymapPickCursor = 0; waitForRelease = true; }
                                         // X: clear binding (set to none)
-                                        if (edge(3)) { editingKeymap = setButton(editingKeymap, keymapCursor, 'none'); saveEditingKeymap(); }
+                                        if (edge(3)) {
+                                                if (keymapCursor < 16) {
+                                                        editingKeymap = setButton(editingKeymap, keymapCursor, 'none');
+                                                } else {
+                                                        const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
+                                                        const dir = stickDirs[keymapCursor - 16];
+                                                        if (editingKeymap.sticks) delete editingKeymap.sticks[dir];
+                                                }
+                                                saveEditingKeymap();
+                                        }
                                         // B: back to library/game
                                         if (edge(0)) { waitForRelease = true; phase = host ? 'game' : 'library'; if (host) menu.dismiss(); }
                                         // Presets
@@ -1572,7 +2194,7 @@ function frame(now: number) {
                                 }
                         }
                         renderKeymap();
-                } else if (phase === 'rename-kb') {
+                } else if (phase === 'rename-kb' || phase === 'add-game-name') {
                         // Swkbd is open — render the live preview of the name being typed.
                         // Do NOT process gamepad input here: the keyboard owns it.
                         renderRenameKb();
@@ -1619,20 +2241,35 @@ function frame(now: number) {
                                                 if (__DEBUG__) { const modStart3 = selectedMod ? selectedMod.replace(/\/[^\/]+$/, '') : (selectedGame?.replace(/\/www$/i, '') || selectedGame); browser = new FolderBrowser(Switch, 'mod', modStart3); pickerPurpose = 'startup-mod'; waitForRelease = true; }
                                                 else startOrChooseSaves();
                                         } else if (pickerPurpose === 'add-game' && result !== null) {
-                                                // Add a new game to the library.
-                                                const id = libraryIdFromRoot(result);
-                                                const name = result.split('/').pop() || 'Game';
-                                                // Try to derive a cover from the folder.
-                                                let cover: string | null = null;
-                                                try { cover = deriveDefaultCover(Switch as unknown as LibraryAccess & { readDirSync(path: string): string[] | null }, id, result); }
-                                                catch (error) { log(`Cover auto-detect failed: ${String(error)}`); }
-                                                const entry: LibraryEntry = { id, name, root: result, sharedSaves: false, mod: null, ...(cover ? { cover } : { cover: null }) };
-                                                if (rememberLibrary(entry)) { library = loadLibrary(Switch as unknown as LibraryAccess); invalidateCoverCache(); }
-                                                // Pre-select the new game.
-                                                const idx = library.games.findIndex((g) => g.id === id);
-                                                if (idx >= 0) libraryCursor = idx;
-                                                libraryPage = Math.floor(libraryCursor / LIBRARY_PAGE_SIZE);
-                                                waitForRelease = true; phase = 'library';
+                                                // Open the software keyboard so the user can name the
+                                                // game before it's added to the library. The suggested
+                                                // name is derived from the folder name or a .exe file
+                                                // in the parent folder.
+                                                addGamePath = result;
+                                                addGameDefaultName = suggestGameName(result);
+                                                addGamePreview = addGameDefaultName;
+                                                addGameSubmitted = false;
+                                                if (navigator?.virtualKeyboard) {
+                                                        const vk = navigator.virtualKeyboard;
+                                                        vk.okButtonText = 'Add';
+                                                        vk.type = 0;
+                                                        vk.maxLength = 64;
+                                                        vk.value = addGameDefaultName;
+                                                        const onSubmit = () => {
+                                                                addGameSubmitted = true;
+                                                                const text = vk.value || addGameDefaultName;
+                                                                addGamePreview = text;
+                                                                finishAddGame(text);
+                                                        };
+                                                        const onLiveInput = () => { addGamePreview = vk.value; };
+                                                        vk.addEventListener('change', onLiveInput);
+                                                        vk.addEventListener('submit', onSubmit);
+                                                        vk.show();
+                                                        phase = 'add-game-name';
+                                                } else {
+                                                        // No swkbd available — add with the suggested name.
+                                                        finishAddGame(addGameDefaultName);
+                                                }
                                         } else if (pickerPurpose === 'cover-image' && result !== null && currentEntry) {
                                                 log(`Cover pick: ${result} for game ${currentEntry.id}`);
                                                 const coverPath = saveUserCoverLogged(Switch as unknown as LibraryAccess, currentEntry.id, result, log);
@@ -1720,23 +2357,28 @@ function frame(now: number) {
                                 } else { importRequested = wantsImport; void launch(); }
                         }
                 } else if (phase === 'notice') {
-                        const lines = ['BurialNX', message];
-                        // When the notice is an exit-confirmation, the second + press
-                        // triggers the real exit through guardedExit. We just need to
-                        // return to the previous phase on B (or + if not the exit notice).
-                        if (exitNoticeArmed) lines.push('Press Plus (+) again to confirm quit. B: stay.');
-                        else lines.push('B: return');
-                        panel(lines, true);
+                        if (exitNoticeArmed) {
+                                // Use the centered quit dialog (compact, game visible).
+                                renderQuitDialog();
+                        } else {
+                                panel(['BurialNX', message, 'B: return'], true);
+                        }
                         if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
                         else if (!waitForRelease && (buttons?.[0]?.pressed && !previousButtons[0])) {
+                                // B: cancel — return to previous phase.
                                 exitNoticeArmed = false; exitArmed = false;
                                 if (host) { menu.dismiss(); phase = 'game'; }
                                 else { phase = currentEntry ? 'game-options' : 'library'; waitForRelease = true; }
-                        } else if (!waitForRelease && exitNoticeArmed && down(9)) {
-                                // Second + press: real exit. (guardedExit also catches it
-                                // via the keydown path; this is the gamepad-side path.)
+                        } else if (!waitForRelease && exitNoticeArmed && buttons?.[1]?.pressed && !previousButtons[1]) {
+                                // A: confirm quit. Wrap in try/catch — if
+                                // teardownGame throws, force the exit anyway.
                                 exitNoticeArmed = false;
-                                quitApp();
+                                try { quitApp(); }
+                                catch (error) {
+                                        log(`quitApp threw: ${error instanceof Error ? error.message : String(error)}`);
+                                        allowExit = true;
+                                        try { (Switch as any).exit?.(); } catch { /* best-effort */ }
+                                }
                         }
                 } else if (phase === 'error') {
                         panel(['BurialNX — game could not start', message, __DEBUG__ ? `Details: ${hostLogPath}` : 'Try the debug build for details.', 'Press B to exit BurialNX (relaunch for a clean library).'], true);
@@ -1752,9 +2394,21 @@ function frame(now: number) {
                                 // hardware (froze on the "Loading…" splash).
                                 quitApp();
                         }
-                } else if (phase === 'loading') panel(['BurialNX', 'Opening game…', ...(__DEBUG__ ? debugLines : [])], true);
+                } else if (phase === 'loading' || phase === 'forwarder-building') renderLoading();
                 else {
                         diagnoseScene(now);
+                        // Override the gamepad keymap during Scene_Save and
+                        // Scene_Load so the confirm/cancel buttons always use
+                        // the DEFAULT menu layout (A=ok, B=cancel), not the
+                        // per-game remapped layout. This prevents confusion when
+                        // the user has remapped buttons for gameplay but expects
+                        // standard A/B in the save/load menu.
+                        overrideKeymapForSaveLoadScene();
+                        // Poll analog stick bindings: read the gamepad axes
+                        // and simulate key presses for bound keyCodes via
+                        // Input._currentState. This lets the user bind
+                        // L-stick/R-stick directions to movement keys.
+                        pollStickBindings();
                         if (now - lastMemoryCheck >= 5000) {
                                 lastMemoryCheck = now;
                                 try {
@@ -1764,13 +2418,18 @@ function frame(now: number) {
                         }
                         if (!sampleStart) sampleStart = now;
                         frames++; if (now - sampleStart >= 1000) { fps = frames * 1000 / (now - sampleStart); sampleStart = now; frames = 0; }
-                        const action = menu.step(buttons, now);
+                        // If Minus(-) is unbound in the game's keymap, the pause
+                        // menu opens immediately (holdMs=0). If bound, require
+                        // 800ms hold (so the game's binding fires on press).
+                        const minusBound = ((currentEntry?.keymap) || globalKeymap).buttons[8] !== 'none';
+                        const action = menu.step(buttons, now, minusBound ? 800 : 0);
                         if (mapPrefetch && fps >= 50 && !menu.blocksInput && typeof runtime.Scene_Map === 'function' &&
                                 runtime.SceneManager?._scene instanceof runtime.Scene_Map && runtime.SceneManager._sceneStarted &&
                                 !runtime.SceneManager._nextScene && !runtime.SceneManager._stopped && runtime.$dataMap && !runtime.$gamePlayer?.isTransferring?.()) {
                                 mapPrefetch.tick(now, true);
                         }
                         if (action === 'load' && runtime.SceneManager && runtime.Scene_Load) runtime.SceneManager.push(runtime.Scene_Load);
+                        if (action === 'save' && runtime.SceneManager && runtime.Scene_Save) runtime.SceneManager.push(runtime.Scene_Save);
                         if (action === 'resolution' && host) fit = host.toggleFit();
                         if (action === 'mod') { const modStart2 = selectedMod ? selectedMod.replace(/\/[^\/]+$/, '') : (selectedGame?.replace(/\/www$/i, '') || selectedGame); browser = new FolderBrowser(Switch, 'mod', modStart2); pickerPurpose = 'menu-mod'; waitForRelease = true; phase = 'picker'; }
                         if (action === 'saves') { choiceFromMenu = true; waitForRelease = true; phase = 'save-choice'; }
@@ -1792,7 +2451,14 @@ function frame(now: number) {
                                         openKeymapEditor('global');
                                 }
                         }
-                        if (action === 'quit') { quitApp(); }
+                        if (action === 'quit') {
+                                try { quitApp(); }
+                                catch (error) {
+                                        log(`quitApp threw: ${error instanceof Error ? error.message : String(error)}`);
+                                        allowExit = true;
+                                        try { (Switch as any).exit?.(); } catch { /* best-effort */ }
+                                }
+                        }
                         if (action === 'direct' && debugSettingsValid) {
                                 try { const value = !directNext; Switch.writeFileSync(debugSettingsPath, JSON.stringify({ directScreen: value })); directNext = value; log('Direct-screen setting saved; restart required.'); }
                                 catch (error) { log(`Could not save direct-screen setting: ${String(error)}`); }
@@ -1801,17 +2467,36 @@ function frame(now: number) {
                         host?.present();
                         if (menu.blocksInput || !host?.direct()) hud();
                 }
-                // Detect + button (gamepad button 9) for quit confirmation.
-                // While the software keyboard is open (rename-kb), + belongs to
-                // the keyboard session and must not be treated as a quit
-                // request — pressing it while typing must do nothing.
-                if (edge(9) && phase !== 'notice' && phase !== 'rename-kb') {
-                        exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
-                        message = 'Press Plus (+) again to quit BurialNX. B: stay.';
-                        waitForRelease = true; phase = 'notice';
-                } else if (edge(9) && exitNoticeArmed && (Date.now() - exitArmedAt < 2000)) {
-                        exitNoticeArmed = false;
-                        quitApp();
+                // Plus(+) quit dialog: if + has a game binding, require
+                // 500ms hold (so the game's binding fires on single press
+                // and the quit dialog fires on hold). If + is unbound,
+                // single press shows the dialog immediately.
+                const plusDown = down(9);
+                const plusBlocked = phase === 'notice' || phase === 'rename-kb' || phase === 'add-game-name' || phase === 'forwarder-building' || phase === 'loading';
+                if (plusDown && !plusBlocked) {
+                        // Check if + (button 9) has a binding in the active keymap.
+                        const activeKeymap = (currentEntry?.keymap) || globalKeymap;
+                        const plusBound = activeKeymap.buttons[9] !== 'none';
+                        if (plusBound) {
+                                // + has a binding → require 500ms hold.
+                                if (plusHoldStart === 0) plusHoldStart = now;
+                                else if (now - plusHoldStart >= 500) {
+                                        exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
+                                        message = 'Quit BurialNX?';
+                                        waitForRelease = true; phase = 'notice';
+                                        plusHoldStart = 0;
+                                }
+                        } else {
+                                // + is unbound → single press shows the dialog.
+                                if (edge(9)) {
+                                        exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
+                                        message = 'Quit BurialNX?';
+                                        waitForRelease = true; phase = 'notice';
+                                }
+                                plusHoldStart = 0;
+                        }
+                } else {
+                        plusHoldStart = 0;
                 }
                 for (let index = 0; index < 16; index++) previousButtons[index] = !!buttons?.[index]?.pressed;
         } catch (error) { fail(error); }
@@ -1842,14 +2527,22 @@ function applyPreset(index: number) {
 function saveEditingKeymap() {
         if (keymapTarget === 'global') {
                 keymapValid = saveKeyMap(Switch as unknown as LibraryAccess, editingKeymap);
-                if (keymapValid) globalKeymap = { buttons: [...editingKeymap.buttons] };
+                if (keymapValid) {
+                        // CRITICAL: copy labels AND sticks, not just buttons.
+                        // Without labels, the editor shows 'ok' instead of the
+                        // bound key (e.g. '1', 'W'). Without sticks, analog
+                        // stick bindings are lost.
+                        globalKeymap = { buttons: [...editingKeymap.buttons] };
+                        if (editingKeymap.labels) globalKeymap.labels = [...editingKeymap.labels];
+                        if (editingKeymap.sticks) globalKeymap.sticks = editingKeymap.sticks;
+                }
         } else if (keymapTarget) {
-                // Per-game keymap: store inline on the library entry.
                 const entry = keymapTarget;
-                const updated: LibraryEntry = { ...entry, keymap: { buttons: [...editingKeymap.buttons] } };
+                const newKeymap: KeyMap = { buttons: [...editingKeymap.buttons] };
+                if (editingKeymap.labels) newKeymap.labels = [...editingKeymap.labels];
+                if (editingKeymap.sticks) newKeymap.sticks = editingKeymap.sticks;
+                const updated: LibraryEntry = { ...entry, keymap: newKeymap };
                 if (rememberLibrary(updated)) {
-                        // Keep currentEntry in sync when the user is editing the
-                        // currently-selected game's keymap.
                         if (currentEntry && currentEntry.id === entry.id) currentEntry = updated;
                         keymapTarget = updated;
                         keymapValid = true;
@@ -1857,8 +2550,6 @@ function saveEditingKeymap() {
         } else {
                 keymapValid = false;
         }
-        // If a game is running, re-apply the (now updated) keymap immediately.
-        // This makes in-game key remapping take effect on the very next frame.
         if (host && runtime?.Input) {
                 try {
                         const active = (keymapTarget && keymapTarget !== 'global' && (keymapTarget as LibraryEntry).keymap)
@@ -1876,8 +2567,13 @@ function saveEditingKeymap() {
  *  tile, the pause-menu "keymap" entry, or the game-options "Edit keymap". */
 function openKeymapEditor(target: 'global' | LibraryEntry) {
         keymapTarget = target;
-        if (target === 'global') editingKeymap = { buttons: [...globalKeymap.buttons] };
-        else editingKeymap = { buttons: [...(target.keymap || globalKeymap).buttons] };
+        const source = target === 'global' ? globalKeymap : (target.keymap || globalKeymap);
+        // Copy BOTH buttons AND labels — without labels, the editor
+        // shows the vkey (e.g. 'ok') instead of the bound label
+        // (e.g. '1', 'W', 'Enter'). This was the root cause of the
+        // "bindings reset to ok" bug.
+        editingKeymap = { buttons: [...source.buttons] };
+        if (source.labels) editingKeymap.labels = [...source.labels];
         keymapCursor = 0;
         waitForRelease = true;
         phase = 'keymap';
@@ -1895,5 +2591,88 @@ function openKeymapEditor(target: 'global' | LibraryEntry) {
 // on exit, which is the only reliably clean reset on this OS.
 registerSessionListeners();
 
+// === Forwarder auto-launch (--game <id>) ==============================
+// A forwarder NRO is a small nx.js app whose own main.js just calls
+//   new Switch.Application('sdmc:/switch/burialnx/burialnx.nro').launch('--game', '<id>')
+// which (via envSetNextLoad, see source/ns.cc) chains into this NRO with
+// `--game <id>` on the argv. Here we parse that argument and, if the
+// referenced game is in the library, jump straight into launch() — same
+// flow as clicking the game in the library grid. If the game is missing
+// or no id was given, we fall through to the library UI so the user can
+// fix things (delete the stale forwarder, re-add the game, etc.).
+//
+// Supported forms (the forwarder builder emits the first one):
+//   --game <id>          (two tokens)
+//   --game=<id>          (one token)
+//   --game-id <id>       (alias, two tokens)
+//   --game-id=<id>       (alias, one token)
+function parseForwarderTarget(argv: readonly string[]): { gameId: string; modForced: boolean } | null {
+        let gameId: string | null = null;
+        let modForced = false;
+        for (let i = 0; i < argv.length; i++) {
+                const a = argv[i] ?? '';
+                if (a === '--game' || a === '--game-id') {
+                        const v = argv[i + 1];
+                        if (typeof v === 'string' && v.length > 0) gameId = v;
+                }
+                const eq = a.startsWith('--game=') ? a.slice('--game='.length)
+                        : a.startsWith('--game-id=') ? a.slice('--game-id='.length)
+                        : null;
+                if (eq !== null && eq.length > 0) gameId = eq;
+                if (a === '--mod') modForced = true;
+        }
+        return gameId ? { gameId, modForced } : null;
+}
+let forwarderTargetId: string | null = null;
+let forwarderForceMod = false;
+try {
+        const argv = (Switch as any).argv as readonly string[] | undefined;
+        if (Array.isArray(argv) && argv.length > 1) {
+                const parsed = parseForwarderTarget(argv);
+                if (parsed) {
+                        forwarderTargetId = parsed.gameId;
+                        forwarderForceMod = parsed.modForced;
+                        log(`_fwd: forwarder launch, target game id = ${forwarderTargetId}, mod forced = ${forwarderForceMod}`);
+                }
+        }
+} catch (error) { log(`_fwd: argv parse failed: ${error instanceof Error ? error.message : String(error)}`); }
+
 if (__DEBUG__) log('Startup ready');
 requestAnimationFrame(frame);
+
+// === Forwarder auto-launch trigger =====================================
+// Scheduled on the next tick (after the first frame is scheduled) so the
+// loading screen can paint immediately. If a forwarder target was found
+// and exists in the library, we load it into state and start the launch
+// flow exactly as if the user had selected it from the library grid.
+// If --mod was passed, force the mod on (override the library entry's
+// modEnabled setting).
+if (forwarderTargetId) {
+        try {
+                const entry = library.games.find((g) => g.id === forwarderTargetId);
+                if (entry) {
+                        log(`_fwd: auto-launching "${entry.name}" (id=${entry.id})`);
+                        // If the forwarder passed --mod, force the mod on.
+                        if (forwarderForceMod && entry.mod) {
+                                const modded: LibraryEntry = { ...entry, modEnabled: true };
+                                log(`_fwd: forcing mod ON (${entry.mod})`);
+                                loadEntryIntoState(modded);
+                        } else {
+                                loadEntryIntoState(entry);
+                        }
+                        // Show the loading bar immediately so the user sees
+                        // feedback before the (async) launch starts.
+                        resetLoading(entry.name, 'Preparing game…');
+                        // Defer one tick so the loading screen paints before the
+                        // (synchronous-feeling) launch() work begins to block on
+                        // SD reads. startOrChooseSaves() will either call launch()
+                        // directly or open the save-choice panel.
+                        setTimeout(() => {
+                                try { startOrChooseSaves(); }
+                                catch (error) { fail(error); }
+                        }, 0);
+                } else {
+                        log(`_fwd: no library entry matches id "${forwarderTargetId}"; falling back to library UI`);
+                }
+        } catch (error) { log(`_fwd: auto-launch failed: ${error instanceof Error ? error.message : String(error)}`); }
+}

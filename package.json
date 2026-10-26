@@ -1,6 +1,6 @@
 {
   "name": "burialnx",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Independent Switch homebrew loader for TCOAAL",
   "type": "module",
@@ -14,7 +14,7 @@
     "id": "01a144e6a07a0000",
     "title": "BurialNX",
     "author": "BurialNX contributors",
-    "userAccountSaveDataSize": "16777216"
+    "userAccountSaveDataSize": "32768"
   },
   "devDependencies": {
     "@nx.js/nro": "1.0.0-beta.7",

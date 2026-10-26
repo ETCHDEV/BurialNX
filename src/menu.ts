@@ -1,47 +1,55 @@
-export type MenuItem = 'continue' | 'load' | 'saves' | 'import' | 'resolution' | 'fps' | 'mod' | 'direct' | 'snapshot' | 'keymap' | 'quit';
+export type MenuItem = 'continue' | 'save' | 'load' | 'keymap' | 'another' | 'back' | 'quit'
+        | 'saves' | 'import' | 'resolution' | 'fps' | 'mod' | 'direct' | 'snapshot';
 
 /** Controller-only overlay state. Button numbering follows the Web Gamepad API. */
 export class PauseMenu {
-	open = false;
-	fps = false;
-	selected = 0;
-	private pressed: boolean[] = Array(16).fill(false);
-	private start: number | undefined;
-	private armed = true;
-	private waitForRelease = false;
-	readonly items: MenuItem[];
-	constructor(debug: boolean) {
-		// The separate "Back to library" entry was removed: returning to the
-		// library now means quitting the app and relaunching it from hbmenu
-		// (a full, from-scratch cold boot — the only reliably clean reset on
-		// Horizon OS, since an in-process session reboot proved unstable on
-		// hardware). The "Quit BurialNX" entry is the single exit path and
-		// performs the full game teardown (audio, frame loop, caches, realm
-		// restore, GC) before Switch.exit().
-		this.items = debug ? ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod', 'keymap', 'direct', 'snapshot', 'quit'] : ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod', 'keymap', 'quit'];
-	}
-	get blocksInput() { return this.open || this.waitForRelease; }
-	dismiss() { this.open = false; this.waitForRelease = true; }
-	step(buttons: ArrayLike<{ pressed: boolean }> | null, now: number): MenuItem | null {
-		const down = (id: number) => !!buttons?.[id]?.pressed;
-		const just = (id: number) => down(id) && !this.pressed[id];
-		if (!down(8)) { this.start = undefined; this.armed = true; }
-		else if (this.armed) {
-			this.start ??= now;
-			if (now - this.start >= 800 && !this.open) { this.open = true; this.armed = false; }
-		}
-		let action: MenuItem | null = null;
-		if (this.open) {
-			if (just(12)) this.selected = (this.selected + this.items.length - 1) % this.items.length;
-			if (just(13)) this.selected = (this.selected + 1) % this.items.length;
-			if (just(0)) { this.open = false; this.waitForRelease = true; }
-			else if (just(1)) {
-				action = this.items[this.selected];
-				if (action === 'fps') this.fps = !this.fps;
-				if (action === 'continue' || action === 'load') { this.open = false; this.waitForRelease = true; }
-			}
-		} else if (this.waitForRelease && !down(0) && !down(1) && !down(12) && !down(13)) this.waitForRelease = false;
-		for (let index = 0; index < 16; index++) this.pressed[index] = down(index);
-		return action;
-	}
+        open = false;
+        fps = false;
+        selected = 0;
+        page: 1 | 2 = 1; // 1 = main, 2 = "Another"
+        private pressed: boolean[] = Array(16).fill(false);
+        private start: number | undefined;
+        private armed = true;
+        private waitForRelease = false;
+        readonly itemsPage1: MenuItem[];
+        readonly itemsPage2: MenuItem[];
+        constructor(debug: boolean) {
+                // Page 1 (main): Resume, Save, Load, Edit keymap, Another, Quit
+                this.itemsPage1 = ['continue', 'save', 'load', 'keymap', 'another', 'quit'];
+                // Page 2 (Another): all remaining options + Back
+                this.itemsPage2 = debug
+                        ? ['saves', 'import', 'resolution', 'fps', 'mod', 'direct', 'snapshot', 'back']
+                        : ['saves', 'import', 'resolution', 'fps', 'mod', 'back'];
+        }
+        get currentItems(): MenuItem[] { return this.page === 1 ? this.itemsPage1 : this.itemsPage2; }
+        get blocksInput() { return this.open || this.waitForRelease; }
+        dismiss() { this.open = false; this.waitForRelease = true; this.page = 1; }
+        step(buttons: ArrayLike<{ pressed: boolean }> | null, now: number, holdMs = 800): MenuItem | null {
+                const down = (id: number) => !!buttons?.[id]?.pressed;
+                const just = (id: number) => down(id) && !this.pressed[id];
+                if (!down(8)) { this.start = undefined; this.armed = true; }
+                else if (this.armed) {
+                        this.start ??= now;
+                        if (now - this.start >= holdMs && !this.open) { this.open = true; this.armed = false; }
+                }
+                let action: MenuItem | null = null;
+                const items = this.currentItems;
+                if (this.open) {
+                        if (just(12)) this.selected = (this.selected + items.length - 1) % items.length;
+                        if (just(13)) this.selected = (this.selected + 1) % items.length;
+                        if (just(0)) { // B: close (or go back to page 1)
+                                if (this.page === 2) { this.page = 1; this.selected = 4; }
+                                else { this.open = false; this.waitForRelease = true; }
+                        }
+                        else if (just(1)) {
+                                action = items[this.selected];
+                                if (action === 'fps') this.fps = !this.fps;
+                                if (action === 'another') { this.page = 2; this.selected = 0; action = null; }
+                                else if (action === 'back') { this.page = 1; this.selected = 4; action = null; }
+                                else if (action === 'continue' || action === 'save' || action === 'load') { this.open = false; this.waitForRelease = true; }
+                        }
+                } else if (this.waitForRelease && !down(0) && !down(1) && !down(12) && !down(13)) this.waitForRelease = false;
+                for (let index = 0; index < 16; index++) this.pressed[index] = down(index);
+                return action;
+        }
 }
