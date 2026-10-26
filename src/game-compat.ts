@@ -101,10 +101,19 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
         // nx.js dispatches 'touchstart'/'touchmove'/'touchend' on the `screen`
         // global. RPG Maker MV's TouchInput listens on `document`. Without
         // forwarding, touch/tap interactions in the game don't work.
+        // The listeners are installed ONCE per process: each new launch
+        // replaces globalThis.document with a fresh one, so the handler
+        // resolves the current document at event time instead of closing over
+        // the document of the first launch (which would send the second
+        // game's touches to a dead document, and stack a listener set per
+        // launch on the shared screen object).
         const doc = runtime.document;
-        if (doc && typeof screen?.addEventListener === 'function') {
+        if (doc && typeof screen?.addEventListener === 'function' && !(screen as any).__burialnxTouchForwarded) {
+                (screen as any).__burialnxTouchForwarded = true;
                 for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel'] as const) {
                         screen.addEventListener(type, ((e: any) => {
+                                const target = (globalThis as any).document;
+                                if (!target) return;
                                 // RPG Maker MV's TouchInput uses touch.pageX/pageY.
                                 // nx.js touch events have clientX/clientY but not pageX/pageY.
                                 // Add them as aliases so the game can read them.
@@ -113,7 +122,7 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                                                 if (t && t.pageX === undefined) { t.pageX = t.clientX; t.pageY = t.clientY; }
                                         }
                                 }
-                                try { doc.dispatchEvent(e); } catch { /* best-effort */ }
+                                try { target.dispatchEvent(e); } catch { /* best-effort */ }
                         }) as EventListener);
                 }
         }

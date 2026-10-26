@@ -37,7 +37,13 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 	let document: any;
 	let gameCanvas: CanvasNode | undefined;
 	const screenContext = screen.getContext('2d')!;
-	const nativeFetch = globalThis.fetch.bind(globalThis);
+	// Keep the REAL native fetch. createBrowserHost runs again when the
+	// user returns to the library and starts another game; at that point
+	// globalThis.fetch is our previous resourceFetch wrapper, and binding
+	// that would stack one wrapper per launch. The marker on the wrapper
+	// preserves the original fetch across launches.
+	const rawFetch = globalThis.fetch as ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & { __burialnxNativeFetch?: typeof globalThis.fetch };
+	const nativeFetch = rawFetch?.__burialnxNativeFetch || rawFetch.bind(globalThis);
 	let fitScreen = true;
 	let queue: ScriptQueue;
 
@@ -193,9 +199,14 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 	for (const name of ['moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'focus', 'blur', 'close']) if (typeof (globalThis as any)[name] !== 'function') (globalThis as any)[name] = () => {};
 	// MV sometimes attaches its listener just after setting src. Defer native
 	// image completion one turn so cached files cannot finish before that.
-	const NativeImage = globalThis.Image;
-	if (NativeImage) {
-		(globalThis as any).Image = function() {
+	// The wrapper is installed once per process: on a second launch
+	// (library → play again) globalThis.Image is already this wrapper, and
+	// wrapping it again would stack deferred dispatches on top of each
+	// other. The marker skips the re-wrap; the existing wrapper is
+	// self-contained and keeps working for the new game.
+	const NativeImage = globalThis.Image as any;
+	if (NativeImage && !NativeImage.__burialnxWrapped) {
+		const wrapped = function() {
 			const image = new NativeImage();
 			const dispatch = image.dispatchEvent.bind(image);
 			image.dispatchEvent = (event: Event) => {
@@ -217,9 +228,13 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
 			image.addEventListener('error', () => log(`Image decode failed: ${image.src}`));
 			return image;
 		};
-		(globalThis as any).Image.prototype = NativeImage.prototype;
+		(wrapped as any).__burialnxWrapped = true;
+		wrapped.prototype = NativeImage.prototype;
+		(globalThis as any).Image = wrapped;
 	}
-	globalThis.fetch = resourceFetch(assets, nativeFetch, log, pngFix);
+	const resourceBridge = resourceFetch(assets, nativeFetch, log, pngFix) as any;
+	resourceBridge.__burialnxNativeFetch = nativeFetch;
+	globalThis.fetch = resourceBridge;
 	return {
 		loadScript(path: string) { return queue.append(path); },
 		settled() { return queue.settled(); },

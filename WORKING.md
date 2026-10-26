@@ -23,6 +23,59 @@ flowchart TD
 ## Code map
 
 - `src/main.ts` connects startup, the options menu, logging, and error handling.
+  At startup it also selects the Switch user once (by touching `localStorage`,
+  whose lazy getter in nx.js mounts save data and shows the system profile
+  selector when no user is preselected) and logs the granted V8 heap size in
+  debug builds. `teardownGame()` fully retires a running game — audio stopped,
+  the game's rAF loop permanently retired, image
+  caches cleared, the game's fonts removed and pending timers cancelled, and
+  a full GC pass — and is used by the quit path, so a stopped game cannot
+  keep running, play sound, or hold native memory.
+  Retiring the frame loop is a two-layer defense: (1) the pending rAF
+  callback is the game's ORIGINAL bound `SceneManager.update`, which
+  property stubs cannot reach, so `beginGameSession()` also wraps
+  `requestAnimationFrame` to track every frame id the game schedules and
+  `endGameSession()` cancels them all before deleting globals (nx.js's rAF
+  is a plain cancellable callback queue); (2) a frame already dequeued for
+  the current vsync batch still runs the bound update after the teardown,
+  so the teardown stubs EVERY manager method update's try/catch can reach
+  (`update`, `updateMain`, `requestUpdate`, `renderScene`, `tickStart`,
+  `tickEnd`, `updateInputData`, `updateScene`, `changeScene`,
+  `catchException`, `stop`, `terminate`) — its own try/catch then swallows
+  the first `… is not defined` error and the stubbed `catchException` ends
+  the chain for good. Without this, the dequeued update's `tickStart()` →
+  `Graphics.tickStart()` and `catchException` → `Graphics.printError()`
+  threw escaping `ReferenceError`s into nx.js, which terminates the whole
+  process for any uncaught rAF exception (the hardware crash: "Graphics is
+  not defined" frozen on a "Loading…" splash, killing the process between
+  teardown and `Switch.exit()` instead of letting it exit cleanly).
+  Because the game runs in the loader's realm, `beginGameSession()` snapshots
+`globalThis` at launch and `endGameSession()` restores it at teardown:
+game-created globals are deleted and host-replaced values (document, fetch,
+Image, …) return to the native originals, which is what actually frees the
+retained native audio/font/pixel memory. The session
+`error`/`unhandledrejection` listeners also call `preventDefault()` on the
+dispatched events: nx.js kills the process with a frozen "Press + to exit"
+screen for ANY uncaught exception or unhandled rejection unless the event
+is canceled, and the loader shows its own recoverable error screen instead.
+There is no in-process session reboot: returning to the library means
+quitting the app (`quitApp()` → `teardownGame()` → `Switch.exit()`) and
+relaunching it from hbmenu, which is a guaranteed clean cold boot — Horizon
+OS reserves the process memory and reclaims it on exit, the only reliably
+clean reset on this OS. An in-process reboot (re-running the app bundle from
+`romfs:/main.js` in a fresh function scope) was implemented and hardened
+across several iterations but proved unstable on hardware: it froze on the
+"Loading…" splash with `FAILURE: ReferenceError: Graphics is not defined`
+(a late game frame referencing the deleted `Graphics` global escaped into
+nx.js, which terminates the whole process for any uncaught rAF exception).
+The full teardown (audio, frame loop, caches, realm restore, GC) is still
+performed before `Switch.exit()` on the quit path, so no stopped game can
+keep running or hold memory while the process dies. The error screen's
+B button uses the same quit path. `renderRenameKb()` draws the rename input
+field: it re-reads `vk.value`/`vk.cursorIndex` every frame (so the preview
+tracks typing even without `change` events), anchors the field above the
+keyboard's real on-screen rectangle (`vk.boundingRect` from `show()`), and
+falls back to a fixed top band without geometry.
 - `src/runtime-plan.ts` selects the game's normal load handler or, if absent,
   starts its boot scene when no scene is already active or queued.
 - `src/folders.ts` and `src/settings.ts` handle SD selection and remembered paths.
@@ -39,7 +92,14 @@ flowchart TD
   request, and script interfaces needed by the game. nx.js supplies the
   actual canvas, audio, image decoding, and timers. The resource fetch bridge
   rejects external and native filesystem URLs; this is not a script sandbox.
+  The Image wrapper and resource fetch are installed around the native
+  originals, and the game-session teardown restores those natives, so every
+  launch installs fresh wrappers and returning to the library plus starting
+  another game never stacks wrappers on top of each other.
 - `src/game-compat.ts` contains the game and engine adapters described below.
+  Screen touch events are forwarded to `document` through a single process-wide
+  listener set that resolves the current `document` at event time, so a second
+  launch keeps touch input working with its fresh document.
 - `src/indexed-png.ts` handles an indexed PNG color issue only if a runtime
   probe shows that the correction is needed.
 - `src/repeated-pattern.ts` batches tiny repeating textures into bounded

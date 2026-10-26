@@ -11,3 +11,4 @@ await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].co
 await import('../tests/icon.test.mjs');
 await import('../tests/ui-flow.test.mjs');
 await import('../tests/library.test.mjs');
+await import('../tests/ini.test.mjs');

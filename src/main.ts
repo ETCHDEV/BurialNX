@@ -99,6 +99,27 @@ function fatal(error: unknown) {
 }
 drawSplash('Loading…');
 
+// === Switch user selection (standard system flow) ======================
+// nx.js shows the system profile selector lazily from the localStorage
+// getter: without this, the "select a user" dialog pops up only when the
+// first launched game touches its saves — in the middle of the session.
+// Touching localStorage here selects the Switch user and mounts the
+// application's save data once, at application startup, before the library
+// appears — the same point where retail Switch games ask for the profile.
+// Title-override launches already carry a preselected user, so normally no
+// dialog appears at all; Album/applet launches get the standard selector.
+try {
+        const storage = (globalThis as any).localStorage;
+        if (storage) { void storage.length; log('_3: save data mounted for the selected user at startup'); }
+        else log('_3: no user save data available (localStorage disabled)');
+} catch (error) { log(`_3: user selection/save mount failed: ${error instanceof Error ? error.message : String(error)}`); }
+// Log how much memory the runtime actually granted (the nxjs.ini
+// [memory] heap_limit request) so debug logs prove the heap budget.
+if (__DEBUG__) try {
+        const memory = (Switch as any).memoryUsage?.();
+        if (memory) log(`_4: V8 heap limit=${Math.round(memory.heapSizeLimit / 1048576)} MiB, native heap=${Math.round(memory.nativeHeapTotal / 1048576)} MiB`);
+} catch { /* memory diagnostics are optional */ }
+
 const menu = new PauseMenu(__DEBUG__);
 
 if (__DEBUG__) log('Reading SD card folders');
@@ -130,7 +151,229 @@ let exitArmedAt = 0;
 let exitNoticeArmed = false;
 let allowExit = false;
 const realExit = typeof (Switch as any).exit === 'function' ? (Switch as any).exit.bind(Switch) : null;
+
+// === Game session snapshot ============================================
+// The game runs in THIS JavaScript realm: its scripts are eval'd at global
+// scope, so every RPG Maker MV global ($dataXXX, SceneManager, Graphics, the
+// patched WebAudio, the host's document/fetch/Image, …) lands on globalThis —
+// and, without this machinery, STAYS there after "Back to library". V8 can
+// never free the map data, sprite graphs, the PIXI renderer or the native
+// audio buffers while those references remain, and the next launch stacks a
+// whole second game on top of the first until native allocations start
+// failing (observed on hardware as "RangeError: Out of memory (failed to
+// allocate … bytes)"). To return ALL memory we snapshot globalThis right
+// before a launch and restore it during teardown: globals added by the game
+// are deleted, globals the host replaced are set back to their original
+// values, game-registered timers are cancelled and fonts the game added are
+// dropped — then one full GC pass retires everything that is no longer
+// reachable.
+interface GameSessionSnapshot {
+        names: Set<string>;
+        values: Record<string, unknown>;
+        fonts: Set<unknown>;
+        timers: Set<number>;
+        rafIds: Set<number>;
+        nativeClearTimeout: ((id: number) => void) | undefined;
+        nativeCancelAnimationFrame: ((id: number) => void) | undefined;
+}
+let gameSession: GameSessionSnapshot | undefined;
+
+function beginGameSession() {
+        const global = globalThis as any;
+        const values: Record<string, unknown> = {};
+        const names = Object.getOwnPropertyNames(globalThis);
+        for (const name of names) values[name] = global[name];
+        const fonts = new Set<unknown>();
+        try {
+                if (global.fonts && typeof global.fonts[Symbol.iterator] === 'function') {
+                        for (const font of global.fonts) fonts.add(font);
+                }
+        } catch { /* the fonts set is optional */ }
+        const snapshot: GameSessionSnapshot = {
+                names: new Set(names),
+                values,
+                fonts,
+                timers: new Set<number>(),
+                rafIds: new Set<number>(),
+                nativeClearTimeout: typeof global.clearTimeout === 'function' ? global.clearTimeout.bind(global) : undefined,
+                nativeCancelAnimationFrame: typeof global.cancelAnimationFrame === 'function' ? global.cancelAnimationFrame.bind(global) : undefined,
+        };
+        gameSession = snapshot;
+        // Track every timer the game registers so teardown can cancel the ones
+        // still pending: a late callback would fire into stopped state and its
+        // closure would pin parts of the game in memory forever.
+        if (typeof global.setTimeout === 'function') {
+                const nativeSetTimeout = global.setTimeout;
+                global.setTimeout = function (handler: unknown, timeout?: unknown, ...args: unknown[]) {
+                        const id = nativeSetTimeout(handler, timeout, ...args);
+                        snapshot.timers.add(id);
+                        return id;
+                };
+        }
+        if (typeof global.setInterval === 'function') {
+                const nativeSetInterval = global.setInterval;
+                global.setInterval = function (handler: unknown, timeout?: unknown, ...args: unknown[]) {
+                        const id = nativeSetInterval(handler, timeout, ...args);
+                        snapshot.timers.add(id);
+                        return id;
+                };
+        }
+        // Track every animation frame the game schedules, for a sharper reason
+        // than the timers: the game's pending rAF callback IS its original
+        // bound SceneManager.update. Property stubs on the manager cannot
+        // reach into that already-bound function, so the only way to stop a
+        // QUEUED frame from running after the realm restore deleted the game
+        // globals is cancelling its id here (nx.js implements rAF as a plain
+        // cancellable callback queue). endGameSession() does exactly that.
+        if (typeof global.requestAnimationFrame === 'function' && typeof global.cancelAnimationFrame === 'function') {
+                const nativeRequestAnimationFrame = global.requestAnimationFrame;
+                global.requestAnimationFrame = function (handler: unknown) {
+                        const id = nativeRequestAnimationFrame(handler);
+                        if (typeof id === 'number') snapshot.rafIds.add(id);
+                        return id;
+                };
+        }
+}
+
+function endGameSession() {
+        const snapshot = gameSession;
+        if (!snapshot) return;
+        gameSession = undefined;
+        const global = globalThis as any;
+        // 0. Cancel the game's queued animation frames FIRST. The pending rAF
+        //    callback runs the original bound SceneManager.update; if it fired
+        //    after the globals below are deleted, its first Graphics/Utils
+        //    reference would throw a ReferenceError that escapes through the
+        //    game's own catchException (which references Graphics too) into
+        //    nx.js — and an uncaught rAF exception terminates the whole
+        //    process (hardware: "Graphics is not defined" over a frozen
+        //    screen). Cancelling the ids plus the manager stubs below make a
+        //    dequeued-but-still-running frame a complete no-op, so quitting
+        //    cannot be crashed by a late game frame between teardown and
+        //    Switch.exit().
+        for (const id of snapshot.rafIds) {
+                try { snapshot.nativeCancelAnimationFrame?.(id); } catch { /* best-effort */ }
+        }
+        // 1. Cancel pending game timers first so no callback fires mid-teardown.
+        for (const id of snapshot.timers) {
+                try { snapshot.nativeClearTimeout?.(id); } catch { /* best-effort */ }
+        }
+        // 2. Drop fonts the game added (each FontFace keeps a native copy of the
+        //    TTF data alive until the object is collected).
+        try {
+                const fonts = global.fonts;
+                if (fonts && typeof fonts[Symbol.iterator] === 'function' && typeof fonts.delete === 'function') {
+                        for (const font of [...fonts]) {
+                                if (!snapshot.fonts.has(font)) { try { fonts.delete(font); } catch { /* best-effort */ } }
+                        }
+                }
+        } catch { /* font cleanup is optional */ }
+        // 3. Delete every global the game or its host added on top of the
+        //    snapshot. Game-created globals are plain configurable properties;
+        //    some nx.js built-ins are non-configurable and simply can't be
+        //    deleted (they are also never the game's, so keeping them is fine).
+        for (const name of Object.getOwnPropertyNames(globalThis)) {
+                if (snapshot.names.has(name)) continue;
+                try { delete global[name]; } catch { /* non-configurable: keep */ }
+        }
+        // 4. Restore replaced values: document, fetch, Image, XMLHttpRequest,
+        //    location, … all go back to the native originals. The next launch
+        //    re-installs fresh wrappers around the natives instead of stacking.
+        for (const name of snapshot.names) {
+                if (!(name in globalThis)) continue;
+                try {
+                        if (global[name] !== snapshot.values[name]) global[name] = snapshot.values[name];
+                } catch { /* non-writable: keep */ }
+        }
+}
+
+/** Completely stop the running game and release everything it holds: game
+ *  audio, the requestAnimationFrame loop, decoded image/bitmap pixel
+ *  buffers, every global the game or its host added to this realm (see the
+ *  game session snapshot above), and our host references. A final GC pass
+ *  returns the freed native buffers to the heap right away. Used by the
+ *  quit path ("Quit BurialNX" and B on the error screen) before Switch.exit(),
+ *  so no part of a stopped game can keep running, keep playing sound, or
+ *  hold on to memory while the runtime tears the process down. */
+function teardownGame() {
+        // Stop all game audio first so nothing keeps playing over the loader.
+        try { runtime.AudioManager?.stopBgm?.(); } catch { /* best-effort */ }
+        try { runtime.AudioManager?.stopBgs?.(); } catch { /* best-effort */ }
+        try { runtime.AudioManager?.stopMe?.(); } catch { /* best-effort */ }
+        try { runtime.AudioManager?.stopSe?.(); } catch { /* best-effort */ }
+        // Permanently retire the game's frame loop. Just setting _stopped (or
+        // the gameStopped flag) leaves the already-queued rAF callback alive:
+        // it re-arms itself every frame and would come back to life — drawing
+        // the retired scene on the physical screen or crashing on stale state —
+        // as soon as the next launch clears gameStopped. Replacing the loop
+        // entry points with no-ops ends the chain for good; the next launch
+        // builds a fresh SceneManager from the game's own scripts.
+        try {
+                const manager = runtime.SceneManager;
+                if (manager) {
+                        try { manager._stopped = true; } catch { /* best-effort */ }
+                        // Drop scene references: scenes hold sprites, and
+                        // sprites hold native bitmap buffers.
+                        try { manager._scene = null; } catch { /* best-effort */ }
+                        try { manager._nextScene = null; } catch { /* best-effort */ }
+                        // Retire EVERY method the game's update loop can reach,
+                        // not just the four obvious ones. A frame that was
+                        // already dequeued for the current vsync batch still
+                        // runs the ORIGINAL bound update() after this function
+                        // returns: its try block calls tickStart/tickEnd →
+                        // Graphics.tickStart/End() and its catch calls
+                        // catchException → Graphics.printError() — with the
+                        // game globals deleted, both threw escaping
+                        // ReferenceErrors and killed the process (hardware
+                        // crash "Graphics is not defined"). Stubbing the full
+                        // reachable set turns even that late callback into a
+                        // complete no-op: the game's own catch swallows the
+                        // first error (e.g. "Utils is not defined") and the
+                        // stubbed catchException ends the chain for good.
+                        for (const name of [
+                                'update', 'updateMain', 'requestUpdate', 'renderScene',
+                                'tickStart', 'tickEnd', 'updateInputData', 'updateScene',
+                                'changeScene', 'catchException', 'stop', 'terminate',
+                        ]) {
+                                try { manager[name] = function () { /* retired game */ }; } catch { /* best-effort */ }
+                        }
+                }
+        } catch { /* best-effort */ }
+        // Release decoded image and bitmap pixel buffers held by the game's caches.
+        try { runtime.ImageManager?._imageCache?.clear?.(); } catch { /* best-effort */ }
+        try { runtime.ImageManager?._cache?.clear?.(); } catch { /* best-effort */ }
+        try { runtime.ImageManager?.clear?.(); } catch { /* best-effort */ }
+        try { if (Array.isArray(runtime.Bitmap?._reuseImages)) runtime.Bitmap._reuseImages.length = 0; } catch { /* best-effort */ }
+        gameStopped = true;
+        // Undo everything the game session added to this realm (globals, host
+        // replacements, game fonts, pending game timers) so the data above is no
+        // longer reachable from anywhere and the GC below can actually free it.
+        endGameSession();
+        // Drop the diagnostic scene references too — they would pin the last
+        // observed scene (and its whole sprite/bitmap graph) in memory.
+        observedScene = undefined;
+        snapshotScene = Symbol('no diagnostic snapshot yet');
+        host = undefined;
+        mapPrefetch = undefined;
+        // Ask V8 for a full collection so the released buffers are actually
+        // returned to the native heap instead of lingering until the next
+        // launch needs the memory.
+        try {
+                const before = __DEBUG__ ? (Switch as any).memoryUsage?.() : undefined;
+                if (typeof runtime.gc === 'function') runtime.gc();
+                if (before) {
+                        const after = (Switch as any).memoryUsage?.();
+                        if (after) log(`_teardown: heap ${(before.usedHeapSize / 1048576).toFixed(1)} MiB -> ${(after.usedHeapSize / 1048576).toFixed(1)} MiB, native malloc ${(after.mallocedMemory / 1048576).toFixed(1)} MiB`);
+                }
+        } catch { /* best-effort */ }
+}
+
 function quitApp() {
+        // Return all memory and shut everything down before exiting: stop the
+        // game (audio + frame loop + image buffers) and run a final GC pass,
+        // then let the runtime tear the process down — nx.js unmounts save
+        // data and releases its native arenas from Switch.exit().
+        try { teardownGame(); } catch { /* best-effort */ }
         if (realExit) { allowExit = true; realExit(); }
         else { /* fall back to letting the runtime handle it */ }
 }
@@ -315,14 +558,20 @@ function panel(lines: string[], full = false) {
 function hud() {
         if (phase !== 'game') return;
         if (menu.open) {
-                const labels: Record<string, string> = { continue: 'Resume', load: 'Load existing save', saves: 'Choose save location (restart)', import: 'Import Steam saves to current location', resolution: `Display: ${fit ? 'fit' : 'native size'}`, fps: `FPS: ${menu.fps ? 'on' : 'off'}`, mod: 'Select mod for next launch', direct: `Direct screen next start: ${directNext ? 'on' : 'off'}`, snapshot: 'Write diagnostic snapshot', keymap: 'Edit joycon key bindings', library: 'Back to library (restart)', quit: 'Quit BurialNX' };
+                const labels: Record<string, string> = { continue: 'Resume', load: 'Load existing save', saves: 'Choose save location (restart)', import: 'Import Steam saves to current location', resolution: `Display: ${fit ? 'fit' : 'native size'}`, fps: `FPS: ${menu.fps ? 'on' : 'off'}`, mod: 'Select mod for next launch', direct: `Direct screen next start: ${directNext ? 'on' : 'off'}`, snapshot: 'Write diagnostic snapshot', keymap: 'Edit joycon key bindings', quit: 'Quit BurialNX (exit to hbmenu)' };
                 panel(['BurialNX  |  Up/Down: select  A: choose  B: close', `${fps.toFixed(1)} FPS`, ...menu.items.map((item, i) => `${i === menu.selected ? '> ' : '  '}${labels[item]}`)]);
         } else if (menu.fps) panel([`${fps.toFixed(1)} FPS`]);
 }
-function fail(error: unknown) {
+function fail(error: unknown, async = false) {
         const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack || ''}` : String(error);
         log(`FAILURE: ${detail}`);
         if (phase === 'error') return;
+        // Leftover asynchronous callbacks of a retired game (timers, audio
+        // promises, late image loads) can still throw after the user quit the
+        // app or returned to the error screen. Those errors can no longer be
+        // acted on and must not hijack the loader with a red error screen;
+        // log them and move on.
+        if (async && gameStopped) { log('Suppressed asynchronous error from the stopped game.'); return; }
         snapshotRuntimeLog();
         message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
         phase = 'error';
@@ -330,13 +579,68 @@ function fail(error: unknown) {
         try { runtime.SceneManager?.stop?.(); } catch { /* keep the original error */ }
 }
 function failRequest(error: Error, responseText: string) {
-        fail(error);
+        // Request completions are asynchronous by nature; when they arrive from
+        // a game that was already stopped, fail() only logs them.
+        fail(error, true);
         if (__DEBUG__ && responseText && responseText.length <= 2 * 1024 * 1024) try {
                 void crypto.subtle.digest('SHA-256', new TextEncoder().encode(responseText)).then((digest) => {
                         const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
                         log(`Failed response UTF-8 SHA-256: ${hash}`);
                 }).catch((reason) => log(`Could not fingerprint failed response: ${String(reason)}`));
         } catch (reason) { log(`Could not fingerprint failed response: ${String(reason)}`); }
+}
+
+// === Session lifetime listeners ========================================
+// The loader registers these three listeners ONCE on the process-lifetime
+// globals. The beforeunload guard ALWAYS prevents the default so the Plus (+)
+// button never exits on its own: quitting goes through the pause menu's
+// "Quit BurialNX" entry or the double-press confirmation (quitApp sets
+// allowExit before calling the real exit). The error/unhandledrejection
+// listeners cancel the dispatched events: nx.js otherwise terminates the
+// whole process ("Press + to exit" over a frozen screen) for ANY uncaught
+// exception or floating promise — the loader shows its own recoverable
+// error screen instead.
+const sessionErrorListener = ((event: any) => {
+        // Image 'error' events (fired when a cover PNG fails to decode) bubble
+        // up to globalThis. They are not ErrorEvent and don't have .error or
+        // .message. loadCoverImage already handles them via its own 'error'
+        // listener (setting entry.failed and drawing a placeholder). Don't
+        // double-handle here — that would show a spurious red error panel
+        // every time a malformed cover is loaded.
+        if (!event) return;
+        if (event.error || event.message) {
+                const error: unknown = event.error instanceof Error || typeof event.error === 'string' ? event.error : typeof event.message === 'string' ? event.message : null;
+                if (error !== null) {
+                        // nx.js terminates the whole process for an uncaught
+                        // exception ("Press + to exit" over a frozen screen)
+                        // unless the dispatched 'error' event is canceled. Take
+                        // responsibility for the outcome instead: show our own
+                        // recoverable error screen — or just log it when the
+                        // error is residue of an already retired session.
+                        try { event.preventDefault?.(); } catch { /* best-effort */ }
+                        fail(error, true);
+                }
+        }
+}) as EventListener;
+const sessionRejectionListener = ((event: PromiseRejectionEvent) => {
+        // Unhandled rejections are exactly as fatal as uncaught exceptions in
+        // nx.js — and games are full of floating promises. Cancel the default
+        // and let fail() decide whether the reason deserves a screen.
+        try { event.preventDefault?.(); } catch { /* best-effort */ }
+        fail(event.reason, true);
+}) as EventListener;
+// nx.js checks Plus (+) every frame and dispatches beforeunload when it is
+// held; if the event is not canceled the runtime exits. The guard ALWAYS
+// prevents the default so + never exits on its own: quitting goes through
+// the pause menu or the double-press confirmation (quitApp sets allowExit
+// before calling the real exit).
+const sessionBeforeUnloadGuard = ((event: Event) => {
+        if (!allowExit) event.preventDefault();
+}) as EventListener;
+function registerSessionListeners() {
+        try { globalThis.addEventListener('error', sessionErrorListener); } catch { /* best-effort */ }
+        try { globalThis.addEventListener('unhandledrejection', sessionRejectionListener); } catch { /* best-effort */ }
+        try { globalThis.addEventListener('beforeunload', sessionBeforeUnloadGuard); } catch { /* best-effort */ }
 }
 
 // === Cover image cache ==================================================
@@ -842,10 +1146,89 @@ function renderKeyboardPicker(targetLabel: string) {
         ctx.textAlign = 'left';
 }
 
+/** Live preview screen while the Switch software keyboard is open. The
+ * inline swkbd does not render the typed text itself, so this field is the
+ * only place the player sees the current name. The text is re-read from the
+ * keyboard EVERY FRAME (vk.value / vk.cursorIndex — nx.js keeps them current
+ * via the native swkbd callbacks), so the preview updates even if a
+ * "change" event is missed; the listeners only keep `renamePreview` warm
+ * for runtimes where the keyboard object is opaque.
+ * The field is anchored directly above the REAL keyboard rectangle
+ * (vk.boundingRect, filled by show() from the applet's touch rectangles),
+ * so it visually reads as "the field this keyboard types into". Without
+ * geometry the field falls back to a fixed top band that no swkbd layout
+ * ever covers. */
+function renderRenameKb() {
+        const vk = (navigator as any).virtualKeyboard;
+        const text = typeof vk?.value === 'string' ? vk.value : renamePreview;
+        const caret = Math.max(0, Math.min(text.length, Number(vk?.cursorIndex) || 0));
+        const max = Number(vk?.maxLength) || 64;
+        const oldName = currentEntry?.name ?? '';
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#161823';
+        ctx.fillRect(0, 0, screen.width, screen.height);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#f4f3ef';
+        ctx.font = '24px sans-serif';
+        ctx.fillText('BurialNX — rename game', 28, 44);
+        ctx.fillStyle = '#9aa0b4';
+        ctx.font = '20px sans-serif';
+        ctx.fillText(oldName ? `Renaming “${oldName}”. Type below — your text appears in this field as you type.` : 'Type below — your text appears in this field as you type.', 28, 78);
+        // Geometry: the applet reports its touch rectangles in show(), so the
+        // height is real hardware data. The keyboard hugs the bottom edge;
+        // anchor the input field just above it (counter + hint below the
+        // field, hint above the keys). Fallback: fixed band at y=150.
+        const kbHeight = Math.max(0, Math.round(Number(vk?.boundingRect?.height) || 0));
+        const boxX = 60, boxW = screen.width - 120, boxH = 92;
+        const boxY = kbHeight > 0 ? Math.max(150, screen.height - kbHeight - boxH - 86) : 150;
+        // Field label.
+        ctx.fillStyle = '#9aa0b4';
+        ctx.font = '19px sans-serif';
+        ctx.fillText('Game name', boxX + 4, boxY - 14);
+        // The input field itself — big and high contrast.
+        ctx.fillStyle = '#252840';
+        ctx.fillRect(boxX, boxY, boxW, boxH);
+        ctx.strokeStyle = '#565f8d';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(boxX + 4, boxY + 4, boxW - 8, boxH - 8);
+        ctx.clip();
+        ctx.font = '34px sans-serif';
+        ctx.fillStyle = '#f4f3ef';
+        ctx.textBaseline = 'middle';
+        const inner = boxW - 72;
+        // Scroll the text so the caret stays visible in long names.
+        let offset = 0;
+        while (offset < caret && ctx.measureText(text.slice(offset, caret)).width > inner) offset++;
+        ctx.fillText(text.slice(offset), boxX + 28, boxY + boxH / 2 + 2);
+        const caretX = boxX + 28 + ctx.measureText(text.slice(offset, caret)).width;
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fillRect(caretX, boxY + boxH / 2 - 22, 3, 44);
+        ctx.restore();
+        // Counter and controls, between the field and the keyboard.
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#6e7681';
+        ctx.font = '19px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${text.length}/${max} characters`, screen.width / 2, boxY + boxH + 32);
+        ctx.fillText('OK saves · B cancels · (+) does nothing while typing', screen.width / 2, boxY + boxH + 60);
+        ctx.restore();
+}
+
 async function launch() {
         phase = 'loading';
         gameStopped = false; // reset for new game launch
         try {
+                // Snapshot the global scope before anything game-related is installed:
+                // every global the game, its fonts, its timers or its host add on top
+                // of this point is undone by teardownGame() when the user quits the
+                // app, so no game data survives into the next cold boot.
+                beginGameSession();
                 if (!selectedGame) throw new Error('No game selected');
                 const rawAssets = gameAssets(selectedGame, selectedMod || null, { async read(path) {
                         const bytes = await Switch.readFile(path);
@@ -926,20 +1309,10 @@ async function launch() {
                 }
         } catch (error) { fail(error); }
 }
-globalThis.addEventListener('error', ((event: any) => {
-        // Image 'error' events (fired when a cover PNG fails to decode) bubble
-        // up to globalThis. They are not ErrorEvent and don't have .error or
-        // .message. loadCoverImage already handles them via its own 'error'
-        // listener (setting entry.failed and drawing a placeholder). Don't
-        // double-handle here — that would show a spurious red error panel
-        // every time a malformed cover is loaded.
-        if (!event) return;
-        if (event.error || event.message) {
-                if (event.error instanceof Error || typeof event.error === 'string') fail(event.error);
-                else if (typeof event.message === 'string') fail(event.message);
-        }
-}) as EventListener);
-globalThis.addEventListener('unhandledrejection', ((event: PromiseRejectionEvent) => fail(event.reason)) as EventListener);
+// The global error/rejection listeners live with the session-lifetime
+// listeners further up (sessionErrorListener & co.); they are registered at
+// the bottom of this file, after every state variable is initialized.
+
 
 let observedScene: any, sceneSince = 0, lastSceneReport = 0;
 let snapshotScene: any = Symbol('no diagnostic snapshot yet');
@@ -1054,20 +1427,34 @@ function frame(now: number) {
                                                         waitForRelease = true; phase = 'notice';
                                                 }
                                         } else if (gameOptionsCursor === 5) {
-                                                // Rename game — use the Switch's built-in software keyboard (swkbd)
+                                                // Rename game — use the Switch's built-in software keyboard (swkbd).
                                                 if (currentEntry && navigator?.virtualKeyboard) {
                                                         const vk = navigator.virtualKeyboard;
                                                         vk.okButtonText = 'Save';
                                                         vk.type = 0; // Normal text keyboard
+                                                        vk.maxLength = 64; // library names are validated to <= 128
+                                                        // Seed the keyboard with the game's current name so it opens
+                                                        // for editing (nx.js sends the value as the swkbd input text
+                                                        // and places the cursor at its end). Whatever comes back on
+                                                        // 'submit' replaces the whole name at once.
+                                                        vk.value = currentEntry.name;
                                                         renameSubmitted = false;
                                                         renamePreview = currentEntry.name;
+                                                        // nx.js dispatches 'change' on every keypress (and
+                                                        // 'cursormove' when the cursor moves) with the keyboard's
+                                                        // full current text in vk.value. The swkbd itself does not
+                                                        // render the input, so the preview field is the player's
+                                                        // only live feedback — keep it in sync while typing.
+                                                        const onLiveInput = () => { renamePreview = vk.value; };
                                                         // nx.js dispatches 'geometrychange' (from onHide) BEFORE
                                                         // 'submit'. So we must DELAY the geometrychange processing
                                                         // to give 'submit' a chance to fire first.
                                                         const onSubmit = () => {
                                                                 renameSubmitted = true;
-                                                                renamePreview = vk.value || currentEntry!.name;
-                                                                const text = renamePreview;
+                                                                // vk.value is the full text from the keyboard: replace the
+                                                                // entire name with it (fall back to the old name if empty).
+                                                                const text = vk.value || currentEntry!.name;
+                                                                renamePreview = text;
                                                                 const updated: LibraryEntry = { ...currentEntry!, name: text };
                                                                 if (rememberLibrary(updated)) { currentEntry = updated; message = 'Name changed.'; }
                                                                 else message = 'Could not save name.';
@@ -1079,6 +1466,8 @@ function frame(now: number) {
                                                                         setTimeout(() => {
                                                                                 vk.removeEventListener('submit', onSubmit as EventListener);
                                                                                 vk.removeEventListener('geometrychange', onGeometryChange as EventListener);
+                                                                                vk.removeEventListener('change', onLiveInput as EventListener);
+                                                                                vk.removeEventListener('cursormove', onLiveInput as EventListener);
                                                                                 if (!renameSubmitted) {
                                                                                         // Cancelled (submit didn't fire within the delay)
                                                                                         waitForRelease = true; phase = 'game-options';
@@ -1088,6 +1477,8 @@ function frame(now: number) {
                                                         };
                                                         vk.addEventListener('submit', onSubmit as EventListener);
                                                         vk.addEventListener('geometrychange', onGeometryChange as EventListener);
+                                                        vk.addEventListener('change', onLiveInput as EventListener);
+                                                        vk.addEventListener('cursormove', onLiveInput as EventListener);
                                                         vk.show();
                                                         phase = 'rename-kb'; // freeze game-options rendering
                                                 } else {
@@ -1182,9 +1573,9 @@ function frame(now: number) {
                         }
                         renderKeymap();
                 } else if (phase === 'rename-kb') {
-                        // Swkbd is open — draw a simple preview screen.
-                        // Do NOT process game input or render the game underneath.
-                        panel(['BurialNX — rename game', 'Type on the keyboard below.', `Preview: ${renamePreview}`], true);
+                        // Swkbd is open — render the live preview of the name being typed.
+                        // Do NOT process gamepad input here: the keyboard owns it.
+                        renderRenameKb();
                 } else if (phase === 'rename') {
                         // Character-cycling rename: Up/Down cycle the char at cursor,
                         // Left/Right move cursor, A confirms, B cancels.
@@ -1347,8 +1738,21 @@ function frame(now: number) {
                                 exitNoticeArmed = false;
                                 quitApp();
                         }
+                } else if (phase === 'error') {
+                        panel(['BurialNX — game could not start', message, __DEBUG__ ? `Details: ${hostLogPath}` : 'Try the debug build for details.', 'Press B to exit BurialNX (relaunch for a clean library).'], true);
+                        if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
+                        else if (!waitForRelease && buttons?.[0]?.pressed && !previousButtons[0]) {
+                                waitForRelease = true;
+                                // A failed launch leaves half-installed game state behind. Exit
+                                // the app fully (teardown + Switch.exit) so the next launch is
+                                // a guaranteed clean cold boot — exactly like "Quit BurialNX"
+                                // from the pause menu. Horizon OS reserves the process memory
+                                // and reclaims it on exit, so this is the only reliably clean
+                                // reset; an in-process session reboot proved unstable on
+                                // hardware (froze on the "Loading…" splash).
+                                quitApp();
+                        }
                 } else if (phase === 'loading') panel(['BurialNX', 'Opening game…', ...(__DEBUG__ ? debugLines : [])], true);
-                else if (phase === 'error') panel(['BurialNX — game could not start', message, __DEBUG__ ? `Details: ${hostLogPath}` : 'Try the debug build for details.'], true);
                 else {
                         diagnoseScene(now);
                         if (now - lastMemoryCheck >= 5000) {
@@ -1388,29 +1792,6 @@ function frame(now: number) {
                                         openKeymapEditor('global');
                                 }
                         }
-                        if (action === 'library') {
-                                // Stop the running game and return to the library.
-                                // Set gameStopped=true so the SceneManager.updateMain
-                                // override returns early and doesn't call the game's
-                                // update (which would crash if globals are missing).
-                                // Set _stopped=true so the game's requestUpdate stops
-                                // scheduling the next rAF callback.
-                                // DO NOT delete globals — the game's rAF callback is
-                                // still in the queue and would crash if it tries to
-                                // access them. gameStopped makes it a no-op.
-                                try { runtime.AudioManager?.stopBgm?.(); } catch { /* best-effort */ }
-                                try { runtime.AudioManager?.stopBgs?.(); } catch { /* best-effort */ }
-                                try { runtime.AudioManager?.stopMe?.(); } catch { /* best-effort */ }
-                                try { runtime.AudioManager?.stopSe?.(); } catch { /* best-effort */ }
-                                gameStopped = true;
-                                try { if (runtime.SceneManager) runtime.SceneManager._stopped = true; } catch {}
-                                host = undefined;
-                                mapPrefetch = undefined;
-                                menu.dismiss();
-                                invalidateCoverCache();
-                                phase = 'library';
-                                waitForRelease = true;
-                        }
                         if (action === 'quit') { quitApp(); }
                         if (action === 'direct' && debugSettingsValid) {
                                 try { const value = !directNext; Switch.writeFileSync(debugSettingsPath, JSON.stringify({ directScreen: value })); directNext = value; log('Direct-screen setting saved; restart required.'); }
@@ -1420,8 +1801,11 @@ function frame(now: number) {
                         host?.present();
                         if (menu.blocksInput || !host?.direct()) hud();
                 }
-                // Detect + button (gamepad button 9) for quit confirmation
-                if (edge(9) && phase !== 'notice') {
+                // Detect + button (gamepad button 9) for quit confirmation.
+                // While the software keyboard is open (rename-kb), + belongs to
+                // the keyboard session and must not be treated as a quit
+                // request — pressing it while typing must do nothing.
+                if (edge(9) && phase !== 'notice' && phase !== 'rename-kb') {
                         exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
                         message = 'Press Plus (+) again to quit BurialNX. B: stay.';
                         waitForRelease = true; phase = 'notice';
@@ -1499,27 +1883,17 @@ function openKeymapEditor(target: 'global' | LibraryEntry) {
         phase = 'keymap';
 }
 
-// === Plus-button exit guard registration ==============================
-// Registered LAST, after every state variable it closes over is initialized,
-// so a keydown dispatched during synchronous init cannot trip a TDZ. The
-// listener intercepts Escape (the key nx.js emits for the Switch Plus
-// button), prevents nx.js's own runtime listener from calling Switch.exit,
-// and prevents the game from receiving Escape as a cancel input.
-//   - In loader UI phases: surface a quit confirmation notice; a second +
-//     within 2 seconds actually quits (quitApp calls the real exit).
-//   - In the game phase: silently swallow the press so the in-game cancel
-//     action does not also fire.
-// === Plus button exit guard (beforeunload) =============================
-// nx.js checks Plus (+) every frame via $.onFrame(plusDown). If plusDown,
-// it dispatches beforeunload. If NOT canceled, $.exit() is called.
-// We ALWAYS preventDefault on beforeunload so + never exits the app.
-// The user quits via pause menu's Quit BurialNX (calls realExit), or by
-// pressing + twice (detected via gamepad button 9 in the frame loop).
-try {
-        addEventListener('beforeunload', ((event: Event) => {
-                if (!allowExit) event.preventDefault();
-        }) as EventListener);
-} catch (error) { /* best-effort */ }
+// === Session listener registration =====================================
+// Registered LAST, after every state variable the listeners close over is
+// initialized, so an event dispatched during synchronous init cannot trip a
+// TDZ. This single process-wide registration installs the
+// error/unhandledrejection reporters and the beforeunload guard (see the
+// session-lifetime listeners above) for the lifetime of the app. There is
+// no session reboot: "Quit BurialNX" (and B on the error screen) perform a
+// full teardown + Switch.exit, so the next launch is a guaranteed clean
+// cold boot from hbmenu — Horizon OS reclaims the reserved process memory
+// on exit, which is the only reliably clean reset on this OS.
+registerSessionListeners();
 
 if (__DEBUG__) log('Startup ready');
 requestAnimationFrame(frame);

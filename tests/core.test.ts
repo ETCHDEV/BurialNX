@@ -155,7 +155,7 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.step(press(8), 0); menu.step(press(8), 801);
         assert.equal(menu.open, true);
         menu.step(press(8), 2000); assert.equal(menu.open, true);
-        assert.deepEqual(menu.items, ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod', 'keymap', 'library', 'quit']);
+        assert.deepEqual(menu.items, ['continue', 'load', 'saves', 'import', 'resolution', 'fps', 'mod', 'keymap', 'quit']);
         menu.step(press(0), 2001); assert.equal(menu.open, false);
         menu.step(null, 2002); assert.equal(menu.blocksInput, false);
         assert.equal((menu as any).pressed, buttonsBuffer);
