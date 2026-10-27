@@ -52,6 +52,11 @@ export interface KeyMap {
          *  When present, the UI shows the label instead of the virtual key name
          *  so the user can see which keyboard key is bound to each button. */
         labels?: string[];
+        /** Optional keyCodes — when present, the bound keyCode is sent
+         *  directly to Input._currentState (simulating a keyboard key press)
+         *  instead of using the vkey via gamepadMapper. This lets the game's
+         *  own keyMapper decide what the key does. */
+        keyCodes?: number[];
         /** Analog stick → keyboard key bindings. When the stick is pushed
          *  past 0.5 in a direction, the bound keyCode is "pressed" via
          *  Input._currentState. This lets the user bind sticks to movement
@@ -100,6 +105,7 @@ export function parseKeyMap(text: string): KeyMap {
         });
         const map: KeyMap = { buttons };
         if (Array.isArray(data.labels)) map.labels = data.labels;
+        if (Array.isArray(data.keyCodes)) map.keyCodes = data.keyCodes;
         if (data.sticks && typeof data.sticks === 'object') map.sticks = data.sticks;
         return map;
 }
@@ -130,11 +136,25 @@ export function saveKeyMap(fs: KeyMapAccess, map: KeyMap): boolean {
 
 /** Apply the user's remap to RPG Maker MV's Input.gamepadMapper, replacing the
  *  hard-coded default. Only buttons remapped to `none` are removed; others are
- *  set so the engine sees the chosen virtual key. */
+ *  set so the engine sees the chosen virtual key.
+ *
+ *  Buttons with a non-zero keyCode binding are SKIPPED here — those are sent
+ *  via Input._onKeyDown by pollButtonBindings() in main.ts. Setting
+ *  gamepadMapper for them too would cause DOUBLE input (gamepad vkey +
+ *  keyboard keyCode). keyCode=0 means "no keyboard binding, use
+ *  gamepadMapper" — don't skip those. */
 export function applyKeyMap(runtime: any, map: KeyMap): void {
         if (!runtime?.Input) return;
         const mapper: Record<number, string> = {};
-        map.buttons.forEach((key, index) => { if (key !== 'none') mapper[index] = key; });
+        map.buttons.forEach((key, index) => {
+                // Skip buttons with a keyCode binding — those are sent via
+                // Input._onKeyDown by pollButtonBindings(). Setting
+                // gamepadMapper would cause DOUBLE input (gamepad vkey +
+                // keyboard keyCode). keyCode=0 means "no keyboard binding,
+                // use gamepadMapper" — don't skip those.
+                if (map.keyCodes && map.keyCodes[index]) return;
+                if (key !== 'none') mapper[index] = key;
+        });
         // The original loader also maps buttons 9 and 12-15 to in-game menu and
         // directions. If the user has remapped them, honor the user. Otherwise,
         // keep them so a fresh KeyMap behaves like the original loader.
@@ -151,17 +171,30 @@ export function setButton(map: KeyMap, index: number, key: VirtualKey): KeyMap {
         if (index < 0 || index >= 16) throw new Error('Invalid button index');
         const buttons = map.buttons.slice();
         buttons[index] = key;
-        return { buttons, ...(map.labels ? { labels: map.labels.slice() } : {}) };
+        const result: KeyMap = { buttons };
+        if (map.labels) result.labels = map.labels.slice();
+        if (map.keyCodes) {
+                result.keyCodes = map.keyCodes.slice();
+                result.keyCodes[index] = 0;
+        }
+        if (map.sticks) result.sticks = map.sticks;
+        return result;
 }
 
-/** Set a button binding with a display label (e.g. '5' for the '5' key). */
-export function setButtonWithLabel(map: KeyMap, index: number, key: VirtualKey, label: string): KeyMap {
+/** Set a button binding with a display label AND a keyCode. The keyCode
+ *  is sent to Input._currentState at runtime so the game's keyMapper
+ *  (not gamepadMapper) decides what the key does. */
+export function setButtonWithLabel(map: KeyMap, index: number, key: VirtualKey, label: string, keyCode: number): KeyMap {
         if (index < 0 || index >= 16) throw new Error('Invalid button index');
         const buttons = map.buttons.slice();
         buttons[index] = key;
         const labels = map.labels ? map.labels.slice() : new Array(16).fill('');
         labels[index] = label;
-        return { buttons, labels };
+        const keyCodes = map.keyCodes ? map.keyCodes.slice() : new Array(16).fill(0);
+        keyCodes[index] = keyCode;
+        const result: KeyMap = { buttons, labels, keyCodes };
+        if (map.sticks) result.sticks = map.sticks;
+        return result;
 }
 
 export { KEYMAP_PATH };

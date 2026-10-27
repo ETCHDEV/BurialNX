@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { mkdtemp, mkdir, copyFile, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, copyFile, readFile, writeFile, rm, cp } from 'node:fs/promises';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -21,6 +21,14 @@ try {
   meta.nacp.title = debug ? 'BurialNX-Debug' : 'BurialNX';
   await writeFile(join(staging, 'package.json'), JSON.stringify(meta));
   await copyFile(join(project, 'romfs', 'nxjs.ini'), join(staging, 'romfs', 'nxjs.ini'));
+  // Recursively copy any other files in romfs/ (e.g. the bundled
+  // action-tile PNG icons under romfs/icons/) into the staging dir
+  // so @nx.js/nro --fat bundles them into the NRO's romfs. Without
+  // this, only nxjs.ini (manually copied above) ends up in the NRO
+  // and romfs:/icons/*.png reads fail at runtime.
+  try {
+    await cp(join(project, 'romfs'), join(staging, 'romfs'), { recursive: true });
+  } catch { /* if romfs/ has no extra files, that's fine — nxjs.ini is already there */ }
   await prepareIcon(project, staging, { defaultIcon });
 
   // === Baked-in forwarder placeholders ==================================

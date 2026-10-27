@@ -1269,6 +1269,70 @@ function invalidateCoverCache() {
         coverCache.clear();
 }
 
+// === Library action-tile icons (bundled in romfs:/icons/) ===========
+// Three PNG icons shipped inside the NRO's romfs: add.png, exit.png,
+// settings.png. They're drawn STRETCHED to fill the cover area of the
+// three library action tiles (240×230), with a text label under them
+// (still inside the tile border). Loaded once at startup; reused for
+// every renderLibrary call. If a romfs read fails, the tile falls back
+// to the original centered-text rendering.
+interface ActionIcon { image: any; loaded: boolean; failed: boolean; }
+const actionIcons: ActionIcon[] = [
+        { image: null, loaded: false, failed: false }, // add
+        { image: null, loaded: false, failed: false }, // settings
+        { image: null, loaded: false, failed: false }, // exit
+];
+const actionIconPaths = ['romfs:/icons/add.png', 'romfs:/icons/settings.png', 'romfs:/icons/exit.png'];
+function loadActionIcons(): void {
+        const NativeImage = (globalThis as any).Image;
+        if (typeof NativeImage !== 'function') return;
+        for (let i = 0; i < actionIconPaths.length; i++) {
+                const path = actionIconPaths[i];
+                const entry = actionIcons[i];
+                if (entry.loaded || entry.failed) continue;
+                try {
+                        const bytes = Switch.readFileSync(path);
+                        if (!bytes || bytes.byteLength < 24) { entry.failed = true; continue; }
+                        const u8 = new Uint8Array(bytes);
+                        // Basic PNG signature check — these are our own
+                        // bundled files so they should always be valid,
+                        // but be defensive.
+                        if (u8[0] !== 0x89 || u8[1] !== 0x50 || u8[2] !== 0x4e || u8[3] !== 0x47) {
+                                entry.failed = true;
+                                log(`Action icon not a PNG: ${path}`);
+                                continue;
+                        }
+                        const img = new NativeImage();
+                        img.addEventListener('load', () => { entry.loaded = true; entry.image = img; });
+                        img.addEventListener('error', (event: any) => {
+                                entry.failed = true;
+                                log(`Action icon load failed: ${path}`);
+                                try { event?.stopPropagation?.(); } catch { /* best-effort */ }
+                        });
+                        // Convert to base64 data URL — same workaround as
+                        // loadCoverImage (avoids the file-fetch+decode
+                        // crash on the native decoder).
+                        let binary = '';
+                        const CHUNK = 8192;
+                        for (let j = 0; j < u8.length; j += CHUNK) {
+                                const chunk = u8.subarray(j, Math.min(j + CHUNK, u8.length));
+                                binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
+                        }
+                        const base64 = (typeof btoa === 'function') ? btoa(binary) : '';
+                        if (base64) img.src = `data:image/png;base64,${base64}`;
+                        else { img.src = path; log(`Action icon: btoa unavailable, falling back to direct path`); }
+                } catch (error) {
+                        entry.failed = true;
+                        log(`Action icon init failed: ${path}: ${String(error)}`);
+                }
+        }
+}
+// Kick off the loads at module init — they're async (Image 'load'
+// event fires later), but the read+base64 work happens synchronously
+// here so by the time renderLibrary is first called the images are
+// either loaded or already marked failed.
+loadActionIcons();
+
 // === Library UI rendering ==============================================
 // IMPORTANT: nx.js allocates ~2MB per ctx.font assignment. This function
 // sets the font EXACTLY ONCE ('20px sans-serif') and never changes it.
@@ -1313,12 +1377,50 @@ function renderLibrary() {
                 ctx.lineWidth = selected ? 3 : 1;
                 ctx.strokeRect(x + 1, y + 1, tileW - 2, tileH - 2);
                 if (isAction) {
-                        // Fixed font (already set to 20px). No auto-shrink.
+                        // Action tile: draw the bundled PNG icon SHRUNK by
+                        // ~1/3 (to ~160×160 = 2/3 of the cover area width)
+                        // and CENTERED in the cover area (240×230), with the
+                        // text label UNDER it in the bottom 36px text strip
+                        // — still inside the outlined tile border. The icon
+                        // source PNGs are 512×512 square, so we draw at a
+                        // square 160×160 to preserve their aspect ratio (no
+                        // squish). If the icon load hasn't completed or
+                        // failed, draw a placeholder in the cover area so
+                        // the label still reads as a caption.
+                        //   actionIdx 0 = "+ Add Game"      → add.png
+                        //   actionIdx 1 = "Keymap Settings" → settings.png
+                        //   actionIdx 2 = "Quit BurialNX"   → exit.png
+                        const labels = ['+ Add Game', 'Keymap Settings', 'Quit BurialNX'];
+                        const icon = actionIcons[actionIdx];
+                        // Icon size = ~2/3 of the cover area's larger
+                        // dimension (240 width → 160), rounded for clean
+                        // pixel math. Centered horizontally AND vertically
+                        // within the 240×230 cover area.
+                        // The EXIT icon (actionIdx 2, "Quit BurialNX") is
+                        // shrunk FURTHER by 2× (160 → 80) per the user's
+                        // request — the exit/power glyph is visually
+                        // heavier than the +/gear icons, so it needs to
+                        // be smaller to feel balanced next to them.
+                        const coverW = tileW;
+                        const coverH = 230;
+                        let iconSize = Math.floor(coverW * 2 / 3); // 160 px (default)
+                        if (actionIdx === 2) iconSize = Math.floor(iconSize / 2); // 80 px (exit, halved)
+                        const iconX = x + Math.floor((coverW - iconSize) / 2);
+                        const iconY = y + Math.floor((coverH - iconSize) / 2);
+                        if (icon && icon.loaded && icon.image) {
+                                try {
+                                        ctx.drawImage(icon.image, iconX, iconY, iconSize, iconSize);
+                                } catch { drawPlaceholderCover(x, y, coverW, coverH); }
+                        } else {
+                                drawPlaceholderCover(x, y, coverW, coverH);
+                        }
+                        // Text label UNDER the icon, in the bottom 36px
+                        // strip of the tile (y+234..y+270), still inside
+                        // the outlined tile border.
                         ctx.fillStyle = '#f4f3ef';
                         ctx.textAlign = 'center';
                         ctx.textBaseline = 'middle';
-                        const labels = ['+ Add Game', 'Keymap Settings', 'Quit BurialNX'];
-                        ctx.fillText(labels[actionIdx] || '', x + tileW / 2, y + tileH / 2);
+                        ctx.fillText(labels[actionIdx] || '', x + tileW / 2, y + 252);
                         ctx.textAlign = 'left';
                         ctx.textBaseline = 'alphabetic';
                 } else {
@@ -1375,14 +1477,6 @@ function renderLibrary() {
         // Footer hint
         ctx.fillStyle = '#9aa0b4';
         ctx.fillText('A: Play  X: Options  Y: Add game  Hold Minus: Menu  Hold Plus: Quit', 28, screen.height - 24);
-        // Version string (bottom-right) so the user can verify they're
-        // running the latest build.
-        ctx.textAlign = 'right';
-        ctx.fillStyle = '#6e7681';
-        ctx.font = '14px sans-serif';
-        ctx.fillText('v0.1.4-exit ' + (__DEBUG__ ? 'debug' : 'release'), screen.width - 28, screen.height - 24);
-        ctx.textAlign = 'left';
-        ctx.font = '20px sans-serif';
         ctx.restore();
 }
 function drawPlaceholderCover(x: number, y: number, w: number, h: number) {
@@ -1598,6 +1692,35 @@ const KEYBOARD_LAYOUT: KeyDef[] = [
         // "none" key — clears the binding (keyCode 0 → 'none' fallback).
         // Positioned right of Esc with same spacing as Esc→backtick.
         { label: 'none', keyCode: 0, x: 1, y: 0, w: 1, h: 1 },
+        // Virtual key buttons — processed as gamepad vkeys (NOT keyboard
+        // keyCodes). When selected, keyCode=0 means "use gamepadMapper".
+        // Arranged in TWO centered rows below the keyboard:
+        //   row 1 (y=7.7): ok, cancel, shift, menu, pageup, pagedown, escape
+        //   row 2 (y=8.7): tab, up, down, left, right, control
+        // The gap between the keyboard bottom (y=6.3) and vkey row 1 (y=7.7)
+        // is 1.4 units — DOUBLE the original 0.7-unit gap, so the joystick
+        // action section sits clearly apart from the PC keyboard.
+        // Width = 2.4 (×55px scale = 132px, with -2px padding = 130px
+        // text area) — wide enough for the longest label "pagedown"
+        // (~110px in the Switch system sans-serif at 20px) to fit
+        // comfortably with ~20px of margin.
+        // Row 1 total = 7 × 2.4 = 16.8 units; centered at x=-0.9
+        // (slightly past the keyboard left/right edges, but the nav
+        // cluster sits at y=0..2.3, so y=7.7 is clear).
+        // Row 2 total = 6 × 2.4 = 14.4 units; centered at x=0.3.
+        { label: 'ok', keyCode: -1, x: -0.9, y: 7.7, w: 2.4, h: 1 },
+        { label: 'cancel', keyCode: -1, x: 1.5, y: 7.7, w: 2.4, h: 1 },
+        { label: 'shift', keyCode: -1, x: 3.9, y: 7.7, w: 2.4, h: 1 },
+        { label: 'menu', keyCode: -1, x: 6.3, y: 7.7, w: 2.4, h: 1 },
+        { label: 'pageup', keyCode: -1, x: 8.7, y: 7.7, w: 2.4, h: 1 },
+        { label: 'pagedown', keyCode: -1, x: 11.1, y: 7.7, w: 2.4, h: 1 },
+        { label: 'escape', keyCode: -1, x: 13.5, y: 7.7, w: 2.4, h: 1 },
+        { label: 'tab', keyCode: -1, x: 0.3, y: 8.7, w: 2.4, h: 1 },
+        { label: 'up', keyCode: -1, x: 2.7, y: 8.7, w: 2.4, h: 1 },
+        { label: 'down', keyCode: -1, x: 5.1, y: 8.7, w: 2.4, h: 1 },
+        { label: 'left', keyCode: -1, x: 7.5, y: 8.7, w: 2.4, h: 1 },
+        { label: 'right', keyCode: -1, x: 9.9, y: 8.7, w: 2.4, h: 1 },
+        { label: 'control', keyCode: -1, x: 12.3, y: 8.7, w: 2.4, h: 1 },
 ];
 // RPG Maker MV default keyMapper: keyCode → virtual key.
 // Number keys (48-57) are not in the default MV keyMapper, but we map them
@@ -1612,11 +1735,21 @@ const KEYCODE_TO_VKEY: Record<number, VirtualKey> = {
 // Mouse buttons removed — RPG Maker MV games use TouchInput for touch,
 // not mouse events. Touch support is handled by forwarding screen touch
 // events to document in installGameCompatibility.
-// Combined pickable list: keyboard keys only (no mouse).
+// Combined pickable list: keyboard keys + virtual-key action buttons.
 // Created lazily when the keyboard picker opens, not at module scope.
-let _allPickKeys: { label: string; vkey: VirtualKey }[] | null = null;
+// Each entry carries the label, the vkey it resolves to, and the keyCode
+// to forward to Input._onKeyDown (0 for vkey-only buttons that use
+// gamepadMapper).
+let _allPickKeys: { label: string; vkey: VirtualKey; keyCode: number }[] | null = null;
 function getAllPickKeys() {
-        if (!_allPickKeys) _allPickKeys = KEYBOARD_LAYOUT.map(k => ({ label: k.label, vkey: KEYCODE_TO_VKEY[k.keyCode] || ('none' as VirtualKey) }));
+        if (!_allPickKeys) _allPickKeys = KEYBOARD_LAYOUT.map(k => {
+                if (k.keyCode === -1) {
+                        // Virtual-key action button — vkey is the label itself
+                        // ('ok', 'cancel', etc.); no keyCode to forward.
+                        return { label: k.label, vkey: k.label as VirtualKey, keyCode: 0 };
+                }
+                return { label: k.label, vkey: KEYCODE_TO_VKEY[k.keyCode] || ('none' as VirtualKey), keyCode: k.keyCode };
+        });
         return _allPickKeys;
 }
 
@@ -1659,6 +1792,127 @@ function findNearestKey(curIdx: number, dx: number, dy: number): number {
 let keymapPicking = false;
 let keymapPickCursor = 0;
 
+// === Shared layout + touch helpers for keymap pages =============
+// Single source of truth for the keymap-page geometry. Both the
+// renderers (which DRAW the cells/keys) and the touch handler (which
+// HIT-TESTS taps on them) read from these constants so a tap on a
+// cell always lands inside the rectangle the user can see.
+const KEYMAP_GRID_COLS = 4;
+const KEYMAP_GRID_ROWS = 6;
+const KEYMAP_CELL_W = 280, KEYMAP_CELL_H = 85, KEYMAP_CELL_GAP = 8;
+const KEYMAP_GRID_START_Y = 108;
+const KEYMAP_KB_SCALE = 55;
+const KEYMAP_KB_UNITS_W = 18;
+const KEYMAP_KB_UNITS_H = 9.7; // keyboard y=0..5.3 + doubled gap + vkey rows y=7.7..9.7
+
+interface Rect { x: number; y: number; w: number; h: number; }
+
+function keymapButtonCellRect(i: number): Rect {
+        const c = i % KEYMAP_GRID_COLS, r = Math.floor(i / KEYMAP_GRID_COLS);
+        const gridW = KEYMAP_GRID_COLS * KEYMAP_CELL_W + (KEYMAP_GRID_COLS - 1) * KEYMAP_CELL_GAP;
+        const startX = Math.floor((screen.width - gridW) / 2);
+        return {
+                x: startX + c * (KEYMAP_CELL_W + KEYMAP_CELL_GAP),
+                y: KEYMAP_GRID_START_Y + r * (KEYMAP_CELL_H + KEYMAP_CELL_GAP),
+                w: KEYMAP_CELL_W, h: KEYMAP_CELL_H,
+        };
+}
+
+function keymapKbOrigin(): { x: number; y: number } {
+        const kbMaxW = KEYMAP_KB_UNITS_W * KEYMAP_KB_SCALE;
+        const kbMaxH = KEYMAP_KB_UNITS_H * KEYMAP_KB_SCALE;
+        return {
+                x: Math.floor((screen.width - kbMaxW) / 2),
+                y: Math.floor((screen.height - kbMaxH) / 2),
+        };
+}
+
+function keymapKeyRect(i: number): Rect | null {
+        const k = KEYBOARD_LAYOUT[i];
+        if (!k) return null;
+        const o = keymapKbOrigin();
+        return {
+                x: o.x + k.x * KEYMAP_KB_SCALE,
+                y: o.y + k.y * KEYMAP_KB_SCALE,
+                w: k.w * KEYMAP_KB_SCALE,
+                h: k.h * KEYMAP_KB_SCALE,
+        };
+}
+
+function keymapBackButtonRect(): Rect {
+        return { x: screen.width - 140, y: 24, w: 112, h: 44 };
+}
+
+function pointInRect(px: number, py: number, r: Rect): boolean {
+        return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+}
+
+function drawBackButton(): void {
+        const r = keymapBackButtonRect();
+        ctx.fillStyle = '#252840';
+        ctx.fillRect(r.x, r.y, r.w, r.h);
+        ctx.strokeStyle = '#565f8d';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+        ctx.fillStyle = '#f4f3ef';
+        ctx.textAlign = 'center';
+        ctx.fillText('← Back', r.x + r.w / 2, r.y + r.h / 2 + 7);
+        ctx.textAlign = 'left';
+}
+
+/** Route a single touch tap on the keymap page to the same action as
+ *  the gamepad A button: tap a cell/key = move cursor + confirm in one
+ *  motion. Tap the "← Back" button (top-right) = same as the B button.
+ *  Tapping anywhere else does nothing — the user must hit a real UI
+ *  element, which makes the touch zones unambiguous. */
+function handleKeymapTouch(px: number, py: number): void {
+        if (pointInRect(px, py, keymapBackButtonRect())) {
+                if (keymapPicking) {
+                        keymapPicking = false;
+                        waitForRelease = true;
+                } else {
+                        waitForRelease = true;
+                        phase = host ? 'game' : 'library';
+                        if (host) menu.dismiss();
+                }
+                return;
+        }
+        if (keymapPicking) {
+                for (let i = 0; i < KEYBOARD_LAYOUT.length; i++) {
+                        const r = keymapKeyRect(i);
+                        if (r && pointInRect(px, py, r)) {
+                                keymapPickCursor = i;
+                                const def = getAllPickKeys()[i];
+                                if (def && def.label) {
+                                        if (keymapCursor < 16) {
+                                                editingKeymap = setButtonWithLabel(editingKeymap, keymapCursor, def.vkey, def.label, def.keyCode);
+                                        } else {
+                                                const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
+                                                const dir = stickDirs[keymapCursor - 16];
+                                                if (!editingKeymap.sticks) editingKeymap.sticks = {};
+                                                editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label };
+                                        }
+                                        saveEditingKeymap();
+                                        keymapPicking = false;
+                                        waitForRelease = true;
+                                }
+                                return;
+                        }
+                }
+        } else {
+                for (let i = 0; i < 24; i++) {
+                        const r = keymapButtonCellRect(i);
+                        if (pointInRect(px, py, r)) {
+                                keymapCursor = i;
+                                keymapPicking = true;
+                                keymapPickCursor = 0;
+                                waitForRelease = true;
+                                return;
+                        }
+                }
+        }
+}
+
 function renderKeymap() {
         const targetLabel = keymapTarget === 'global' ? 'GLOBAL DEFAULT' : (keymapTarget ? `PER-GAME: ${keymapTarget.name}` : '(none)');
         ctx.save();
@@ -1684,20 +1938,19 @@ function renderButtonGrid(targetLabel: string) {
         ctx.fillText('BurialNX — Joycon key bindings', 28, 36);
         ctx.fillStyle = '#9aa0b4';
         ctx.fillText(`Editing: ${targetLabel}`, 28, 60);
-        ctx.fillText('D-pad: move  A: pick key  X: clear  L/R/ZL/ZR: presets  B: back', 28, 84);
+        ctx.fillText('D-pad / tap: pick  X: clear  L/R/ZL/ZR: presets  B / ← Back: back', 28, 84);
+        // Back button (also a touch target).
+        drawBackButton();
         // Grid: 4 columns × 6 rows = 24 entries (16 buttons + 8 stick dirs).
         // Smaller cells to fit 6 rows on screen.
-        const cols = 4;
+        const cols = KEYMAP_GRID_COLS;
         const totalEntries = 24;
         const stickNames = ['L↑', 'L↓', 'L←', 'L→', 'R↑', 'R↓', 'R←', 'R→'];
         const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
-        const cellW = 280, cellH = 85, gap = 8;
-        const gridW = cols * cellW + (cols - 1) * gap;
-        const startX = Math.floor((screen.width - gridW) / 2);
-        const startY = 108;
+        const cellW = KEYMAP_CELL_W, cellH = KEYMAP_CELL_H;
         for (let i = 0; i < totalEntries; i++) {
-                const c = i % cols, r = Math.floor(i / cols);
-                const x = startX + c * (cellW + gap), y = startY + r * (cellH + gap);
+                const rect = keymapButtonCellRect(i);
+                const x = rect.x, y = rect.y;
                 const selected = i === keymapCursor;
                 const isStick = i >= 16;
                 // Get the display label and color.
@@ -1751,19 +2004,40 @@ function renderKeyboardPicker(targetLabel: string) {
         ctx.fillText(`Pick a key for: ${btn}`, 28, 36);
         ctx.fillStyle = '#9aa0b4';
         ctx.fillText(`Current: ${curLabel}  |  ${targetLabel}`, 28, 60);
-        ctx.fillText('D-pad: navigate  A: bind  B: back', 28, 84);
-        // Keyboard area: centered horizontally AND vertically, scale=55px per key unit
-        const scale = 55;
-        const kbMaxW = 18 * scale;
-        const kbX = Math.floor((screen.width - kbMaxW) / 2);
-        const kbMaxH = 6.3 * scale; // keyboard spans y=0..5.3+1
-        const kbY = Math.floor((screen.height - kbMaxH) / 2);
+        ctx.fillText('D-pad / tap: navigate & bind  B / ← Back: back', 28, 84);
+        // Back button (also a touch target).
+        drawBackButton();
+        // Keyboard area: centered horizontally AND vertically, scale=55px per key unit.
+        // The layout now spans y=0..9.7 (keyboard rows 0..5.3 + a 1.4-unit
+        // doubled gap + 2 rows of virtual-key buttons at y=7.7 and y=8.7,
+        // each h=1). kbMaxH accounts for the extra rows so the whole grid
+        // stays vertically centered instead of being pushed against the top.
+        const scale = KEYMAP_KB_SCALE;
+        const o = keymapKbOrigin();
+        const kbX = o.x, kbY = o.y;
+        // Section label for the joystick-action row, drawn in the gap
+        // between the keyboard bottom (y=6.3) and vkey row 1 (y=7.7).
+        // Left-aligned at x=28 like the top headers (Current:…, D-pad:…)
+        // and placed 0.35 units above vkey row 1 so it visually attaches
+        // to the section it labels.
+        ctx.fillStyle = '#9aa0b4';
+        ctx.textAlign = 'left';
+        ctx.fillText('Joystick action buttons', 28, kbY + 7.35 * scale);
         // Draw all keyboard keys
         for (let i = 0; i < KEYBOARD_LAYOUT.length; i++) {
                 const k = KEYBOARD_LAYOUT[i];
                 const x = kbX + k.x * scale, y = kbY + k.y * scale;
                 const w = k.w * scale - 2, h = k.h * scale - 2;
-                const vkey = KEYCODE_TO_VKEY[k.keyCode] || 'none';
+                // Virtual-key buttons (keyCode=-1) are colored by their
+                // OWN label — e.g. the "ok" button gets the green 'ok'
+                // color. Regular keyboard keys are colored by their
+                // keyCode → vkey mapping (e.g. keyCode 13 → 'ok' → green).
+                let vkey: VirtualKey;
+                if (k.keyCode === -1) {
+                        vkey = k.label as VirtualKey;
+                } else {
+                        vkey = KEYCODE_TO_VKEY[k.keyCode] || 'none';
+                }
                 const color = KEYMAP_COLORS[vkey] || '#6e7681';
                 const selected = i === keymapPickCursor;
                 ctx.fillStyle = selected ? '#3a3f5c' : '#252840';
@@ -2029,6 +2303,86 @@ function pollStickBindings(): void {
         apply(s.rRight, rx > threshold);
 }
 
+/** Build a synthetic KeyboardEvent-like object that RPG Maker MV's
+ *  Input._onKeyDown / _onKeyUp can consume without throwing. MV's handlers
+ *  call `event.preventDefault()` unconditionally (and some plugins also
+ *  call `event.stopPropagation()` / `stopImmediatePropagation()`), so the
+ *  event must look like a real DOM KeyboardEvent — not a plain
+ *  `{ keyCode }`. The no-op methods safely satisfy those calls without
+ *  touching the OS HID stack (which we cannot reach from a homebrew
+ *  loader anyway). */
+function makeSyntheticKeyboardEvent(keyCode: number) {
+        // `key`/`code` are filled in for plugins that read the printable
+        // name; `keyCode`/`which` are what MV's _onKeyDown actually reads.
+        return {
+                keyCode,
+                which: keyCode,
+                charCode: 0,
+                key: '',
+                code: '',
+                location: 0,
+                repeat: false,
+                // The four DOM Event no-ops — never throw, never block.
+                preventDefault: () => {},
+                stopPropagation: () => {},
+                stopImmediatePropagation: () => {},
+                // Some MV plugins inspect `target` — give them a safe
+                // window-shaped stub so `event.target.defaultPrevented`
+                // doesn't crash either.
+                target: { defaultPrevented: false },
+                currentTarget: { defaultPrevented: false },
+                defaultPrevented: false,
+                bubbles: false,
+                cancelable: false,
+                type: 'keydown',
+        };
+}
+
+/** Poll the 16 face buttons. For each button that has a non-zero keyCode
+ *  binding, call Input._onKeyDown/_onKeyUp directly. This fires the game's
+ *  keyboard handler, which sets _currentState[keyCode] and lets the game's
+ *  keyMapper translate the keyCode to a virtual key. This is needed because
+ *  RPG Maker MV's _currentState uses keyCodes (from keyboard) AND virtual
+ *  key names (from gamepad) — they're separate namespaces. Setting
+ *  _currentState[keyCode] directly doesn't work if the game checks
+ *  _currentState['ok'] (string). Calling _onKeyDown ensures the game
+ *  processes the keyCode through its own keyMapper. */
+function pollButtonBindings(): void {
+        const input = runtime.Input;
+        if (!input) return;
+        const km = (currentEntry?.keymap) || globalKeymap;
+        if (!km.keyCodes) return;
+        const pad = (navigator as any).getGamepads?.()?.[0];
+        if (!pad || !pad.buttons) return;
+        for (let i = 0; i < 16; i++) {
+                const kc = km.keyCodes[i];
+                if (!kc) continue; // No keyCode binding — gamepadMapper handles it.
+                const pressed = !!pad.buttons[i]?.pressed;
+                const wasPressed = !!input._buttonKeyState?.[i];
+                if (!input._buttonKeyState) input._buttonKeyState = {};
+                if (pressed && !wasPressed) {
+                        // Button just pressed — fire keydown with a full
+                        // KeyboardEvent-shaped object so MV's
+                        // `event.preventDefault()` call (and any plugin's
+                        // stopPropagation) doesn't throw.
+                        if (typeof input._onKeyDown === 'function') {
+                                const ev = makeSyntheticKeyboardEvent(kc);
+                                ev.type = 'keydown';
+                                input._onKeyDown(ev);
+                        }
+                        input._buttonKeyState[i] = true;
+                } else if (!pressed && wasPressed) {
+                        // Button just released — fire keyup the same way.
+                        if (typeof input._onKeyUp === 'function') {
+                                const ev = makeSyntheticKeyboardEvent(kc);
+                                ev.type = 'keyup';
+                                input._onKeyUp(ev);
+                        }
+                        input._buttonKeyState[i] = false;
+                }
+        }
+}
+
 let observedScene: any, sceneSince = 0, lastSceneReport = 0;
 let snapshotScene: any = Symbol('no diagnostic snapshot yet');
 function diagnoseScene(now: number) {
@@ -2278,7 +2632,7 @@ function frame(now: number) {
                                                 if (def && def.label) {
                                                         if (keymapCursor < 16) {
                                                                 // Face button binding
-                                                                editingKeymap = setButtonWithLabel(editingKeymap, keymapCursor, def.vkey, def.label);
+                                                                editingKeymap = setButtonWithLabel(editingKeymap, keymapCursor, def.vkey, def.label, def.keyCode);
                                                         } else {
                                                                 // Stick direction binding
                                                                 const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
@@ -2541,6 +2895,13 @@ function frame(now: number) {
                         // Input._currentState. This lets the user bind
                         // L-stick/R-stick directions to movement keys.
                         pollStickBindings();
+                        // Poll face-button keyCode bindings: for each button
+                        // with a non-zero keyCode, fire Input._onKeyDown/
+                        // _onKeyUp with a synthetic KeyboardEvent so the
+                        // game's keyMapper translates it (same path as a
+                        // real keyboard key press). Buttons without a
+                        // keyCode binding are handled by gamepadMapper.
+                        pollButtonBindings();
                         if (now - lastMemoryCheck >= 5000) {
                                 lastMemoryCheck = now;
                                 try {
@@ -2742,6 +3103,25 @@ function openKeymapEditor(target: 'global' | LibraryEntry) {
 // cold boot from hbmenu — Horizon OS reclaims the reserved process memory
 // on exit, which is the only reliably clean reset on this OS.
 registerSessionListeners();
+
+// === Touchscreen listener for keymap pages ===========================
+// nx.js dispatches TouchEvent on the global `screen` object. Register
+// ONE touchstart listener at startup that routes taps on the keymap
+// page to the same actions as the gamepad A button — so the user can
+// navigate and bind keys purely with the touch screen. Touches are
+// ignored on every other phase so the game's own TouchInput handling
+// (forwarded to RPG Maker MV in installGameCompatibility) keeps
+// working during gameplay.
+try {
+        (screen as any).addEventListener?.('touchstart', (e: any) => {
+                if (phase !== 'keymap') return;
+                const t = e?.touches?.[0] || e?.changedTouches?.[0];
+                if (!t) return;
+                const x = Number(t.clientX), y = Number(t.clientY);
+                if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+                handleKeymapTouch(x, y);
+        });
+} catch { /* touchscreen not available on this device */ }
 
 // === Forwarder auto-launch (--game <id>) ==============================
 // A forwarder NRO is a small nx.js app whose own main.js just calls
