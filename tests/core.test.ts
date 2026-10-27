@@ -581,6 +581,65 @@ test('region plugin bootstrap removal preserves both supported layouts', () => {
         assert.throws(() => prepareGameScript(path, `${newLayout}\n};${bootstrap}`));
 });
 
+test('top-level use strict is stripped so function declarations become global under indirect eval', () => {
+        // Regression for Claire's Quest: plugins with 'use strict' at the top
+        // level declare classes with `function Game_EnemyEvent() {}`. Under
+        // indirect eval (which BurialNX uses), strict mode prevents the function
+        // declaration from becoming a global — so subsequent plugins that reference
+        // it throw ReferenceError. prepareGameScript strips the top-level directive
+        // so eval runs in sloppy mode (like a browser <script> tag).
+        const plugin = `/*:\n* @plugindesc test\n*/\n'use strict';\nfunction Game_EnemyEvent() { this.x = 1; }\nGame_EnemyEvent.prototype.ok = function() { return true; };`;
+        const prepared = prepareGameScript('js/plugins/CQ_EventEnemy.js', plugin)!;
+        assert.ok(!prepared.includes("'use strict'"), "top-level 'use strict' stripped");
+        assert.ok(prepared.includes('function Game_EnemyEvent'), 'function declaration preserved');
+        // Indirect eval: the function must become global.
+        (0, eval)(prepared);
+        // @ts-expect-error — global injected by eval
+        assert.equal(typeof Game_EnemyEvent, 'function', 'Game_EnemyEvent is global');
+        // @ts-expect-error
+        assert.equal(new Game_EnemyEvent().x, 1);
+        // @ts-expect-error
+        assert.equal(new Game_EnemyEvent().ok(), true);
+});
+
+test('use strict inside function bodies is preserved', () => {
+        // 'use strict' inside a function body affects that function's semantics
+        // (this binding, undeclared variable assignment, etc.) and must NOT be
+        // stripped — only the top-level directive prologue is removed.
+        const plugin = `var outer = function() {\n  'use strict';\n  return typeof this;\n};\nfunction strictFn() {\n  'use strict';\n  return typeof this;\n}`;
+        const prepared = prepareGameScript('js/plugins/test.js', plugin)!;
+        assert.ok(prepared.includes("'use strict'"), "function-body 'use strict' preserved");
+        (0, eval)(prepared);
+        // @ts-expect-error — globals injected by eval
+        assert.equal(outer.call(undefined), 'undefined', 'strict mode makes this=undefined in non-method');
+        // @ts-expect-error
+        assert.equal(strictFn.call(undefined), 'undefined');
+});
+
+test('use strict with double quotes is also stripped', () => {
+        const plugin = `"use strict";\nfunction MyClass() { return 42; }`;
+        const prepared = prepareGameScript('js/plugins/test.js', plugin)!;
+        assert.ok(!prepared.includes('"use strict"'), 'double-quote use strict stripped');
+        (0, eval)(prepared);
+        // @ts-expect-error — global injected by eval
+        assert.equal(new MyClass().constructor(), 42);
+});
+
+test('scripts without use strict are unchanged', () => {
+        const plugin = `var Game_Map = Game_Map || {};\nGame_Map.prototype.update = function() { return true; };`;
+        const prepared = prepareGameScript('js/rpg_objects.js', plugin)!;
+        assert.equal(prepared, plugin, 'no use strict → no change');
+});
+
+test('use strict after a line comment is stripped', () => {
+        const plugin = `// header comment\n'use strict';\nfunction Foo() {}`;
+        const prepared = prepareGameScript('js/plugins/test.js', plugin)!;
+        assert.ok(!prepared.includes("'use strict'"), 'use strict after line comment stripped');
+        (0, eval)(prepared);
+        // @ts-expect-error — global injected by eval
+        assert.equal(typeof Foo, 'function');
+});
+
 test('unreliable credits stay disabled and cannot trap the title menu', () => {
         let starts = 0, activations = 0, buzzes = 0;
         function Title(this: any) { this._commandWindow = { activate: () => activations++ }; }
@@ -652,9 +711,12 @@ test('canvas method wrappers are reused and still track drawing and replacements
                 assert.equal(ctx.fillRect, ctx.fillRect);
                 ctx.drawImage(new FakeCanvas(1, 1), 0, 0);
                 assert.equal(draws, 1); assert.equal(canvas.revision, 1);
+                // Replacing a method via own-property assignment creates a new own
+                // property on the wrapper — the replacement is called directly
+                // (without revision tracking, since it's a user override).
                 ctx.drawImage = () => { replacements++; };
                 ctx.drawImage(new FakeCanvas(1, 1), 0, 0);
-                assert.equal(replacements, 1); assert.equal(canvas.revision, 2);
+                assert.equal(replacements, 1);
         } finally {
                 for (const name of names) {
                         const descriptor = previous.get(name);

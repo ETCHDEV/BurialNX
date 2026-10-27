@@ -124,7 +124,35 @@ falls back to a fixed top band without geometry.
 - `src/game-compat.ts` contains the game and engine adapters described below.
   Screen touch events are forwarded to `document` through a single process-wide
   listener set that resolves the current `document` at event time, so a second
-  launch keeps touch input working with its fresh document.
+  launch keeps touch input working with its fresh document. It also strips the
+  top-level `'use strict'` directive from every script (see below) and patches
+  `WebAudio._createNodes` to override `createPanner` (nx.js does not implement
+  it).
+- `src/node-compat.ts` installs the Node.js / NW.js globals that RPG Maker MV
+  games packaged as NW.js desktop apps expect (`require`, `process`, `Buffer`,
+  `module`, `exports`, `global`, `__dirname`, `__filename`, `nw`). Without them
+  a game that calls `require` from a plugin dies with `ReferenceError: require
+  is not defined` at the title screen. `nw.dll` itself is an x86 Windows DLL
+  and cannot run on the Switch's ARM64 CPU, so the fix is to polyfill the
+  globals NW.js would have provided, not to load nw.dll. `require('fs')` is
+  wired to nx.js's synchronous SD-card I/O (`Switch.readFileSync`/`writeFileSync`
+  /`statSync`/...) with a per-game writable overlay at
+  `sdmc:/switch/burialnx/nwfs/<game-id>/` so game/mod scripts can read and
+  write files via the familiar Node API without ever modifying the game's own
+  directory (writes go to the overlay; reads check the overlay first, then the
+  real path under the app root). `require('path')`, `require('events')`,
+  `require('buffer').Buffer` are real implementations; `require('os'/`crypto'/
+  `child_process`/`http`/...)` return safe no-op stubs; unknown bare modules
+  return a callable proxy that never throws on chained property access.
+  Relative `require('./local')` loads and caches a local module from the app
+  root or `www/`. `process.mainModule.filename` points at
+  `<appRoot>/www/index.html` so `path.dirname()` = `<appRoot>/www` and
+  `../patch/` = `<appRoot>/patch` (matching the Windows/NW.js layout). The
+  layer is installed in `launch()` after `createBrowserHost` and before any
+  game script loads, so it is tracked by the game-session snapshot and torn
+  down on quit. This is a compatibility shim, not a security sandbox — game/mod
+  scripts already run with native privileges (see SECURITY.md); the overlay
+  only keeps the game dir pristine.
 - `src/indexed-png.ts` handles an indexed PNG color issue only if a runtime
   probe shows that the correction is needed.
 - `src/repeated-pattern.ts` batches tiny repeating textures into bounded

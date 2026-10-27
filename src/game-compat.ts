@@ -8,6 +8,19 @@ import { fixIndexedPng } from './indexed-png';
  * Two desktop-only plugins cannot run on nx.js. Use MV audio instead of the
  * streaming Worker, and omit only the appended Node payload from the region
  * plugin. The region collision rules themselves must remain enabled.
+ *
+ * Additionally, the top-level `'use strict'` directive is stripped from every
+ * script. BurialNX evaluates game scripts via indirect eval `(0, eval)(...)`,
+ * which runs in the global scope. Under strict mode, indirect eval does NOT
+ * leak `var`/`function` declarations to the global object — so a plugin that
+ * declares `function Game_EnemyEvent() {}` under `'use strict'` would NOT
+ * expose `Game_EnemyEvent` as a global, and subsequent plugins referencing it
+ * would throw `ReferenceError: Game_EnemyEvent is not defined`. In a browser
+ * `<script>` tag, top-level declarations become global even under strict mode
+ * (a special case for script-tag evaluation). Stripping the directive makes
+ * indirect eval run in sloppy mode, matching that behavior. Only the top-level
+ * directive prologue is stripped; `'use strict'` inside function bodies (which
+ * affects those functions' semantics) is preserved.
  */
 export function prepareGameScript(path: string, source: string): string | null {
         if (path.endsWith('/AudioStreaming.js')) return null;
@@ -24,7 +37,56 @@ export function prepareGameScript(path: string, source: string): string | null {
                         || /^(\s*Yanfly\.RR\s*=\s*Yanfly\.RR\s*\|\|\s*\{\s*\};)\s*\(function\(/.exec(line)?.[1];
                 if (!prefix) throw new Error('Unrecognized region plugin: cannot remove Node payload safely');
                 lines[injected[0]] = prefix;
-                return lines.join('\n');
+                source = lines.join('\n');
+        }
+        // Strip the top-level 'use strict' directive so indirect eval runs in
+        // sloppy mode and function/var declarations become global (like a
+        // <script> tag). See the function-level comment above for the full
+        // rationale. Only the directive prologue (before any real code) is
+        // stripped; function-body 'use strict' directives are preserved.
+        source = stripTopLevelUseStrict(source);
+        return source;
+}
+
+/**
+ * Remove the top-level `'use strict'` / `"use strict"` directive prologue
+ * from a script source. The directive is only stripped when it appears as the
+ * first actual statement (after optional comments and whitespace). Directives
+ * inside function bodies are left intact because they affect those functions'
+ * runtime semantics (e.g. `this` binding, assignment to undeclared variables).
+ *
+ * Uses a single-pass line scan (O(n)) rather than a regex to avoid
+ * catastrophic backtracking on large files like rpg_core.js (240+ KiB).
+ */
+export function stripTopLevelUseStrict(source: string): string {
+        const lines = source.split('\n');
+        let inBlockComment = false;
+        for (let i = 0; i < lines.length; i++) {
+                let line = lines[i];
+                if (inBlockComment) {
+                        const end = line.indexOf('*/');
+                        if (end >= 0) { inBlockComment = false; line = line.slice(end + 2); }
+                        else continue; // still inside a multi-line block comment
+                }
+                // Strip any remaining inline block comments on this line (non-nested).
+                let rest = line;
+                for (;;) {
+                        const start = rest.indexOf('/*');
+                        if (start < 0) break;
+                        const end = rest.indexOf('*/', start + 2);
+                        if (end < 0) { inBlockComment = true; rest = rest.slice(0, start); break; }
+                        rest = rest.slice(0, start) + rest.slice(end + 2);
+                }
+                // Strip line comments.
+                const commentIdx = rest.indexOf('//');
+                if (commentIdx >= 0) rest = rest.slice(0, commentIdx);
+                const trimmed = rest.trim();
+                if (!trimmed) continue; // whitespace or comment-only line
+                // First real code line — check if it's a 'use strict' directive.
+                const m = /^(['"])use strict\1;?$/.exec(trimmed);
+                if (m) { lines.splice(i, 1); return lines.join('\n'); }
+                // First real code is something else — no top-level 'use strict' to strip.
+                return source;
         }
         return source;
 }
@@ -39,10 +101,20 @@ export async function languageTable(assets: Reader): Promise<Language | null> {
         return JSON.parse(text.slice(8));
 }
 
+// Hoisted constants for translate() — avoid per-call allocation of the names
+// object and the regex. The fast path (no '(' in input) skips the regex
+// entirely for ~95% of drawText calls, which is the common case for games
+// without language packs or for text that doesn't use escape sequences.
+const TRANSLATE_NAMES: Record<string, string> = { lines: 'linesLUT', label: 'labelLUT', syslabel: 'sysLabel', sysmenus: 'sysMenus' };
+const TRANSLATE_RE = /\((lines|label|sysLabel|sysMenus)\)\[([^\]]+)\]/gi;
+
 export function translate(input: string, table: Language): string {
-        const names: Record<string, string> = { lines: 'linesLUT', label: 'labelLUT', syslabel: 'sysLabel', sysmenus: 'sysMenus' };
-        return input.replace(/\((lines|label|sysLabel|sysMenus)\)\[([^\]]+)\]/gi, (whole, type: string, key: string) => {
-                const value = table[names[type.toLowerCase()]]?.[key];
+        // Fast path: if there's no '(' character, the escape-sequence regex can't
+        // match anything — return the input unchanged without allocating regex
+        // state or a callback closure.
+        if (input.indexOf('(') < 0) return input;
+        return input.replace(TRANSLATE_RE, (whole, type: string, key: string) => {
+                const value = table[TRANSLATE_NAMES[type.toLowerCase()]]?.[key];
                 return Array.isArray(value) ? value.join('\n') : typeof value === 'string' ? value : whole;
         });
 }
@@ -193,19 +265,84 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         };
                 }
         }
-        // nx.js exposes StereoPanner, whereas MV requests the older 3D panner.
+        // RPG Maker MV's WebAudio._createNodes calls context.createPanner() for
+        // every audio source. nx.js's AudioContext does NOT implement createPanner
+        // (it throws "Method not implemented."). The context may be created DURING
+        // SCRIPT LOADING (the WebAudio constructor calls WebAudio.initialize() →
+        // _createContext() the first time `new WebAudio(url)` runs), which is
+        // BEFORE installGameCompatibility runs. So patching _createContext alone
+        // is too late. Instead, patch _createNodes (the instance method that
+        // actually calls createPanner) to ensure createPanner is overridden on
+        // the context right before it's used — regardless of when the context
+        // was created.
         const audio = runtime.WebAudio;
         if (audio) {
-                const create = audio._createContext;
-                audio._createContext = function() {
-                        create.call(this);
-                        const context = this._context;
-                        if (context?.createStereoPanner) context.createPanner = () => {
-                                const node = context.createStereoPanner();
-                                node.setPosition = (x: number) => node.pan.setValueAtTime(Math.max(-1, Math.min(1, x)), context.currentTime);
-                                return node;
-                        };
+                // Shared no-op closures (hoisted to avoid per-panner allocation).
+                const NO_OP = () => {};
+                const PANNING_MODEL_DESC = { get: () => 'equalpower', set: NO_OP, configurable: true };
+                // Helper: create a working panner node replacement.
+                const makePanner = (context: any) => {
+                        if (context && typeof context.createStereoPanner === 'function') {
+                                try {
+                                        const node = context.createStereoPanner();
+                                        // MV calls setPosition(x, y, z) with 3 args; StereoPanner only
+                                        // takes pan (-1..1). Use x as pan, ignore y/z.
+                                        node.setPosition = (x: number, _y?: number, _z?: number) => {
+                                                try { node.pan.setValueAtTime(Math.max(-1, Math.min(1, x)), context.currentTime); } catch { /* best-effort */ }
+                                        };
+                                        node.setVelocity = NO_OP;
+                                        node.setOrientation = NO_OP;
+                                        // panningModel is a PannerNode property; StereoPanner doesn't
+                                        // have it. Make it a no-op setter so MV's assignment doesn't throw.
+                                        try { Object.defineProperty(node, 'panningModel', PANNING_MODEL_DESC); } catch { /* best-effort */ }
+                                        return node;
+                                } catch { /* createStereoPanner exists but throws — fall through */ }
+                        }
+                        // Fallback: a GainNode that accepts setPosition() but
+                        // ignores it. Audio passes through without panning.
+                        const gain = context && typeof context.createGain === 'function'
+                                ? context.createGain()
+                                : { gain: { value: 1, setValueAtTime: NO_OP }, connect() { return this; }, disconnect() {} };
+                        gain.setPosition = NO_OP;
+                        gain.setVelocity = NO_OP;
+                        gain.setOrientation = NO_OP;
+                        try { Object.defineProperty(gain, 'panningModel', PANNING_MODEL_DESC); } catch { /* best-effort */ }
+                        return gain;
                 };
+                // Install createPanner override on a context (once). The closure
+                // captures `context` so it can be shared across all audio sources
+                // that use that context — no per-source allocation.
+                const installPanner = (context: any) => {
+                        if (context && !context.__bnxPannerInstalled) {
+                                context.__bnxPannerInstalled = true;
+                                context.createPanner = () => makePanner(context);
+                        }
+                };
+                // Patch _createContext (for contexts created after this point).
+                const create = audio._createContext;
+                if (typeof create === 'function') {
+                        audio._createContext = function() {
+                                create.call(this);
+                                if (this._context) installPanner(this._context);
+                        };
+                }
+                // ALSO patch the existing context if it was already created.
+                if (audio._context) installPanner(audio._context);
+                // CRITICAL: Patch _createNodes (instance method) to ensure
+                // createPanner is overridden on the context right before it's
+                // called. This catches the case where the context was created
+                // during script loading (before installGameCompatibility).
+                // installPanner() is idempotent (checks __bnxPannerInstalled),
+                // so calling it per-source is cheap — no closure allocation.
+                const proto = audio.prototype;
+                if (proto?._createNodes) {
+                        const origCreateNodes = proto._createNodes;
+                        proto._createNodes = function() {
+                                const ctx = audio._context;
+                                if (ctx) installPanner(ctx);
+                                return origCreateNodes.apply(this, arguments);
+                        };
+                }
                 audio.prototype._onXhrLoad = function(xhr: any) {
                         try {
                                 const bytes = runtime.Decrypter?.hasEncryptedAudio ? runtime.Decrypter.decryptArrayBuffer(xhr.response) : xhr.response;

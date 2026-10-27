@@ -25,6 +25,12 @@ try {
   const coreResult = await build({ ...sharedBuildOptions, entryPoints: ['tests/core.test.ts'] });
   await import(`data:text/javascript;base64,${Buffer.from(coreResult.outputFiles[0].contents).toString('base64')}`);
 
+  // node-compat.test.ts exercises the Node/NW.js compatibility layer
+  // (require/process/Buffer/fs/path/events/nw shims) using an in-memory
+  // fake of nx.js's synchronous `Switch` fs.
+  const compatResult = await build({ ...sharedBuildOptions, entryPoints: ['tests/node-compat.test.ts'] });
+  await import(`data:text/javascript;base64,${Buffer.from(compatResult.outputFiles[0].contents).toString('base64')}`);
+
   // forwarder.test.ts imports `esbuild` at runtime to bundle src/forwarder.ts
   // in a vm context. Loading it via a `data:` URL would leave Node unable to
   // resolve the bare `esbuild` specifier (data: URLs have no base for

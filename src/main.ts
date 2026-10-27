@@ -3,6 +3,7 @@ import { gameAssets } from './game-assets';
 import { scriptPlan, startGame } from './runtime-plan';
 import { createBrowserHost } from './browser-host';
 import { installGameCompatibility, languageTable, prepareGameScript, registerFonts } from './game-compat';
+import { installNodeCompat, type SwitchFs } from './node-compat';
 import { PauseMenu } from './menu';
 import { gameSaveFolders, parseSelection, startupSelection, type GameSelection, type SaveLocation } from './settings';
 import { needsPngFix } from './indexed-png';
@@ -2254,6 +2255,17 @@ async function launch() {
                 const [language, , pngFix] = await Promise.all([languageTable(assets), registerFonts(assets, runtime), needsPngFix(log)]);
                 setLoadingProgress(0.20, 'Preparing runtime host…');
                 host = createBrowserHost(assets, prepareGameScript, log, pngFix, directScreen, failRequest);
+                // Install Node.js / NW.js compatibility globals (require, process,
+                // Buffer, module, exports, global, __dirname, __filename, nw) BEFORE
+                // any game script loads. RPG Maker MV games packaged for NW.js call
+                // these the moment a plugin or a patched title window runs — without
+                // them the launch dies with `ReferenceError: require is not defined`.
+                // `require('fs')` is wired to nx.js's synchronous SD-card I/O via
+                // the `Switch` global, with a per-game writable overlay so the game's
+                // own files stay pristine. This runs after beginGameSession(), so the
+                // installed globals are tracked and cleaned up by teardownGame().
+                try { installNodeCompat(runtime, (Switch as unknown as SwitchFs) ?? null, { gameRoot: selectedGame, log: __DEBUG__ ? log : undefined }); }
+                catch (compatError) { log(`node-compat install failed: ${compatError instanceof Error ? compatError.message : String(compatError)}`); }
                 // Script loading dominates the launch time for RPG Maker MV
                 // games (often 40+ scripts, several hundred KiB each). Reserve
                 // the 0.20..0.90 range for it and update per-script.
@@ -2295,8 +2307,8 @@ async function launch() {
                 if (runtime.Input?._updateGamepadState && !(runtime.Input as any).__bnxStickWrap) {
                         const originalUpdateGamepad = runtime.Input._updateGamepadState;
                         (runtime.Input as any).__bnxStickWrap = true;
-                        runtime.Input._updateGamepadState = function(...args: unknown[]) {
-                                originalUpdateGamepad.apply(this, args);
+                        runtime.Input._updateGamepadState = function() {
+                                originalUpdateGamepad.apply(this, arguments);
                                 try { pollStickBindings(); } catch { /* best-effort */ }
                         };
                 }
@@ -2312,7 +2324,7 @@ async function launch() {
                 setLoadingProgress(0.98, 'Starting game…');
                 if (runtime.Graphics?.render) {
                         const render = runtime.Graphics.render;
-                        runtime.Graphics.render = function(...args: unknown[]) { const result = render.apply(this, args); hud(); return result; };
+                        runtime.Graphics.render = function() { const result = render.apply(this, arguments); hud(); return result; };
                 }
                 if (runtime.Graphics?._createRenderer) {
                         const create = runtime.Graphics._createRenderer;
