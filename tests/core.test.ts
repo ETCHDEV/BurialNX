@@ -951,7 +951,7 @@ test('withLanguageImages returns the base reader unchanged when imgFiles is empt
         assert.equal(withLanguageImages(base, pack), base);
 });
 
-test('registerLanguageFont overrides Window_Base, Yanfly, Graphics, and Bitmap font selection', () => {
+test('registerLanguageFont overrides Window_Base, Yanfly, Graphics, and Bitmap font selection', async () => {
         const fonts: string[] = [];
         const runtime: any = {
                 FontFace: class { constructor(public family: string, public src: ArrayBuffer) {} },
@@ -965,9 +965,10 @@ test('registerLanguageFont overrides Window_Base, Yanfly, Graphics, and Bitmap f
                 table: {}, fontFace: 'bitter-pro-regular', fontSize: 24,
                 fontFile: 'AAEAAA', imgFiles: {}, langName: 'Русский', source: 'languages/ru.cld',
         };
-        registerLanguageFont(runtime, pack);
-        // Font registered with the correct family name.
-        assert.deepEqual(fonts, ['bitter-pro-regular']);
+        await registerLanguageFont(runtime, pack);
+        // Font registered with all 4 variants (normal, bold, italic, bold-italic).
+        assert.equal(fonts.length, 4);
+        assert.equal(fonts[0], 'bitter-pro-regular');
         // Font face overridden everywhere RPG Maker MV / Yanfly reads it.
         assert.equal(runtime.Window_Base.prototype.standardFontFace(), 'bitter-pro-regular');
         assert.equal(runtime.Window_Base.prototype.standardFontSize(), 24);
@@ -978,10 +979,10 @@ test('registerLanguageFont overrides Window_Base, Yanfly, Graphics, and Bitmap f
         assert.equal(runtime.Bitmap.prototype.fontSize, 24);
 });
 
-test('registerLanguageFont is a no-op when the pack has no embedded font', () => {
+test('registerLanguageFont is a no-op when the pack has no embedded font', async () => {
         const runtime: any = { Window_Base: { prototype: { standardFontFace() { return 'GameFont'; } } } };
         const pack: LanguagePack = { table: {}, fontFace: null, fontSize: null, fontFile: null, imgFiles: {}, langName: null, source: null };
-        registerLanguageFont(runtime, pack);
+        await registerLanguageFont(runtime, pack);
         // Nothing changed.
         assert.equal(runtime.Window_Base.prototype.standardFontFace(), 'GameFont');
 });

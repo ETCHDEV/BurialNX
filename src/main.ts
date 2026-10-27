@@ -2497,7 +2497,7 @@ async function launch() {
                 // Must run AFTER scripts load (so Window_Base, Yanfly, Graphics exist)
                 // and AFTER installGameCompatibility (which may reference the font hooks).
                 if (languagePack) {
-                        try { registerLanguageFont(runtime, languagePack); }
+                        try { await registerLanguageFont(runtime, languagePack); }
                         catch (fontError) { log(`Language font install failed: ${fontError instanceof Error ? fontError.message : String(fontError)}`); }
                 }
                 // Wrap Input._updateGamepadState so pollStickBindings runs

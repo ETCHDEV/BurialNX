@@ -271,15 +271,27 @@ function decodeBase64(base64: string): ArrayBuffer {
  * runtime font set. We also override Window_Base.standardFontFace and
  * standardFontSize (and Yanfly's YEP_CoreEngine override of the same) so every
  * window and bitmap draws with this language's font instead of GameFont.
+ *
+ * Registers ALL 4 variants (normal, bold, italic, bold-italic) — same as
+ * registerFonts — so the game can render bold/italic text in the language font.
+ * Without all 4 variants, bold/italic text falls back to GameFont which has
+ * no Cyrillic glyphs → empty/blank dialogue lines.
  */
-export function registerLanguageFont(runtime: any, pack: LanguagePack): void {
+export async function registerLanguageFont(runtime: any, pack: LanguagePack): Promise<void> {
         const face = pack.fontFace;
         const size = pack.fontSize;
         if (face && pack.fontFile) {
                 try {
                         const bytes = decodeBase64(pack.fontFile);
                         if (runtime.FontFace && runtime.fonts?.add) {
-                                runtime.fonts.add(new runtime.FontFace(face, bytes));
+                                // Register ALL 4 variants (normal, bold, italic, bold-italic)
+                                // — same pattern as registerFonts. Without bold/italic variants,
+                                // the game falls back to GameFont for bold/italic text, which
+                                // has no Cyrillic glyphs → empty lines for Russian dialogue.
+                                for (const variant of [{}, { weight: 'bold' }, { style: 'italic' }, { style: 'italic', weight: 'bold' }]) {
+                                        try { runtime.fonts.add(new runtime.FontFace(face, bytes, variant)); }
+                                        catch { /* best-effort: variant may not be supported */ }
+                                }
                         }
                 } catch { /* best-effort: fall back to default font */ }
         }
@@ -291,6 +303,21 @@ export function registerLanguageFont(runtime: any, pack: LanguagePack): void {
                 // Yanfly's YEP_CoreEngine replaces standardFontFace to read Yanfly.Param.DefaultFont.
                 // Override that parameter so the YEP path also picks up the language font.
                 if (runtime.Yanfly?.Param) runtime.Yanfly.Param.DefaultFont = face;
+                // YEP_MessageCore has its OWN font system for dialogue windows:
+                // it overrides standardFontFace for Window_Message, Window_ChoiceList,
+                // and Window_NameBox to return $gameSystem.getMessageFontName() which
+                // reads from Yanfly.Param.MSGFontName (= "GameFont"). Without overriding
+                // these, dialogue text uses GameFont (no Cyrillic glyphs) → empty lines.
+                // Fix: override the YEP message font parameters AND the message window
+                // prototypes' standardFontFace directly.
+                if (runtime.Yanfly?.Param) {
+                        runtime.Yanfly.Param.MSGFontName = face;
+                        runtime.Yanfly.Param.MSGCNFontName = face;
+                        runtime.Yanfly.Param.MSGKRFontName = face;
+                }
+                for (const proto of [runtime.Window_Message?.prototype, runtime.Window_ChoiceList?.prototype, runtime.Window_NameBox?.prototype]) {
+                        if (proto) proto.standardFontFace = function() { return face; };
+                }
                 // Graphics.fontFace is the Bitmap default; set it so raw Bitmap draws match.
                 if (runtime.Graphics) runtime.Graphics.fontFace = face;
                 // Bitmap's constructor default is 'GameFont'; update the prototype property too.
@@ -301,7 +328,11 @@ export function registerLanguageFont(runtime: any, pack: LanguagePack): void {
                 if (base && typeof base.standardFontSize === 'function') {
                         base.standardFontSize = function() { return size; };
                 }
-                if (runtime.Yanfly?.Param) runtime.Yanfly.Param.FontSize = size;
+                if (runtime.Yanfly?.Param) {
+                        runtime.Yanfly.Param.FontSize = size;
+                        // Override message font size too (YEP_MessageCore uses MSGFontSize).
+                        runtime.Yanfly.Param.MSGFontSize = size;
+                }
                 if (runtime.Bitmap?.prototype) runtime.Bitmap.prototype.fontSize = size;
         }
 }
