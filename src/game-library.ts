@@ -24,6 +24,11 @@ export interface LibraryEntry {
         keymap?: KeyMap;
         /** ISO timestamp of the last launch. Used for sorting and "recent". */
         lastPlayed?: number;
+        /** Per-game language preference: a .cld code (e.g. 'ru') or '' for
+         *  English (default). Absent = no preference (auto-select first .cld).
+         *  Stored in the library file (SD card), NOT localStorage, so it works
+         *  in forwarder NROs which have saveData=0 (localStorage unavailable). */
+        language?: string;
 }
 
 export interface LibraryFile {
@@ -73,6 +78,7 @@ export function parseLibrary(text: string): LibraryFile {
                 if (raw.cover !== undefined) entry.cover = raw.cover === null ? null : raw.cover.replace(/\/+$/, '');
                 if (keymap !== undefined) entry.keymap = keymap;
                 if (typeof raw.lastPlayed === 'number' && Number.isFinite(raw.lastPlayed) && raw.lastPlayed > 0) entry.lastPlayed = raw.lastPlayed;
+                if (typeof raw.language === 'string') entry.language = raw.language;
                 games.push(entry);
         }
         const file: LibraryFile = { version: 1, games };
@@ -155,6 +161,22 @@ export function upsertGame(fs: LibraryAccess, file: LibraryFile, entry: LibraryE
         if (index >= 0) games = file.games.map((g) => (g.id === entry.id ? { ...g, ...entry } : g));
         else games = [...file.games, entry];
         const updated: LibraryFile = { version: 1, games, lastPlayed: entry.id };
+        saveLibrary(fs, updated);
+        return updated;
+}
+
+/** Move a game up (dir=-1) or down (dir=+1) in the library order. The three
+ *  action tiles (Add Game, Keymap, Quit) are always at the end and never
+ *  move. Swaps the game at the given index with its neighbor. No-op at the
+ *  boundaries (first game can't move up, last game can't move down). */
+export function moveGame(fs: LibraryAccess, file: LibraryFile, id: string, dir: -1 | 1): LibraryFile {
+        const index = file.games.findIndex((g) => g.id === id);
+        if (index < 0) return file;
+        const target = index + dir;
+        if (target < 0 || target >= file.games.length) return file;
+        const games = [...file.games];
+        [games[index], games[target]] = [games[target], games[index]];
+        const updated: LibraryFile = { version: 1, games, ...(file.lastPlayed ? { lastPlayed: file.lastPlayed } : {}) };
         saveLibrary(fs, updated);
         return updated;
 }

@@ -313,6 +313,10 @@ test('rename seeds the software keyboard with the current name and ignores Plus 
   };
   // Move down to the "Rename game" entry (index 5).
   for (let i = 0; i < 5; i++) { await ui.tick([13]); await ui.tick(); }
+  await ui.tick([1]); // A: open the rename choice panel.
+  await ui.tick(); // Release A.
+  assert.ok(ui.labels.some((l) => l.includes('Rename game')), 'rename choice panel is shown');
+  // Press A again to select "Type a custom name" (index 0).
   await ui.tick([1]); // A: open the software keyboard.
   await ui.tick(); // The rename preview screen renders on the next frame.
   assert.equal(vk.shown, 1, 'the software keyboard was opened');

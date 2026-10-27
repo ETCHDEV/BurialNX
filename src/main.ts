@@ -1,18 +1,19 @@
 import { FolderBrowser } from './folders';
 import { gameAssets } from './game-assets';
+import type { Reader } from './library';
 import { scriptPlan, startGame } from './runtime-plan';
 import { createBrowserHost } from './browser-host';
-import { installGameCompatibility, languageTable, prepareGameScript, registerFonts } from './game-compat';
+import { installGameCompatibility, languageTable, prepareGameScript, registerFonts, loadLanguagePack, registerLanguageFont, withLanguageImages, scanLanguageFiles, resolveLanguageName, parseLanguagePack, wrapSystemTerms, type LanguagePack, type LanguageEntry, type LanguageScanFs } from './game-compat';
 import { installNodeCompat, type SwitchFs } from './node-compat';
 import { PauseMenu } from './menu';
 import { gameSaveFolders, parseSelection, startupSelection, type GameSelection, type SaveLocation } from './settings';
 import { needsPngFix } from './indexed-png';
 import { ensureGameSaveFolder, hasSteamSaveData, importSteamSaves, installSdSaves, safeGameSaveFolder, safeSaveFolder } from './saves';
 import { installMapPrefetch, MapPrefetcher } from './map-prefetch';
-import { entryFromSelection, libraryIdFromRoot, loadLibrary, markPlayed, removeGame, toSelection, upsertGame, type LibraryEntry, type LibraryFile, type LibraryAccess } from './game-library';
+import { entryFromSelection, libraryIdFromRoot, loadLibrary, markPlayed, moveGame, removeGame, toSelection, upsertGame, type LibraryEntry, type LibraryFile, type LibraryAccess } from './game-library';
 import { BUTTON_NAMES, DEFAULT_KEYMAP, applyKeyMap, loadKeyMap, PRESETS, saveKeyMap, setButton, setButtonWithLabel, VIRTUAL_KEYS, type KeyMap, type VirtualKey } from './keymap';
 import { COVERS_DIR, coverPathFor, deriveDefaultCover, saveUserCover, saveUserCoverLogged } from './cover';
-import { buildForwarder, deleteForwarder, forwarderExists, forwarderPathFor, forwarderDirFor, sanitizeGameName, BURIALNX_NRO_PATH, BURIALNX_DEBUG_NRO_PATH } from './forwarder';
+import { buildForwarder, deleteForwarder, forwarderExists, forwarderPathFor, forwarderDirFor, renameForwarder, sanitizeGameName, BURIALNX_NRO_PATH, BURIALNX_DEBUG_NRO_PATH } from './forwarder';
 
 declare const __DEBUG__: boolean;
 // Baked-in forwarder game id. For the main burialnx.nro, this is a 64-'0'
@@ -139,9 +140,18 @@ let browser = new FolderBrowser(Switch, 'game');
 let selectedGame: string | undefined;
 let selectedMod: string | null | undefined;
 let sharedSaves = false;
+// Languages discovered for the currently-selected game (scanned at launch).
+// Empty when no .cld packs are present; the game then uses the default English
+// data embedded in data/. The user's choice is persisted per-game in the
+// LIBRARY FILE (sdmc:/switch/burialnx/library.json), NOT localStorage, so it
+// works in forwarder NROs which have saveData=0 (localStorage unavailable).
+let languageEntries: LanguageEntry[] = [];
+// The code of the language pack currently loaded into the running game, or ''
+// when only the default English data is in use. Drives the pause-menu label.
+let activeLanguageCode = '';
 let waitForRelease = false;
-let phase: 'library' | 'picker' | 'game-options' | 'keymap' | 'cover-confirm' | 'notice' | 'save-choice' | 'game-save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' | 'rename' | 'rename-kb' | 'add-game-name' | 'forwarder-building' = 'library';
-let pickerPurpose: 'game' | 'startup-mod' | 'menu-mod' | 'game-mod' | 'startup-saves' | 'menu-saves' | 'add-game' | 'cover-image' = 'game';
+let phase: 'library' | 'picker' | 'game-options' | 'keymap' | 'cover-confirm' | 'notice' | 'save-choice' | 'game-save-choice' | 'import-confirm' | 'loading' | 'game' | 'error' | 'rename' | 'rename-kb' | 'rename-choice' | 'add-game-name' | 'forwarder-building' = 'library';
+let pickerPurpose: 'game' | 'startup-mod' | 'menu-mod' | 'game-mod' | 'startup-saves' | 'menu-saves' | 'add-game' | 'cover-image' | 'rename-source' = 'game';
 let noticeReturnPhase: 'library' | 'game-options' = 'library';
 let saveLocation: SaveLocation | undefined;
 let choiceFromMenu = false, importRequested = false;
@@ -482,6 +492,9 @@ function teardownGame() {
         snapshotScene = Symbol('no diagnostic snapshot yet');
         host = undefined;
         mapPrefetch = undefined;
+        // Reset language state so a subsequent launch scans the new game's packs.
+        languageEntries = [];
+        activeLanguageCode = '';
         // Ask V8 for a full collection so the released buffers are actually
         // returned to the native heap instead of lingering until the next
         // launch needs the memory.
@@ -613,7 +626,8 @@ function quitApp(mode: QuitMode) {
                         chainToLibrary();
                 } catch (e) {
                         log(`_exit: chainToLibrary FAILED: ${e instanceof Error ? e.message : String(e)}`);
-                        if (realExit) { allowExit = true; realExit(); }
+                        removeBeforeUnloadListener();
+                        if (realExit) { allowExit = true; try { realExit(); } catch { /* best-effort */ } }
                 }
                 return;
         }
@@ -631,10 +645,32 @@ function quitApp(mode: QuitMode) {
         // Try calling Switch.exit(). If hbloader cleared the next-load after
         // chain-loading us, this returns to hbmenu. If not, the stale
         // next-load re-chains and the re-launch detection catches it.
+        //
+        // CRITICAL: Switch.exit() is DEFERRED to the next tick via setTimeout.
+        // quitApp() is called from inside the frame() rAF callback — calling
+        // Switch.exit() synchronously while the frame is still on the call
+        // stack causes a sporadic crash (re-entrancy: the next rAF may fire
+        // before Switch.exit finishes, accessing retired state). Deferring
+        // lets the current frame return cleanly, then the exit runs on a
+        // fresh tick with no frame on the stack.
         log(`_exit: calling Switch.exit() [wasForwarder=${wasForwarder}]`);
         if (realExit) {
                 allowExit = true;
-                realExit();
+                // CRITICAL: Remove all session event listeners BEFORE calling
+                // Switch.exit(). The Atmosphere crash report showed infinite
+                // recursion (stack overflow) during exit — the repeating stack
+                // pattern (nxjs C++ → V8 → C++ → V8 → ...) indicates that
+                // Switch.exit() dispatches a beforeunload event, and the
+                // handler's execution triggers another beforeunload (or
+                // similar event), creating an unbreakable recursive loop that
+                // overflows the 1 MB stack. Removing the listeners means
+                // Switch.exit() can't dispatch events to our handlers, breaking
+                // the recursion cycle. Also deferred to the next tick via
+                // setTimeout so the current frame() returns cleanly first.
+                removeBeforeUnloadListener();
+                setTimeout(() => {
+                        try { realExit(); } catch (e) { log(`_exit: Switch.exit threw: ${e instanceof Error ? e.message : String(e)}`); }
+                }, 0);
         }
 }
 
@@ -759,6 +795,24 @@ function remember(selection: GameSelection) {
 function rememberLibrary(entry: LibraryEntry) {
         try { library = upsertGame(Switch as unknown as LibraryAccess, library, entry); return true; }
         catch (error) { log(`Could not save library entry: ${String(error)}`); return false; }
+}
+/** Read the per-game language preference from the library entry (NOT localStorage).
+ *  Returns: undefined = no preference (auto-select first .cld), '' = English,
+ *  'ru' = Russian, etc. Uses the library file on the SD card so it works in
+ *  forwarder NROs (which have saveData=0, making localStorage unavailable). */
+function getGameLanguage(gameRoot: string): string | undefined {
+        const entry = library.games.find((g) => g.root === gameRoot || g.id === libraryIdFromRoot(gameRoot));
+        return entry?.language;
+}
+/** Save the per-game language preference to the library file on the SD card.
+ *  Works in both the main app and forwarder NROs (no localStorage needed). */
+function setGameLanguage(gameRoot: string, code: string): void {
+        const id = libraryIdFromRoot(gameRoot);
+        const entry = library.games.find((g) => g.id === id);
+        if (entry) {
+                const updated: LibraryEntry = { ...entry, language: code };
+                if (rememberLibrary(updated)) { currentEntry = updated; log(`Language preference saved: ${code || 'English (default)'} for ${id}`); }
+        }
 }
 function currentSelection(saves = saveLocation): GameSelection {
         if (!selectedGame) throw new Error('No game selected');
@@ -891,17 +945,25 @@ async function startForwarderBuild(entry: LibraryEntry) {
                 setLoadingProgress(1, 'Done.');
                 if (result.ok) {
                         const mib = result.bytes ? (result.bytes / 1024 / 1024).toFixed(1) : '?';
-                        message = `Forwarder built: ${outputPath} (${mib} MiB). Reboot to hbmenu to see it.`;
+                        message = `Forwarder built:\n${outputPath}\n(${mib} MiB). Reboot to hbmenu to see it.`;
                         if (__DEBUG__) log(`forwarder build ok: ${outputPath} (${result.bytes} bytes)`);
                 } else {
                         message = `Forwarder build failed: ${result.error || 'unknown error'}`;
                         if (__DEBUG__) log(`forwarder build failed: ${result.error}`);
                 }
+                // Explicitly free the 54 MB baseNro ArrayBuffer and cover Image
+                // before showing the notice. Without this, the large buffers may
+                // still be in memory when the user clicks exit — the deferred
+                // Switch.exit() can crash during native cleanup if too much
+                // memory is still allocated. This GC call is the fix for the
+                // sporadic "exit crashes after building/deleting a forwarder" bug.
+                try { if (typeof runtime.gc === 'function') runtime.gc(); } catch { /* best-effort */ }
                 waitForRelease = true; phase = 'notice';
         } catch (error) {
                 const msg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
                 log(`startForwarderBuild threw: ${msg}`);
                 message = `Forwarder build error: ${msg}`;
+                try { if (typeof runtime.gc === 'function') runtime.gc(); } catch { /* best-effort */ }
                 waitForRelease = true; phase = 'notice';
         }
 }
@@ -983,6 +1045,12 @@ function hud() {
  *  menu items, not the full screen — the game is visible around it. */
 function renderPauseMenu(): void {
         if (!ctx) return;
+        /** Human-readable label for the language currently in use (or 'English' default). */
+        function currentLanguageLabel(): string {
+                if (!activeLanguageCode) return 'English (default)';
+                const entry = languageEntries.find((e) => e.code === activeLanguageCode);
+                return entry?.name || activeLanguageCode;
+        }
         // The last menu item (pause-menu "quit") is labeled differently
         // depending on how the game was launched:
         //   - Forwarder launch (forwarderTargetId set): the user wants to
@@ -1002,6 +1070,7 @@ function renderPauseMenu(): void {
                 mod: 'Select mod for next launch',
                 direct: `Direct screen: ${directNext ? 'on' : 'off'}`,
                 snapshot: 'Diagnostic snapshot',
+                language: `Language: ${currentLanguageLabel()}`,
         };
         const items = menu.currentItems;
         // Top bar (always visible when menu is open).
@@ -1012,7 +1081,7 @@ function renderPauseMenu(): void {
         // the opaque panel always covers the same screen area, so
         // switching pages doesn't leave ghosting from the old panel.
         // The actual items are vertically CENTERED within the panel.
-        const maxItems = __DEBUG__ ? 8 : 6;
+        const maxItems = __DEBUG__ ? 9 : 7;
         const itemH = 26;
         const topH = 30;
         const padding = 12;
@@ -1118,24 +1187,48 @@ function renderNoticePopup(msg: string): void {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = 'source-over';
-        // Word-wrap the message to a max line width so long notices
-        // (forwarder paths, multi-sentence results) stay on screen.
-        const maxLineWidth = 480;
+        // Word-wrap the message so long notices (forwarder paths, multi-
+        // sentence results) stay on screen. Use most of the screen width.
+        const maxLineWidth = screen.width - 80;
         ctx.font = '22px sans-serif';
         ctx.textBaseline = 'alphabetic';
+        // Split by whitespace, but also break long paths at '/' so a single
+        // path like sdmc:/switch/The_Coffin_of_Andy_and_Leyley/The_Coffin_of_Andy_and_Leyley.nro
+        // wraps across multiple lines instead of overflowing.
         const words = (msg || '').split(/\s+/).filter(Boolean);
         const lines: string[] = [];
         let line = '';
+        const flush = () => { if (line) { lines.push(line); line = ''; } };
         for (const w of words) {
+                // If the word itself is wider than maxLineWidth, break it at '/'
+                // or '_' boundaries so long paths wrap nicely.
+                if (ctx.measureText(w).width > maxLineWidth) {
+                        if (line) { flush(); }
+                        let chunk = '';
+                        for (let i = 0; i < w.length; i++) {
+                                const ch = w[i];
+                                const test = chunk + ch;
+                                if (ctx.measureText(test).width > maxLineWidth && chunk) {
+                                        // Break after '/' so the next chunk starts cleanly.
+                                        if (chunk.endsWith('/')) { lines.push(chunk); chunk = ch; }
+                                        else { lines.push(chunk); chunk = ch; }
+                                } else {
+                                        chunk = test;
+                                }
+                        }
+                        if (chunk) { line = chunk; }
+                        flush();
+                        continue;
+                }
                 const test = line ? line + ' ' + w : w;
                 if (ctx.measureText(test).width > maxLineWidth && line) {
-                        lines.push(line);
+                        flush();
                         line = w;
                 } else {
                         line = test;
                 }
         }
-        if (line) lines.push(line);
+        flush();
         if (!lines.length) lines.push('');
         // Box geometry — auto-size to the wrapped text.
         const padX = 36, padTop = 30, lineH = 28, btnH = 44;
@@ -1249,6 +1342,20 @@ function registerSessionListeners() {
         try { globalThis.addEventListener('unhandledrejection', sessionRejectionListener); } catch { /* best-effort */ }
         try { globalThis.addEventListener('beforeunload', sessionBeforeUnloadGuard); } catch { /* best-effort */ }
 }
+/** Remove the beforeunload listener. Called BEFORE Switch.exit() to prevent
+ *  nx.js from dispatching beforeunload during the exit process. The Atmosphere
+ *  crash report showed infinite recursion (stack overflow) during exit: the
+ *  repeating stack pattern (C++ → V8 → C++ → V8 → ...) indicates that
+ *  Switch.exit() dispatches beforeunload, and the handler's execution triggers
+ *  another beforeunload (or similar event), creating an unbreakable recursive
+ *  loop that overflows the 1 MB stack. Removing ONLY the beforeunload listener
+ *  breaks the cycle — the error and unhandledrejection listeners are KEPT so
+ *  that residual errors from the retired game are still suppressed (the quit
+ *  path test verifies this). Those listeners don't cause recursion because
+ *  fail() has an early-return guard (if (phase === 'error') return). */
+function removeBeforeUnloadListener() {
+        try { globalThis.removeEventListener('beforeunload', sessionBeforeUnloadGuard); } catch { /* best-effort */ }
+}
 
 // === Cover image cache ==================================================
 // nx.js's native Image decoder crashes (segfault, no catchable JS error)
@@ -1292,43 +1399,60 @@ function loadCoverImage(path: string | null | undefined): { image: any; loaded: 
                         return entry;
                 }
                 const u8 = new Uint8Array(bytes);
-                // Verify PNG signature
-                if (u8[0] !== 0x89 || u8[1] !== 0x50 || u8[2] !== 0x4e || u8[3] !== 0x47) {
+                // Detect the image format from the magic bytes so non-PNG
+                // covers (JPEG, WebP, GIF) are decoded correctly. Previously
+                // only PNG was accepted — JPEG/WebP files saved with a .png
+                // extension failed the PNG signature check and showed a
+                // question-mark placeholder.
+                let mime: string | null = null;
+                if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) mime = 'image/png';
+                else if (u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff) mime = 'image/jpeg';
+                else if (u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x38) mime = 'image/gif';
+                else if (u8.length >= 12 && u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46 && u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50) mime = 'image/webp';
+                if (!mime) {
                         entry.failed = true;
-                        log(`Cover not a PNG: ${path} (first bytes: ${u8[0].toString(16)} ${u8[1].toString(16)} ${u8[2].toString(16)} ${u8[3].toString(16)})`);
+                        log(`Cover unknown format: ${path} (first bytes: ${u8[0].toString(16)} ${u8[1].toString(16)} ${u8[2].toString(16)} ${u8[3].toString(16)})`);
                         return entry;
                 }
-                // IHDR is at offset 8+4+4 = 16 (after signature + length + type).
-                // IHDR data: width(4 BE), height(4 BE), bitDepth(1), colorType(1),
-                // compression(1), filter(1), interlace(1).
-                const ihdrView = new DataView(bytes, 16, 13);
-                const ihdrWidth = ihdrView.getUint32(0, false);
-                const ihdrHeight = ihdrView.getUint32(4, false);
-                const bitDepth = u8[24];
-                const colorType = u8[25];
-                const interlace = u8[28];
-                log(`Cover PNG: ${path} ${ihdrWidth}x${ihdrHeight} bitDepth=${bitDepth} colorType=${colorType} interlace=${interlace} (${bytes.byteLength} bytes)`);
-                // nx.js's native decoder is known to crash on interlaced PNGs
-                // and on unusual bit depths (1, 2, 4, 16). Reject those
-                // preemptively so the app doesn't crash.
-                if (interlace !== 0) {
-                        entry.failed = true;
-                        log(`Cover rejected: interlaced PNG not supported (would crash native decoder)`);
-                        return entry;
+                // For PNG, validate the IHDR to avoid native decoder crashes
+                // on interlaced or unusual bit depths. Non-PNG formats are
+                // passed directly to the native decoder (which handles them).
+                if (mime === 'image/png') {
+                        // IHDR is at offset 8+4+4 = 16 (after signature + length + type).
+                        const ihdrView = new DataView(bytes, 16, 13);
+                        const ihdrWidth = ihdrView.getUint32(0, false);
+                        const ihdrHeight = ihdrView.getUint32(4, false);
+                        const bitDepth = u8[24];
+                        const colorType = u8[25];
+                        const interlace = u8[28];
+                        log(`Cover PNG: ${path} ${ihdrWidth}x${ihdrHeight} bitDepth=${bitDepth} colorType=${colorType} interlace=${interlace} (${bytes.byteLength} bytes)`);
+                        // nx.js's native decoder is known to crash on interlaced PNGs
+                        // and on unusual bit depths (1, 2, 4, 16). Reject those
+                        // preemptively so the app doesn't crash.
+                        if (interlace !== 0) {
+                                entry.failed = true;
+                                log(`Cover rejected: interlaced PNG not supported (would crash native decoder)`);
+                                return entry;
+                        }
+                        if (bitDepth !== 8) {
+                                entry.failed = true;
+                                log(`Cover rejected: bitDepth ${bitDepth} not supported (only 8-bit)`);
+                                return entry;
+                        }
+                        if (colorType !== 2 && colorType !== 6) {
+                                entry.failed = true;
+                                log(`Cover rejected: colorType ${colorType} not supported (only 2=RGB, 6=RGBA)`);
+                                return entry;
+                        }
+                } else {
+                        log(`Cover ${mime}: ${path} (${bytes.byteLength} bytes)`);
                 }
-                if (bitDepth !== 8) {
-                        entry.failed = true;
-                        log(`Cover rejected: bitDepth ${bitDepth} not supported (only 8-bit)`);
-                        return entry;
-                }
-                if (colorType !== 2 && colorType !== 6) {
-                        entry.failed = true;
-                        log(`Cover rejected: colorType ${colorType} not supported (only 2=RGB, 6=RGBA)`);
-                        return entry;
-                }
-                // Convert to base64 data URL. The native decoder takes a
-                // different code path for data: URLs (in-memory buffer) vs
-                // sdmc:/ paths (file fetch), which avoids the crash.
+                // Convert to base64 data URL with the detected MIME type.
+                // The native decoder takes a different code path for data:
+                // URLs (in-memory buffer) vs sdmc:/ paths (file fetch), which
+                // avoids the crash. Using the correct MIME type is critical
+                // for non-PNG formats (JPEG, WebP, GIF) — the native decoder
+                // needs to know the format to decode correctly.
                 let binary = '';
                 const CHUNK = 8192;
                 for (let i = 0; i < u8.length; i += CHUNK) {
@@ -1337,7 +1461,7 @@ function loadCoverImage(path: string | null | undefined): { image: any; loaded: 
                 }
                 const base64 = (typeof btoa === 'function') ? btoa(binary) : '';
                 if (base64) {
-                        img.src = `data:image/png;base64,${base64}`;
+                        img.src = `data:${mime};base64,${base64}`;
                 } else {
                         // btoa not available — fall back to direct path
                         log(`Cover: btoa unavailable, falling back to direct path`);
@@ -1438,7 +1562,7 @@ function renderLibrary() {
         ctx.fillText('BurialNX Library', 28, 40);
         ctx.fillStyle = '#9aa0b4';
         const totalPages = Math.max(1, Math.ceil((library.games.length + LIBRARY_ACTION_TILES) / LIBRARY_PAGE_SIZE));
-        ctx.fillText(`Page ${libraryPage + 1}/${totalPages}  ·  ${library.games.length} game(s)`, 28, 68);
+        ctx.fillText(`Page ${libraryPage + 1}/${totalPages}  ·  ${library.games.length} game(s)  ·  L/R: reorder`, 28, 68);
         // Grid: 4 columns x 2 rows. Each tile 240x270, cover 240x230 + text 40px.
         const tileW = 240, tileH = 270, gap = 16;
         const gridW = LIBRARY_COLS * tileW + (LIBRARY_COLS - 1) * gap;
@@ -1460,9 +1584,8 @@ function renderLibrary() {
                 const selected = tileIndex === libraryCursor;
                 ctx.fillStyle = selected ? '#3a3f5c' : '#252840';
                 ctx.fillRect(x, y, tileW, tileH);
-                ctx.strokeStyle = selected ? '#f4f3ef' : '#3a3f5c';
-                ctx.lineWidth = selected ? 3 : 1;
-                ctx.strokeRect(x + 1, y + 1, tileW - 2, tileH - 2);
+                // Selection border is drawn AFTER the cover/icon (below) so
+                // it appears ON TOP of the cover image, not behind it.
                 if (isAction) {
                         // Action tile: draw the bundled PNG icon SHRUNK by
                         // ~1/3 (to ~160×160 = 2/3 of the cover area width)
@@ -1560,10 +1683,16 @@ function renderLibrary() {
                                 ctx.textAlign = 'left';
                         }
                 }
+                // Draw the selection border ON TOP of everything (cover image,
+                // action icon, text) so it's always visible — not hidden behind
+                // the cover image.
+                ctx.strokeStyle = selected ? '#f4f3ef' : '#3a3f5c';
+                ctx.lineWidth = selected ? 3 : 1;
+                ctx.strokeRect(x + 1, y + 1, tileW - 2, tileH - 2);
         }
         // Footer hint
         ctx.fillStyle = '#9aa0b4';
-        ctx.fillText('D-pad: navigate (Up/Down: row)  A: Play  X: Options  Y: Add game  Hold Minus: Menu  Hold Plus: Quit', 28, screen.height - 24);
+        ctx.fillText('D-pad: navigate (Up/Down: row)  A: Play  X: Options  Y: Add game  Hold Minus in Game: Menu  Plus: Quit', 28, screen.height - 24);
         ctx.restore();
 }
 function drawPlaceholderCover(x: number, y: number, w: number, h: number) {
@@ -1610,7 +1739,25 @@ function renderGameOptions() {
                 `Mod: ${modLabel}  |  Keymap: ${hasPerGameKeymap ? 'per-game' : 'global'}`,
                 `Save: ${saveLabel}  |  Forwarder: ${fwdLabel}`,
         ];
-        // --- Menu items (14 total). ---
+        // --- Menu items (14 or 15 depending on language availability). ---
+        // The "Language" option is inserted between "Change save folder" and
+        // "Create forwarder" only when the game ships at least one .cld pack
+        // (which means 2+ total languages counting the embedded English data).
+        const hasLanguages = currentGameLanguages.length > 0;
+        // Determine the current language label for display.
+        let langLabel = '(unknown)';
+        if (currentEntry) {
+                const savedRaw = currentEntry.language; // from library file (SD card)
+                if (savedRaw === undefined) {
+                        // No preference → default to first .cld (Russian) if available
+                        langLabel = currentGameLanguages[0]?.name || currentGameLanguages[0]?.code || 'English (default)';
+                } else if (savedRaw === '') {
+                        langLabel = 'English (default)';
+                } else {
+                        const entry2 = currentGameLanguages.find((e) => e.code === savedRaw);
+                        langLabel = entry2?.name || savedRaw;
+                }
+        }
         const items: string[] = [
                 'Play',
                 'Pick cover image',
@@ -1622,11 +1769,14 @@ function renderGameOptions() {
                 modOn ? 'Disable mod' : (hasMod ? 'Enable mod' : '(no mod to toggle)'),
                 'Toggle shared saves',
                 'Change save folder',
+        ];
+        if (hasLanguages) items.push(`Language: ${langLabel}`);
+        items.push(
                 hasForwarder ? 'Recreate forwarder NRO' : 'Create forwarder NRO',
                 hasForwarder ? 'Delete forwarder NRO' : '(no forwarder to delete)',
                 'Delete from library',
                 'Back to library (B)',
-        ];
+        );
         // --- Layout constants. ---
         const titleY = 26;
         const headerFont = '18px sans-serif';
@@ -2252,9 +2402,70 @@ async function launch() {
                 const scripts = scriptPlan(new TextDecoder().decode(index));
                 log(`Game: ${selectedGame}; mod: ${selectedMod || 'none'}; shared saves: ${sharedSaves}`);
                 setLoadingProgress(0.12, 'Loading fonts and language…');
-                const [language, , pngFix] = await Promise.all([languageTable(assets), registerFonts(assets, runtime), needsPngFix(log)]);
+                // Load the language table. Start with the DEFAULT English data
+                // (always works — it's embedded in data/), then try to UPGRADE
+                // to a .cld pack (Russian) if one exists. ALL .cld operations
+                // are wrapped in try/catch so they NEVER crash the launch —
+                // if anything fails, the game falls back to English. This is
+                // critical for forwarder NROs which have saveData=0 (no
+                // localStorage) and may have different runtime constraints.
+                //
+                // CRITICAL: the .cld file is ~25 MB. It is read and parsed ONLY
+                // ONCE (for the chosen language). resolveLanguageName is NOT
+                // called separately (it would read+parse the same 25 MB file a
+                // second time, causing an OOM crash on the first forwarder
+                // launch). Instead, the display name is taken from the parsed
+                // pack's langName field.
+                const [, , pngFix] = await Promise.all([languageTable(assets), registerFonts(assets, runtime), needsPngFix(log)]);
+                let language = await languageTable(assets);
+                let languagePack: LanguagePack | null = null;
+                let imageReader: Reader = assets;
+                activeLanguageCode = '';
+                languageEntries = [];
+                try {
+                        const scanFs = (Switch as unknown as LanguageScanFs) ?? null;
+                        languageEntries = scanLanguageFiles(scanFs, selectedGame);
+                        if (languageEntries.length > 0) {
+                                // Use the .cld code as the display name for now (e.g. 'ru').
+                                // The real name (e.g. 'Русский') is resolved from the parsed
+                                // pack below — NO separate file read needed.
+                                // Pick the language: saved preference > first .cld (Russian).
+                                const savedRaw = getGameLanguage(selectedGame);
+                                let chosen: LanguageEntry | null = null;
+                                if (savedRaw === undefined) chosen = languageEntries[0];
+                                else if (savedRaw !== '') chosen = languageEntries.find((e) => e.code === savedRaw) ?? null;
+                                // savedRaw === '' → explicit English: chosen stays null.
+                                if (chosen) {
+                                        log(`Languages: ${languageEntries.map((e) => e.code).join(', ')}; loading ${chosen.code}`);
+                                        // Read the .cld file ONCE (not twice — resolveLanguageName
+                                        // is skipped to avoid an OOM crash on the first launch).
+                                        let cldBytes: ArrayBuffer | null = null;
+                                        if (chosen.path) cldBytes = await assets.read(chosen.path);
+                                        else try { cldBytes = await Switch.readFile(chosen.absPath); } catch { /* unreadable */ }
+                                        if (cldBytes) {
+                                                languagePack = parseLanguagePack(cldBytes, chosen.path || chosen.absPath);
+                                                activeLanguageCode = chosen.code;
+                                                language = languagePack.table;
+                                                // Update the chosen entry's display name from the
+                                                // parsed pack (free — no extra file read).
+                                                if (languagePack.langName) chosen.name = languagePack.langName;
+                                                // Wrap assets with translated images (best-effort).
+                                                try { imageReader = withLanguageImages(assets, languagePack); } catch { imageReader = assets; }
+                                        }
+                                } else if (savedRaw === '') {
+                                        log(`Languages: ${languageEntries.map((e) => e.code).join(', ')}; using English (user preference)`);
+                                }
+                        }
+                } catch (langError) {
+                        // Language scanning/loading failed — fall back to English.
+                        // The `language` variable still holds the English table.
+                        log(`Language .cld loading failed (using English): ${langError instanceof Error ? langError.message : String(langError)}`);
+                        languagePack = null;
+                        activeLanguageCode = '';
+                        imageReader = assets;
+                }
                 setLoadingProgress(0.20, 'Preparing runtime host…');
-                host = createBrowserHost(assets, prepareGameScript, log, pngFix, directScreen, failRequest);
+                host = createBrowserHost(imageReader, prepareGameScript, log, pngFix, directScreen, failRequest);
                 // Install Node.js / NW.js compatibility globals (require, process,
                 // Buffer, module, exports, global, __dirname, __filename, nw) BEFORE
                 // any game script loads. RPG Maker MV games packaged for NW.js call
@@ -2280,6 +2491,15 @@ async function launch() {
                 await host.settled();
                 setLoadingProgress(0.95, 'Installing compatibility…');
                 installGameCompatibility(runtime, selectedGame, sharedSaves, language, pngFix, mergedKeymap());
+                // Register the language pack's embedded font (e.g. bitter-pro-regular
+                // from ru.cld) and override Window_Base/Yanfly/Graphics font selection
+                // so the game draws text in the localized font instead of GameFont.
+                // Must run AFTER scripts load (so Window_Base, Yanfly, Graphics exist)
+                // and AFTER installGameCompatibility (which may reference the font hooks).
+                if (languagePack) {
+                        try { registerLanguageFont(runtime, languagePack); }
+                        catch (fontError) { log(`Language font install failed: ${fontError instanceof Error ? fontError.message : String(fontError)}`); }
+                }
                 // Wrap Input._updateGamepadState so pollStickBindings runs
                 // AFTER it — this is the CRITICAL timing fix for vkey stick
                 // bindings (keyCode 0 → vkey name like 'ok', 'cancel').
@@ -2709,8 +2929,13 @@ let gameOptionsCursor = 0;
 let gameOptionsScroll = 0; // index of the first visible menu item (auto-adjusted when the cursor moves)
 // Play, Pick cover, Auto-detect, Edit keymap, Reset keymap, Rename game,
 // Change mod folder, Toggle mod, Toggle shared saves, Change save folder,
-// Create/Recreate forwarder, Delete forwarder, Delete, Back = 14 options, indices 0..13.
-const GAME_OPTIONS_COUNT = 14;
+// Language (conditional, only when 2+ languages), Create/Recreate forwarder,
+// Delete forwarder, Delete, Back = 14 or 15 options depending on language count.
+const GAME_OPTIONS_BASE_COUNT = 14;
+// Languages discovered for the game currently shown in the game-options screen.
+// Scanned synchronously (readDirSync) when entering the options screen; the
+// display names are resolved lazily (codes are used if a .cld can't be read).
+let currentGameLanguages: LanguageEntry[] = [];
 
 function libraryTileCount() { return library.games.length + LIBRARY_ACTION_TILES; }
 
@@ -2791,18 +3016,60 @@ function frame(now: number) {
                                 } else if (edge(3) && entry) {
                                         loadEntryIntoState(entry);
                                         gameOptionsCursor = 0; gameOptionsScroll = 0;
+                                        // Scan for .cld language packs so the "Language" option
+                                        // only appears when the game ships 2+ languages (any .cld
+                                        // counts as 2+ because the embedded English data is always
+                                        // available). Synchronous readDirSync; names resolved lazily.
+                                        currentGameLanguages = scanLanguageFiles((Switch as unknown as LanguageScanFs) ?? null, entry.root);
                                         waitForRelease = true; phase = 'game-options';
                                 } else if (edge(2)) {
                                         // Y = Add game from anywhere in the library.
                                         browser = new FolderBrowser(Switch, 'game', 'sdmc:/switch/burialnx'); pickerPurpose = 'add-game'; waitForRelease = true; phase = 'picker';
+                                }
+                                // L/R shoulder buttons move the selected game up/down
+                                // in the library order. The 3 action tiles (Add, Keymap,
+                                // Quit) are always at the end and can't be moved.
+                                if (!isAction && entry && (edge(4) || edge(5))) {
+                                        const dir = edge(4) ? -1 : 1; // L = up, R = down
+                                        const oldIdx = libraryCursor;
+                                        library = moveGame(Switch as unknown as LibraryAccess, library, entry.id, dir as -1 | 1);
+                                        // Move the cursor to follow the game's new position.
+                                        const newIdx = library.games.findIndex((g) => g.id === entry.id);
+                                        if (newIdx >= 0) libraryCursor = newIdx;
+                                        else libraryCursor = Math.max(0, oldIdx + dir);
+                                        // Keep the cursor on the current page.
+                                        const ps = libraryPage * LIBRARY_PAGE_SIZE;
+                                        if (libraryCursor < ps) libraryPage = Math.max(0, libraryPage - 1);
+                                        else if (libraryCursor >= ps + LIBRARY_PAGE_SIZE) libraryPage++;
+                                        invalidateCoverCache();
+                                        try { runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                                 }
                         }
                         renderLibrary();
                 } else if (phase === 'game-options') {
                         if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
                         else if (!waitForRelease) {
-                                if (edge(13)) gameOptionsCursor = (gameOptionsCursor + 1) % GAME_OPTIONS_COUNT;
-                                if (edge(12)) gameOptionsCursor = (gameOptionsCursor + GAME_OPTIONS_COUNT - 1) % GAME_OPTIONS_COUNT;
+                                const optsCount = GAME_OPTIONS_BASE_COUNT + (currentGameLanguages.length > 0 ? 1 : 0);
+                                if (edge(13)) gameOptionsCursor = (gameOptionsCursor + 1) % optsCount;
+                                if (edge(12)) gameOptionsCursor = (gameOptionsCursor + optsCount - 1) % optsCount;
+                                // Left/Right on the Language item cycles through available
+                                // languages with auto-confirm (no A press needed). Whatever is
+                                // shown is saved immediately and applies on the next launch.
+                                if (currentGameLanguages.length > 0 && gameOptionsCursor === 10 && currentEntry) {
+                                        const codes = currentGameLanguages.map((e) => e.code).concat(['']);
+                                        const savedRaw = currentEntry.language; // from library file (SD card)
+                                        const currentCode = savedRaw === undefined ? (currentGameLanguages[0]?.code || '') : savedRaw;
+                                        const currentIdx = Math.max(0, codes.indexOf(currentCode));
+                                        let nextIdx = -1;
+                                        if (edge(14)) nextIdx = (currentIdx + codes.length - 1) % codes.length; // Left
+                                        if (edge(15)) nextIdx = (currentIdx + 1) % codes.length;               // Right
+                                        if (nextIdx >= 0) {
+                                                const nextCode = codes[nextIdx];
+                                                setGameLanguage(currentEntry.root, nextCode);
+                                                // Play a soft click so the user gets feedback.
+                                                try { runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                                        }
+                                }
                                 if (edge(0)) { waitForRelease = true; phase = 'library'; }
                                 else if (edge(1)) {
                                         if (gameOptionsCursor === 0) {
@@ -2838,66 +3105,11 @@ function frame(now: number) {
                                                         waitForRelease = true; phase = 'notice';
                                                 }
                                         } else if (gameOptionsCursor === 5) {
-                                                // Rename game — use the Switch's built-in software keyboard (swkbd).
-                                                if (currentEntry && navigator?.virtualKeyboard) {
-                                                        const vk = navigator.virtualKeyboard;
-                                                        vk.okButtonText = 'Save';
-                                                        vk.type = 0; // Normal text keyboard
-                                                        vk.maxLength = 64; // library names are validated to <= 128
-                                                        // Seed the keyboard with the game's current name so it opens
-                                                        // for editing (nx.js sends the value as the swkbd input text
-                                                        // and places the cursor at its end). Whatever comes back on
-                                                        // 'submit' replaces the whole name at once.
-                                                        vk.value = currentEntry.name;
-                                                        renameSubmitted = false;
-                                                        renamePreview = currentEntry.name;
-                                                        // nx.js dispatches 'change' on every keypress (and
-                                                        // 'cursormove' when the cursor moves) with the keyboard's
-                                                        // full current text in vk.value. The swkbd itself does not
-                                                        // render the input, so the preview field is the player's
-                                                        // only live feedback — keep it in sync while typing.
-                                                        const onLiveInput = () => { renamePreview = vk.value; };
-                                                        // nx.js dispatches 'geometrychange' (from onHide) BEFORE
-                                                        // 'submit'. So we must DELAY the geometrychange processing
-                                                        // to give 'submit' a chance to fire first.
-                                                        const onSubmit = () => {
-                                                                renameSubmitted = true;
-                                                                // vk.value is the full text from the keyboard: replace the
-                                                                // entire name with it (fall back to the old name if empty).
-                                                                const text = vk.value || currentEntry!.name;
-                                                                renamePreview = text;
-                                                                const updated: LibraryEntry = { ...currentEntry!, name: text };
-                                                                if (rememberLibrary(updated)) { currentEntry = updated; message = 'Name changed.'; }
-                                                                else message = 'Could not save name.';
-                                                                waitForRelease = true; phase = 'notice';
-                                                        };
-                                                        const onGeometryChange = () => {
-                                                                if (vk.boundingRect.height === 0) {
-                                                                        // Delay processing to allow 'submit' to fire first
-                                                                        setTimeout(() => {
-                                                                                vk.removeEventListener('submit', onSubmit as EventListener);
-                                                                                vk.removeEventListener('geometrychange', onGeometryChange as EventListener);
-                                                                                vk.removeEventListener('change', onLiveInput as EventListener);
-                                                                                vk.removeEventListener('cursormove', onLiveInput as EventListener);
-                                                                                if (!renameSubmitted) {
-                                                                                        // Cancelled (submit didn't fire within the delay)
-                                                                                        waitForRelease = true; phase = 'game-options';
-                                                                                }
-                                                                        }, 50);
-                                                                }
-                                                        };
-                                                        vk.addEventListener('submit', onSubmit as EventListener);
-                                                        vk.addEventListener('geometrychange', onGeometryChange as EventListener);
-                                                        vk.addEventListener('change', onLiveInput as EventListener);
-                                                        vk.addEventListener('cursormove', onLiveInput as EventListener);
-                                                        vk.show();
-                                                        phase = 'rename-kb'; // freeze game-options rendering
-                                                } else {
-                                                        // Fallback: character-cycling editor (if swkbd unavailable)
-                                                        renameBuffer = currentEntry.name.slice(0, 64);
-                                                        while (renameBuffer.length < 8) renameBuffer += ' ';
-                                                        renameCursor = 0;
-                                                        waitForRelease = true; phase = 'rename';
+                                                // Rename game — show a choice: type a custom name,
+                                                // use the folder name, or use the .exe file name.
+                                                if (currentEntry) {
+                                                        gameOptionsCursor = 0; // reset for the choice panel
+                                                        waitForRelease = true; phase = 'rename-choice';
                                                 }
                                         } else if (gameOptionsCursor === 6) {
                                                 // Select/change mod folder
@@ -2926,34 +3138,54 @@ function frame(now: number) {
                                                 choiceFromMenu = false;
                                                 waitForRelease = true;
                                                 phase = 'save-choice';
-                                        } else if (gameOptionsCursor === 10) {
-                                                // Create / Recreate forwarder NRO
-                                                if (currentEntry) void startForwarderBuild(currentEntry);
-                                        } else if (gameOptionsCursor === 11) {
-                                                // Delete forwarder NRO
+                                        } else if (currentGameLanguages.length > 0 && gameOptionsCursor === 10) {
+                                                // Language — A also cycles forward (same as Right), auto-saved.
+                                                // Left/Right handling is in the navigation block above.
                                                 if (currentEntry) {
-                                                        const had = forwarderExists(Switch as unknown as LibraryAccess, currentEntry.name, currentEntry.id);
-                                                        const removed = deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id);
-                                                        if (had && removed) message = `Forwarder deleted. (${forwarderPathFor(currentEntry.name, currentEntry.id)})`;
-                                                        else if (had && !removed) message = 'Forwarder file present but could not be removed.';
-                                                        else message = 'No forwarder to delete.';
-                                                        waitForRelease = true; phase = 'notice';
+                                                        const codes = currentGameLanguages.map((e) => e.code).concat(['']);
+                                                        const savedRaw = currentEntry.language;
+                                                        const currentCode = savedRaw === undefined ? (currentGameLanguages[0]?.code || '') : savedRaw;
+                                                        const currentIdx = Math.max(0, codes.indexOf(currentCode));
+                                                        const nextIdx = (currentIdx + 1) % codes.length;
+                                                        const nextCode = codes[nextIdx];
+                                                        setGameLanguage(currentEntry.root, nextCode);
+                                                        try { runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                                                 }
-                                        } else if (gameOptionsCursor === 12) {
-                                                // Delete
-                                                if (currentEntry) {
-                                                        // Also remove the forwarder if present, so the SD card
-                                                        // doesn't keep a stale shortcut to a deleted game.
-                                                        try { deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id); } catch { /* non-fatal */ }
-                                                        library = removeGame(Switch as unknown as LibraryAccess, library, currentEntry.id);
-                                                        invalidateCoverCache();
-                                                        currentEntry = null;
-                                                        message = 'Game removed from library.';
+                                        } else {
+                                                // Forwarder / delete / back are at the END of the list, but
+                                                // their cursor index shifts by +1 when the language option
+                                                // is present (it's inserted at index 10). Map by offset.
+                                                const offset = currentGameLanguages.length > 0 ? 1 : 0;
+                                                const actionIdx = gameOptionsCursor - 10 - offset;
+                                                if (actionIdx === 0) {
+                                                        // Create / Recreate forwarder NRO
+                                                        if (currentEntry) void startForwarderBuild(currentEntry);
+                                                } else if (actionIdx === 1) {
+                                                        // Delete forwarder NRO
+                                                        if (currentEntry) {
+                                                                const had = forwarderExists(Switch as unknown as LibraryAccess, currentEntry.name, currentEntry.id);
+                                                                const removed = deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id);
+                                                                if (had && removed) message = `Forwarder deleted:\n${forwarderPathFor(currentEntry.name, currentEntry.id)}`;
+                                                                else if (had && !removed) message = 'Forwarder file present but could not be removed.';
+                                                                else message = 'No forwarder to delete.';
+                                                                waitForRelease = true; phase = 'notice';
+                                                        }
+                                                } else if (actionIdx === 2) {
+                                                        // Delete
+                                                        if (currentEntry) {
+                                                                // Also remove the forwarder if present, so the SD card
+                                                                // doesn't keep a stale shortcut to a deleted game.
+                                                                try { deleteForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void }, currentEntry.name, currentEntry.id); } catch { /* non-fatal */ }
+                                                                library = removeGame(Switch as unknown as LibraryAccess, library, currentEntry.id);
+                                                                invalidateCoverCache();
+                                                                currentEntry = null;
+                                                                message = 'Game removed from library.';
+                                                                waitForRelease = true; phase = 'library';
+                                                        }
+                                                } else if (actionIdx === 3) {
+                                                        // Back
                                                         waitForRelease = true; phase = 'library';
                                                 }
-                                        } else if (gameOptionsCursor === 13) {
-                                                // Back
-                                                waitForRelease = true; phase = 'library';
                                         }
                                 }
                         }
@@ -3017,6 +3249,102 @@ function frame(now: number) {
                                 }
                         }
                         renderKeymap();
+                } else if (phase === 'rename-choice') {
+                        // Choose how to rename: type a custom name, or browse
+                        // for a folder/file to take the name from.
+                        if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
+                        else if (!waitForRelease) {
+                                if (edge(13)) gameOptionsCursor = (gameOptionsCursor + 1) % 2;
+                                if (edge(12)) gameOptionsCursor = (gameOptionsCursor + 2) % 2;
+                                if (edge(0)) { waitForRelease = true; phase = 'game-options'; } // B: back
+                                else if (edge(1) && currentEntry) {
+                                        if (gameOptionsCursor === 0) {
+                                                // Option 1: Type a custom name — open the keyboard.
+                                                if (navigator?.virtualKeyboard) {
+                                                        const vk = navigator.virtualKeyboard;
+                                                        vk.okButtonText = 'Save';
+                                                        vk.type = 0;
+                                                        vk.maxLength = 64;
+                                                        vk.value = currentEntry.name;
+                                                        renameSubmitted = false;
+                                                        renamePreview = currentEntry.name;
+                                                        const onLiveInput = () => { renamePreview = vk.value; };
+                                                        const onSubmit = () => {
+                                                                renameSubmitted = true;
+                                                                const text = vk.value || currentEntry!.name;
+                                                                const oldName = currentEntry!.name;
+                                                                const updated: LibraryEntry = { ...currentEntry!, name: text };
+                                                                if (rememberLibrary(updated)) { currentEntry = updated; message = 'Name changed.'; }
+                                                                else message = 'Could not save name.';
+                                                                // Rename the forwarder if it exists at the old name's path.
+                                                                try {
+                                                                        if (renameForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void; rmdirSync?: (p: string) => void; readFileSync?: (p: string) => ArrayBuffer | null }, oldName, text, updated.id)) {
+                                                                                message += '\n\nForwarder renamed. Recreate it in game options for the Switch Home Menu.';
+                                                                        }
+                                                                } catch { /* best-effort */ }
+                                                                waitForRelease = true; phase = 'notice';
+                                                        };
+                                                        const onGeometryChange = () => {
+                                                                if (vk.boundingRect.height === 0) {
+                                                                        setTimeout(() => {
+                                                                                vk.removeEventListener('submit', onSubmit as EventListener);
+                                                                                vk.removeEventListener('geometrychange', onGeometryChange as EventListener);
+                                                                                vk.removeEventListener('change', onLiveInput as EventListener);
+                                                                                vk.removeEventListener('cursormove', onLiveInput as EventListener);
+                                                                                if (!renameSubmitted) { waitForRelease = true; phase = 'game-options'; }
+                                                                        }, 50);
+                                                                }
+                                                        };
+                                                        vk.addEventListener('submit', onSubmit as EventListener);
+                                                        vk.addEventListener('geometrychange', onGeometryChange as EventListener);
+                                                        vk.addEventListener('change', onLiveInput as EventListener);
+                                                        vk.addEventListener('cursormove', onLiveInput as EventListener);
+                                                        vk.show();
+                                                        phase = 'rename-kb';
+                                                } else {
+                                                        renameBuffer = currentEntry.name.slice(0, 64);
+                                                        while (renameBuffer.length < 8) renameBuffer += ' ';
+                                                        renameCursor = 0;
+                                                        waitForRelease = true; phase = 'rename';
+                                                }
+                                        } else if (gameOptionsCursor === 1) {
+                                                // Option 2: Browse for a folder or file to take the name from.
+                                                // Opens the folder browser starting at the game's parent folder.
+                                                // Uses 'file' mode so ALL files are visible (not just folders).
+                                                const parent = currentEntry.root.replace(/\/www$/i, '').replace(/\/+$/, '') || 'sdmc:';
+                                                browser = new FolderBrowser(Switch, 'file', parent);
+                                                pickerPurpose = 'rename-source';
+                                                waitForRelease = true; phase = 'picker';
+                                        }
+                                }
+                        }
+                        // Render the choice panel.
+                        if (ctx) {
+                                ctx.save();
+                                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                                ctx.fillStyle = '#161823';
+                                ctx.fillRect(0, 0, screen.width, screen.height);
+                                ctx.font = '22px sans-serif';
+                                ctx.fillStyle = '#f4f3ef'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+                                ctx.fillText('Rename game — choose source', 28, 50);
+                                ctx.font = '20px sans-serif';
+                                ctx.fillStyle = '#9aa0b4';
+                                ctx.fillText(currentEntry?.name || '(unknown)', 28, 78);
+                                const items = [
+                                        'Type a custom name',
+                                        'Use name from folder/file',
+                                ];
+                                ctx.font = '22px sans-serif';
+                                for (let i = 0; i < items.length; i++) {
+                                        const isCursor = i === gameOptionsCursor;
+                                        ctx.fillStyle = isCursor ? '#3fb950' : '#c9cdd6';
+                                        ctx.fillText((isCursor ? '▶ ' : '  ') + items[i], 28, 120 + i * 32);
+                                }
+                                ctx.font = '16px sans-serif';
+                                ctx.fillStyle = '#6e7681';
+                                ctx.fillText('Up/Down: select  A: choose  B: back', 28, screen.height - 20);
+                                ctx.restore();
+                        }
                 } else if (phase === 'rename-kb' || phase === 'add-game-name') {
                         // Swkbd is open — render the live preview of the name being typed.
                         // Do NOT process gamepad input here: the keyboard owns it.
@@ -3116,6 +3444,25 @@ function frame(now: number) {
                                                 const updated: LibraryEntry = { ...currentEntry, mod: result, modEnabled: true };
                                                 if (rememberLibrary(updated)) { currentEntry = updated; message = `Mod set to: ${result}`; }
                                                 else message = 'Could not save mod setting.';
+                                                waitForRelease = true; phase = 'notice';
+                                        } else if (pickerPurpose === 'rename-source' && result !== null && currentEntry) {
+                                                // Take the game name from the selected folder or file.
+                                                // The result is a full sdmc: path — extract the last segment
+                                                // (folder name or filename without extension).
+                                                const clean = result.replace(/\/+$/, '');
+                                                const lastSegment = clean.split('/').pop() || currentEntry.name;
+                                                // If it's a file (has an extension), strip it.
+                                                const name = lastSegment.replace(/\.[^.]+$/, '');
+                                                const oldName = currentEntry.name;
+                                                const updated: LibraryEntry = { ...currentEntry, name: name || currentEntry.name };
+                                                if (rememberLibrary(updated)) { currentEntry = updated; message = `Name set to: ${name}`; }
+                                                else message = 'Could not save name.';
+                                                // Rename the forwarder if it exists at the old name's path.
+                                                try {
+                                                        if (renameForwarder(Switch as unknown as LibraryAccess & { removeSync?: (p: string) => void; unlinkSync?: (p: string) => void; rmdirSync?: (p: string) => void; readFileSync?: (p: string) => ArrayBuffer | null }, oldName, name, updated.id)) {
+                                                                message += '\n\nForwarder renamed. Recreate it in game options for the Switch Home Menu.';
+                                                        }
+                                                } catch { /* best-effort */ }
                                                 waitForRelease = true; phase = 'notice';
                                         }
                                         else if (pickerPurpose === 'menu-mod' && selectedGame) {
@@ -3340,6 +3687,25 @@ function frame(now: number) {
                                 catch (error) { log(`Could not save direct-screen setting: ${String(error)}`); }
                         }
                         if (action === 'snapshot') { log(`Snapshot: scene=${runtime.SceneManager?._scene?.constructor?.name || 'unknown'}, fps=${fps.toFixed(1)}`); snapshotRuntimeLog(); }
+                        // Left/Right (or A) on the Language item cycle through available
+                        // languages with auto-confirm — the selected language is saved
+                        // immediately to the library file (SD card, NOT localStorage —
+                        // forwarder NROs have saveData=0) and applies on the next launch.
+                        // The pause-menu label shows the newly-selected language on the next render.
+                        if (menu.languageCycle !== 0 && selectedGame && languageEntries.length > 0) {
+                                const codes = languageEntries.map((e) => e.code).concat(['']);
+                                const savedRaw = getGameLanguage(selectedGame);
+                                const currentCode = savedRaw === undefined ? (languageEntries[0]?.code || '') : savedRaw;
+                                const currentIdx = Math.max(0, codes.indexOf(currentCode));
+                                const dir = menu.languageCycle;
+                                const nextIdx = (currentIdx + dir + codes.length) % codes.length;
+                                const nextCode = codes[nextIdx];
+                                setGameLanguage(selectedGame, nextCode);
+                                try { runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                                // Update activeLanguageCode so the label re-renders with the new name.
+                                activeLanguageCode = nextCode;
+                                log(`Language set to ${nextCode || 'English (default)'}; applies on next launch.`);
+                        }
                         host?.present();
                         if (menu.blocksInput || !host?.direct()) hud();
                 }
@@ -3353,7 +3719,7 @@ function frame(now: number) {
                 //   - Forwarder-launched game (forwarderTargetId set): "Quit BurialNX?" / shutdown
                 //   - Library-launched game (forwarderTargetId null): "Return to library?" / return-to-library
                 const plusDown = down(9);
-                const plusBlocked = phase === 'notice' || phase === 'rename-kb' || phase === 'add-game-name' || phase === 'forwarder-building' || phase === 'loading';
+                const plusBlocked = phase === 'notice' || phase === 'rename-kb' || phase === 'add-game-name' || phase === 'rename-choice' || phase === 'forwarder-building' || phase === 'loading';
                 if (plusDown && !plusBlocked) {
                         // Determine the exit mode and dialog label for this
                         // context. A game is running when `host` is set.

@@ -13,7 +13,7 @@ import { gameAssetNames, gameAssets, unpackGameAsset } from '../src/game-assets'
 import { installMapPrefetch, MapPrefetcher } from '../src/map-prefetch';
 import { fixIndexedPng } from '../src/indexed-png';
 import { gameSaveFolders, parseSelection, startupSelection } from '../src/settings';
-import { prepareGameScript, translate, installGameCompatibility } from '../src/game-compat';
+import { prepareGameScript, translate, installGameCompatibility, parseLanguagePack, loadLanguagePack, scanLanguageFiles, withLanguageImages, registerLanguageFont, resolveLanguageName, wrapSystemTerms, type LanguagePack, type LanguageEntry } from '../src/game-compat';
 import { createBrowserHost, resourceFetch } from '../src/browser-host';
 import { RepeatedPattern } from '../src/repeated-pattern';
 import { ensureGameSaveFolder, hasSteamSaveData, importSteamSaves, installSdSaves, safeGameSaveFolder, safeSaveFolder, steamSaveSources } from '../src/saves';
@@ -162,8 +162,8 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.step(press(1), 2001);
         // Now on page 2.
         assert.equal(menu.page, 2);
-        // Page 2: saves, import, resolution, fps, mod, back (no snapshot/direct in release)
-        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mod', 'back']);
+        // Page 2: saves, import, resolution, fps, mod, language, back (no snapshot/direct in release)
+        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mod', 'language', 'back']);
         // B goes back to page 1.
         menu.step(press(0), 2002);
         assert.equal(menu.page, 1);
@@ -782,4 +782,403 @@ test('one-pixel patterns are batched and updated when the source changes', () =>
         pattern.fill(dest.getContext(), 0, 0, 1, 1, make);
         assert.equal(dest.pixels[0], 9); assert.equal(builds, 2);
 });
+
+// === Language pack (.cld) loading tests =====================================
+
+/** Encode a minimal LANGDATA blob for tests. */
+function langdata(pack: Record<string, unknown>): ArrayBuffer {
+        const text = 'LANGDATA' + JSON.stringify(pack);
+        return new TextEncoder().encode(text).buffer;
+}
+
+test('parseLanguagePack extracts tables, font metadata, and image map from a .cld blob', () => {
+        const bytes = langdata({
+                langVers: '1', langName: 'Test', fontFace: 'custom-font', fontSize: 22,
+                fontFile: 'AAEC', imgFiles: { 'img/x': 'iVBORw0KGgo=' },
+                sysLabel: { Game: 'Spiel' }, sysMenus: { New: 'Neu' },
+                labelLUT: { a: 'A' }, linesLUT: { b: ['B1', 'B2'] },
+        });
+        const pack = parseLanguagePack(bytes, 'languages/test.cld');
+        assert.equal(pack.langName, 'Test');
+        assert.equal(pack.fontFace, 'custom-font');
+        assert.equal(pack.fontSize, 22);
+        assert.equal(pack.fontFile, 'AAEC');
+        assert.equal(pack.source, 'languages/test.cld');
+        assert.equal(Object.keys(pack.imgFiles).length, 1);
+        assert.equal(pack.imgFiles['img/x'], 'iVBORw0KGgo=');
+        // The table exposes the four keys translate() reads.
+        assert.deepEqual(Object.keys(pack.table).sort(), ['labelLUT', 'linesLUT', 'sysLabel', 'sysMenus']);
+        assert.equal(pack.table.sysMenus!.New, 'Neu');
+        assert.deepEqual(pack.table.linesLUT!.b, ['B1', 'B2']);
+});
+
+test('parseLanguagePack tolerates packs without font or images (default English data)', () => {
+        const bytes = langdata({ langName: 'English', fontFace: 'GameFont', fontSize: 28, fontFile: null, imgFiles: {} });
+        const pack = parseLanguagePack(bytes, null);
+        assert.equal(pack.fontFile, null);
+        assert.equal(pack.langName, 'English');
+        assert.equal(Object.keys(pack.imgFiles).length, 0);
+        assert.equal(pack.source, null);
+});
+
+test('parseLanguagePack rejects a non-LANGDATA blob', () => {
+        const bytes = new TextEncoder().encode('{}').buffer;
+        assert.throws(() => parseLanguagePack(bytes, null), /Unsupported language data/);
+});
+
+test('loadLanguagePack prefers a .cld file and falls back to the default English data', async () => {
+        const cld = langdata({ langName: 'Русский', fontFace: 'bitter', fontSize: 24, fontFile: 'AAAA', imgFiles: {}, sysMenus: { New: 'Новая' } });
+        const english = langdata({ langName: 'English', fontFace: 'GameFont', fontSize: 28, fontFile: null, imgFiles: {}, sysMenus: { New: 'New' } });
+        const files: Record<string, ArrayBuffer> = { 'languages/ru.cld': cld, 'data/9c7050ae76645487': english };
+        const reader = { async read(path: string) { return files[path] ?? null; } };
+        // .cld path provided → load it.
+        const ru = await loadLanguagePack(reader, 'languages/ru.cld');
+        assert.ok(ru); assert.equal(ru!.langName, 'Русский'); assert.equal(ru!.fontFace, 'bitter');
+        assert.equal(translate('(sysMenus)[New]', ru!.table), 'Новая');
+        // No .cld path → fall back to English default.
+        const en = await loadLanguagePack(reader, null);
+        assert.ok(en); assert.equal(en!.langName, 'English'); assert.equal(translate('(sysMenus)[New]', en!.table), 'New');
+});
+
+test('loadLanguagePack falls back to default when the .cld path is unreadable', async () => {
+        const english = langdata({ langName: 'English', fontFace: 'GameFont', fontSize: 28, fontFile: null, imgFiles: {} });
+        const reader = { async read(path: string) { return path === 'data/9c7050ae76645487' ? english : null; } };
+        const pack = await loadLanguagePack(reader, 'languages/missing.cld');
+        assert.ok(pack); assert.equal(pack!.langName, 'English');
+});
+
+test('loadLanguagePack returns null when neither .cld nor default exist', async () => {
+        const reader = { async read() { return null; } };
+        const pack = await loadLanguagePack(reader, 'languages/missing.cld');
+        assert.equal(pack, null);
+});
+
+test('scanLanguageFiles finds .cld packs in www/languages and prefers Russian first', () => {
+        const fs = { readDirSync(path: string): string[] | null {
+                if (path.includes('languages')) return ['en.cld', 'ru.cld', 'notes.txt', 'fr.cld'];
+                return null;
+        } };
+        const entries = scanLanguageFiles(fs, '/sdmc/game/www');
+        assert.equal(entries.length, 3);
+        // Russian is sorted first.
+        assert.equal(entries[0].code, 'ru');
+        assert.equal(entries[0].path, 'languages/ru.cld');
+        assert.equal(entries[0].absPath, '/sdmc/game/www/languages/ru.cld');
+        // Other languages are alphabetical after ru.
+        assert.equal(entries[1].code, 'en');
+        assert.equal(entries[2].code, 'fr');
+        // Non-.cld files are skipped.
+        assert.ok(!entries.some((e) => e.code === 'notes'));
+});
+
+test('scanLanguageFiles also checks the parent folder when languages/ is above www', () => {
+        let calls = 0;
+        const fs = { readDirSync(path: string): string[] | null {
+                calls++;
+                if (path === '/sdmc/game/languages/') return ['ru.cld']; // one level above www
+                return null;
+        } };
+        const entries = scanLanguageFiles(fs, '/sdmc/game/www');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].code, 'ru');
+        // Parent-folder packs have null asset path (assetPath rejects ..) and an absolute path.
+        assert.equal(entries[0].path, null);
+        assert.equal(entries[0].absPath, '/sdmc/game/languages/ru.cld');
+});
+
+test('scanLanguageFiles de-duplicates the same code across www and parent folders', () => {
+        const fs = { readDirSync(path: string): string[] | null {
+                if (path === '/sdmc/game/www/languages/') return ['ru.cld'];
+                if (path === '/sdmc/game/languages/') return ['ru.cld', 'en.cld'];
+                return null;
+        } };
+        const entries = scanLanguageFiles(fs, '/sdmc/game/www');
+        assert.equal(entries.length, 2);
+        // The www copy wins (first seen); the parent copy is deduped.
+        assert.equal(entries[0].code, 'ru');
+        assert.equal(entries[0].path, 'languages/ru.cld');
+        assert.equal(entries[1].code, 'en');
+        assert.equal(entries[1].path, null); // only in parent
+});
+
+test('scanLanguageFiles returns empty when readDirSync is unavailable', () => {
+        assert.deepEqual(scanLanguageFiles(null, '/sdmc/game/www'), []);
+        assert.deepEqual(scanLanguageFiles({}, '/sdmc/game/www'), []);
+});
+
+test('resolveLanguageName reads langName from a .cld pack', async () => {
+        const cld = langdata({ langName: 'Русский', fontFace: 'f', fontSize: 1, fontFile: null, imgFiles: {} });
+        const reader = { async read(path: string) { return path === 'languages/ru.cld' ? cld : null; } };
+        const name = await resolveLanguageName(reader, { path: 'languages/ru.cld', absPath: '/x/ru.cld', code: 'ru', name: 'ru' });
+        assert.equal(name, 'Русский');
+});
+
+test('resolveLanguageName falls back to the code when the pack cannot be read', async () => {
+        const reader = { async read() { return null; } };
+        const entry: LanguageEntry = { path: 'languages/zz.cld', absPath: '/x/zz.cld', code: 'zz', name: 'zz' };
+        const name = await resolveLanguageName(reader, entry);
+        assert.equal(name, 'zz');
+});
+
+test('withLanguageImages serves decoded base64 images for listed paths and falls through otherwise', async () => {
+        // 'iVBORw0KGgo=' decodes to the 4-byte PNG signature + padding.
+        const pack: LanguagePack = {
+                table: {}, fontFace: null, fontSize: null, fontFile: null,
+                imgFiles: { 'img/title': 'iVBORw0KGgo=' }, langName: null, source: null,
+        };
+        let baseReads = 0;
+        const base = { async read(path: string) { baseReads++; return path === 'data/Map001.json' ? new ArrayBuffer(4) : null; } };
+        const overlay = withLanguageImages(base, pack);
+        // Listed path → decoded image, no base reader call.
+        const img = await overlay.read('img/title');
+        assert.ok(img);
+        assert.equal(new Uint8Array(img)[0], 137); // PNG signature byte 0
+        assert.equal(new Uint8Array(img)[1], 80);  // 'P'
+        assert.equal(baseReads, 0);
+        // Unlisted path → falls through to base reader.
+        const data = await overlay.read('data/Map001.json');
+        assert.ok(data);
+        assert.equal(baseReads, 1);
+        // Missing path → base returns null.
+        const missing = await overlay.read('img/missing');
+        assert.equal(missing, null);
+        assert.equal(baseReads, 2);
+});
+
+test('withLanguageImages returns the base reader unchanged when imgFiles is empty', () => {
+        const base = { async read() { return null; } };
+        const pack: LanguagePack = { table: {}, fontFace: null, fontSize: null, fontFile: null, imgFiles: {}, langName: null, source: null };
+        assert.equal(withLanguageImages(base, pack), base);
+});
+
+test('registerLanguageFont overrides Window_Base, Yanfly, Graphics, and Bitmap font selection', () => {
+        const fonts: string[] = [];
+        const runtime: any = {
+                FontFace: class { constructor(public family: string, public src: ArrayBuffer) {} },
+                fonts: { add(f: any) { fonts.push(f.family); } },
+                Window_Base: { prototype: { standardFontFace() { return 'GameFont'; }, standardFontSize() { return 28; } } },
+                Yanfly: { Param: { DefaultFont: 'GameFont', FontSize: 28 } },
+                Graphics: { fontFace: 'GameFont' },
+                Bitmap: { prototype: { fontFace: 'GameFont', fontSize: 28 } },
+        };
+        const pack: LanguagePack = {
+                table: {}, fontFace: 'bitter-pro-regular', fontSize: 24,
+                fontFile: 'AAEAAA', imgFiles: {}, langName: 'Русский', source: 'languages/ru.cld',
+        };
+        registerLanguageFont(runtime, pack);
+        // Font registered with the correct family name.
+        assert.deepEqual(fonts, ['bitter-pro-regular']);
+        // Font face overridden everywhere RPG Maker MV / Yanfly reads it.
+        assert.equal(runtime.Window_Base.prototype.standardFontFace(), 'bitter-pro-regular');
+        assert.equal(runtime.Window_Base.prototype.standardFontSize(), 24);
+        assert.equal(runtime.Yanfly.Param.DefaultFont, 'bitter-pro-regular');
+        assert.equal(runtime.Yanfly.Param.FontSize, 24);
+        assert.equal(runtime.Graphics.fontFace, 'bitter-pro-regular');
+        assert.equal(runtime.Bitmap.prototype.fontFace, 'bitter-pro-regular');
+        assert.equal(runtime.Bitmap.prototype.fontSize, 24);
+});
+
+test('registerLanguageFont is a no-op when the pack has no embedded font', () => {
+        const runtime: any = { Window_Base: { prototype: { standardFontFace() { return 'GameFont'; } } } };
+        const pack: LanguagePack = { table: {}, fontFace: null, fontSize: null, fontFile: null, imgFiles: {}, langName: null, source: null };
+        registerLanguageFont(runtime, pack);
+        // Nothing changed.
+        assert.equal(runtime.Window_Base.prototype.standardFontFace(), 'GameFont');
+});
+
+// === wrapSystemTerms tests =================================================
+
+test('wrapSystemTerms wraps $dataSystem.terms.commands that match sysMenus keys', () => {
+        const language = {
+                sysMenus: { 'New Game': 'Новая Игра', 'Continue': 'Продолжить', 'Options': 'Опции' },
+                sysLabel: {},
+        };
+        const runtime: any = {
+                $dataSystem: {
+                        gameTitle: 'The Coffin of Andy and Leyley',
+                        terms: {
+                                commands: ['Fight', 'Escape', 'Attack', 'Guard', 'Item', 'Skill', 'Equip', 'Status', 'Formation', 'Save', 'Game End', 'Options', 'Weapon', 'Armor', 'Key Item', 'Equip', 'Optimize', 'Clear', 'New Game', 'Continue', null, 'To Title', 'Cancel', null, 'Buy', 'Sell'],
+                                basic: ['Level', 'Lv', 'HP', 'HP'],
+                                params: ['Max HP', 'Max MP'],
+                                messages: { alwaysDash: 'Always Dash', file: 'File' },
+                        },
+                },
+        };
+        wrapSystemTerms(runtime, language);
+        // "New Game" → "(sysMenus)[New Game]", "Continue" → "(sysMenus)[Continue]", "Options" → "(sysMenus)[Options]"
+        assert.equal(runtime.$dataSystem.terms.commands[18], '(sysMenus)[New Game]');
+        assert.equal(runtime.$dataSystem.terms.commands[19], '(sysMenus)[Continue]');
+        assert.equal(runtime.$dataSystem.terms.commands[11], '(sysMenus)[Options]');
+        // Entries without a matching key stay unchanged.
+        assert.equal(runtime.$dataSystem.terms.commands[0], 'Fight');
+        assert.equal(runtime.$dataSystem.terms.commands[10], 'Game End');
+        // null entries stay null.
+        assert.equal(runtime.$dataSystem.terms.commands[20], null);
+});
+
+test('wrapSystemTerms wraps $dataSystem.gameTitle when it matches a sysLabel key', () => {
+        const language = {
+                sysMenus: {},
+                sysLabel: { 'Game': 'Гроб для Энди и Лейли', 'Item': 'Предметы', 'File': 'Файл', 'Save': 'Какой файл перезаписать?', 'Load': 'Какой файл загрузить?' },
+        };
+        const runtime: any = {
+                $dataSystem: { gameTitle: 'The Coffin of Andy and Leyley', terms: { commands: [], messages: { file: 'File', saveMessage: 'Save to which file?', loadMessage: 'Load which file?' } } },
+        };
+        wrapSystemTerms(runtime, language);
+        // gameTitle maps to sysLabel['Game'] (not an exact-match key) → wrapped in (sysLabel)[Game]
+        assert.equal(runtime.$dataSystem.gameTitle, '(sysLabel)[Game]');
+        // "File" message → "(sysLabel)[File]" (exact match)
+        assert.equal(runtime.$dataSystem.terms.messages.file, '(sysLabel)[File]');
+        // saveMessage maps to sysLabel['Save'] (the .cld key is 'Save', not the full prompt)
+        assert.equal(runtime.$dataSystem.terms.messages.saveMessage, '(sysLabel)[Save]');
+        assert.equal(runtime.$dataSystem.terms.messages.loadMessage, '(sysLabel)[Load]');
+});
+
+test('wrapSystemTerms wraps Galv.CRED.titleText (plugin title constant)', () => {
+        const language = { sysMenus: { 'Credits': 'Титры' }, sysLabel: {} };
+        const runtime: any = {
+                $dataSystem: { terms: {} },
+                Galv: { CRED: { titleText: 'Credits' } },
+        };
+        wrapSystemTerms(runtime, language);
+        assert.equal(runtime.Galv.CRED.titleText, '(sysMenus)[Credits]');
+});
+
+test('wrapSystemTerms does NOT wrap strings that have no matching key', () => {
+        const language = { sysMenus: { 'New Game': 'Новая Игра' }, sysLabel: {} };
+        const runtime: any = {
+                $dataSystem: { gameTitle: 'Some Untitled Game', terms: { commands: ['Fight', 'New Game', 'Unknown'], messages: { foo: 'Bar' } } },
+        };
+        wrapSystemTerms(runtime, language);
+        // "Fight" and "Unknown" have no matching key → unchanged.
+        assert.equal(runtime.$dataSystem.terms.commands[0], 'Fight');
+        assert.equal(runtime.$dataSystem.terms.commands[2], 'Unknown');
+        // "New Game" matches → wrapped.
+        assert.equal(runtime.$dataSystem.terms.commands[1], '(sysMenus)[New Game]');
+        // "Bar" has no matching key → unchanged.
+        assert.equal(runtime.$dataSystem.terms.messages.foo, 'Bar');
+        // gameTitle: no sysLabel['Game'] key exists → unchanged.
+        assert.equal(runtime.$dataSystem.gameTitle, 'Some Untitled Game');
+});
+
+test('wrapSystemTerms is a no-op when language is null', () => {
+        const runtime: any = { $dataSystem: { gameTitle: 'Test', terms: { commands: ['New Game'] } } };
+        wrapSystemTerms(runtime, null);
+        assert.equal(runtime.$dataSystem.terms.commands[0], 'New Game');
+        assert.equal(runtime.$dataSystem.gameTitle, 'Test');
+});
+
+test('wrapSystemTerms does not double-wrap already-wrapped escape sequences', () => {
+        const language = { sysMenus: { 'New Game': 'Новая Игра' }, sysLabel: {} };
+        const runtime: any = {
+                $dataSystem: { terms: { commands: ['(sysMenus)[New Game]'] } },
+        };
+        wrapSystemTerms(runtime, language);
+        // Already starts with '(' → not re-wrapped.
+        assert.equal(runtime.$dataSystem.terms.commands[0], '(sysMenus)[New Game]');
+});
+
+test('installGameCompatibility hooks DataManager.onLoad to wrap $dataSystem terms', () => {
+        const language = { sysMenus: { 'New Game': 'Новая Игра' }, sysLabel: {} };
+        let onLoadCalled = false;
+        const runtime: any = {
+                DataManager: { onLoad: (_data: any, name: string) => { onLoadCalled = true; }, setupNewGame() {} },
+                StorageManager: {},
+                Input: {},
+        };
+        installGameCompatibility(runtime, 'sdmc:/game/www', false, language);
+        // The onLoad hook should be installed.
+        assert.ok(runtime.DataManager.__bnxTermsWrap);
+        // Simulate $dataSystem loading.
+        const fakeData = { terms: { commands: ['New Game', 'Fight'] }, gameTitle: 'Test' };
+        runtime.$dataSystem = fakeData;
+        runtime.DataManager.onLoad(fakeData, '$dataSystem');
+        // The terms should now be wrapped.
+        assert.equal(fakeData.terms.commands[0], '(sysMenus)[New Game]');
+        assert.equal(fakeData.terms.commands[1], 'Fight');
+});
+
+test('wrapSystemTerms maps option aliases (Always Dash → Run Always)', () => {
+        // The .cld's sysMenus uses "Run Always" but the game says "Always Dash".
+        // The alias map bridges this: "Always Dash" → wrap in (sysMenus)[Run Always].
+        // Only strings with a corresponding .cld key are aliased; others stay
+        // untranslated (e.g. "BGS Volume" and "ME Volume" have no .cld key).
+        const language = {
+                sysMenus: { 'Run Always': 'Всегда бежать', 'Volume BGM': 'Громкость музыки', 'Volume SFX': 'Громкость звуков' },
+                sysLabel: {},
+        };
+        const runtime: any = {
+                $dataSystem: { gameTitle: 'Test', terms: { commands: [], messages: { alwaysDash: 'Always Dash', bgmVolume: 'BGM Volume', seVolume: 'SE Volume', bgsVolume: 'BGS Volume', meVolume: 'ME Volume' } } },
+        };
+        wrapSystemTerms(runtime, language);
+        // These have aliases → wrapped.
+        assert.equal(runtime.$dataSystem.terms.messages.alwaysDash, '(sysMenus)[Run Always]');
+        assert.equal(runtime.$dataSystem.terms.messages.bgmVolume, '(sysMenus)[Volume BGM]');
+        assert.equal(runtime.$dataSystem.terms.messages.seVolume, '(sysMenus)[Volume SFX]');
+        // These have NO alias (no .cld key) → stay untranslated (NOT "Volume BGM").
+        assert.equal(runtime.$dataSystem.terms.messages.bgsVolume, 'BGS Volume');
+        assert.equal(runtime.$dataSystem.terms.messages.meVolume, 'ME Volume');
+        // translate() converts the wrapped ones.
+        assert.equal(translate(runtime.$dataSystem.terms.messages.alwaysDash, language), 'Всегда бежать');
+        assert.equal(translate(runtime.$dataSystem.terms.messages.bgmVolume, language), 'Громкость музыки');
+        assert.equal(translate(runtime.$dataSystem.terms.messages.seVolume, language), 'Громкость звуков');
+});
+
+test('wrapSystemTerms alias only applies when the target sysMenus key exists', () => {
+        // "Always Dash" has an alias to "Run Always", but if the .cld has no
+        // "Run Always" key, the alias is not applied (string stays unchanged).
+        const language = { sysMenus: { 'New Game': 'Новая Игра' }, sysLabel: {} };
+        const runtime: any = {
+                $dataSystem: { gameTitle: 'Test', terms: { commands: [], messages: { alwaysDash: 'Always Dash' } } },
+        };
+        wrapSystemTerms(runtime, language);
+        assert.equal(runtime.$dataSystem.terms.messages.alwaysDash, 'Always Dash'); // unchanged
+});
+
+test('installGameCompatibility hooks Window_Options.booleanStatusText to wrap On/Off', () => {
+        const language = { sysMenus: { 'On': 'Вкл.', 'Off': 'Выкл.' }, sysLabel: {} };
+        const runtime: any = {
+                Window_Options: { prototype: { booleanStatusText(value: boolean) { return value ? 'ON' : 'OFF'; } } },
+                StorageManager: {},
+                Input: {},
+                DataManager: { setupNewGame() {} },
+        };
+        installGameCompatibility(runtime, 'sdmc:/game/www', false, language);
+        const proto = runtime.Window_Options.prototype;
+        // booleanStatusText now returns escape sequences.
+        assert.equal(proto.booleanStatusText(true), '(sysMenus)[On]');
+        assert.equal(proto.booleanStatusText(false), '(sysMenus)[Off]');
+        // translate() converts them.
+        assert.equal(translate(proto.booleanStatusText(true), language), 'Вкл.');
+        assert.equal(translate(proto.booleanStatusText(false), language), 'Выкл.');
+});
+
+test('PauseMenu.languageCycle is set by Left/Right on the Language item', () => {
+        const menu = new PauseMenu(false);
+        const buttons = (id: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === id }));
+        // Open the pause menu (hold Minus).
+        menu.step(buttons(8), 0); menu.step(buttons(8), 1000);
+        assert.ok(menu.open);
+        // Navigate to "Another" (page 1, index 4) and press A → page 2.
+        menu.selected = 4;
+        menu.step(buttons(1), 1001);
+        assert.equal(menu.page, 2);
+        // The Language item is on page 2. Find its index.
+        const langIdx = menu.currentItems.indexOf('language');
+        assert.ok(langIdx >= 0);
+        menu.selected = langIdx;
+        // Press Right → languageCycle = +1.
+        menu.step(null, 1002); // release
+        menu.step(buttons(15), 1003); // Right edge
+        assert.equal(menu.languageCycle, 1);
+        // Press Left → languageCycle = -1.
+        menu.step(null, 1004);
+        menu.step(buttons(14), 1005); // Left edge
+        assert.equal(menu.languageCycle, -1);
+        // No Left/Right → languageCycle = 0.
+        menu.step(null, 1006);
+        menu.step(null, 1007);
+        assert.equal(menu.languageCycle, 0);
+});
+
 

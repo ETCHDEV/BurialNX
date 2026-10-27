@@ -71,10 +71,12 @@ export const BURIALNX_NRO_PATH = 'sdmc:/switch/burialnx/burialnx.nro';
 export const BURIALNX_DEBUG_NRO_PATH = 'sdmc:/switch/burialnx/burialnx-debug.nro';
 
 /** Sanitize a game name for use as a folder/filename. Keeps only
- *  alphanumeric, dash, underscore, and space characters. Truncates to
- *  40 chars. If the result is empty, falls back to the game id. */
+ *  alphanumeric, dash, and underscore characters — SPACES ARE REPLACED
+ *  WITH UNDERSCORES because the Switch homebrew menu (hbmenu) and the
+ *  NRO launching mechanism can fail to handle paths containing spaces.
+ *  Truncates to 40 chars. If the result is empty, falls back to the game id. */
 export function sanitizeGameName(name: string, fallback: string): string {
-        const cleaned = name.replace(/[^a-zA-Z0-9 \-_]/g, '').trim().slice(0, 40);
+        const cleaned = name.replace(/[^a-zA-Z0-9 \-_]/g, '').replace(/ /g, '_').trim().slice(0, 40);
         return cleaned || fallback;
 }
 
@@ -742,14 +744,81 @@ export function forwarderExists(fs: LibraryAccess, gameName: string, gameId: str
         try { return fs.statSync(forwarderPathFor(gameName, gameId)) != null; } catch { return false; }
 }
 
-/** Delete a forwarder .nro. Best-effort: a missing file is not an error.
- *  Returns true if the file was deleted. */
-export function deleteForwarder(fs: LibraryAccess & { removeSync?: (path: string) => void; unlinkSync?: (path: string) => void }, gameName: string, gameId: string): boolean {
+/** Rename a forwarder's folder and .nro file when the game is renamed.
+ *  The forwarder path is derived from the sanitized game name, so renaming
+ *  the game changes the path. This function:
+ *  1. Checks if a forwarder exists at the OLD name's path.
+ *  2. Creates the NEW name's directory.
+ *  3. Copies the .nro file from old path to new path.
+ *  4. Deletes the old .nro, old folder, and any leftover files.
+ *  Returns true if the forwarder was renamed, false if no forwarder existed. */
+export function renameForwarder(fs: LibraryAccess & { removeSync?: (path: string) => void; unlinkSync?: (path: string) => void; rmdirSync?: (path: string) => void; readFileSync?: (path: string) => ArrayBuffer | null }, oldName: string, newName: string, gameId: string): boolean {
+        const oldPath = forwarderPathFor(oldName, gameId);
+        const newDir = forwarderDirFor(newName, gameId);
+        const newPath = forwarderPathFor(newName, gameId);
+        const oldDir = forwarderDirFor(oldName, gameId);
+        // Check if the old forwarder exists.
+        try { if (!fs.statSync(oldPath)) return false; } catch { return false; }
+        // Read the old .nro bytes.
+        let nroBytes: ArrayBuffer | null = null;
+        try { nroBytes = fs.readFileSync?.(oldPath) ?? null; } catch { return false; }
+        if (!nroBytes) return false;
+        // Create the new directory.
+        try { fs.mkdirSync(newDir); } catch { /* may already exist */ }
+        // Write the .nro to the new path.
+        try { fs.writeFileSync(newPath, nroBytes); } catch { return false; }
+        // Delete the old forwarder (file + folder).
+        const remove = fs.removeSync || fs.unlinkSync;
+        if (remove) {
+                try { remove.call(fs, oldPath); } catch { /* best-effort */ }
+                try {
+                        const entries = (fs as any).readDirSync?.(`${oldDir}/`) as string[] | null;
+                        if (entries) {
+                                for (const name of entries) {
+                                        if (name && name !== '.' && name !== '..') {
+                                                try { remove.call(fs, `${oldDir}/${name}`); } catch { /* best-effort */ }
+                                        }
+                                }
+                        }
+                } catch { /* unreadable */ }
+                try { (fs as any).rmdirSync?.(oldDir); } catch { /* try next */ }
+                try { (fs as any).removeSync?.(oldDir); } catch { /* try next */ }
+                try { (fs as any).unlinkSync?.(oldDir); } catch { /* not supported */ }
+        }
+        return true;
+}
+
+/** Delete a forwarder .nro AND its containing folder. Best-effort: a missing
+ *  file/folder is not an error. Returns true if the .nro file was deleted.
+ *  The folder (sdmc:/switch/<sanitized-name>/) is also removed so it doesn't
+ *  leave behind empty dirs or log files after the forwarder is gone.
+ *  Tries rmdirSync, removeSync, and unlinkSync for the directory (nx.js may
+ *  support any of these for directory removal). */
+export function deleteForwarder(fs: LibraryAccess & { removeSync?: (path: string) => void; unlinkSync?: (path: string) => void; rmdirSync?: (path: string) => void }, gameName: string, gameId: string): boolean {
         const nroPath = forwarderPathFor(gameName, gameId);
+        const dir = forwarderDirFor(gameName, gameId);
         const remove = fs.removeSync || fs.unlinkSync;
         if (!remove) return false;
+        let deleted = false;
         try {
-                if (fs.statSync(nroPath)) { remove.call(fs, nroPath); return true; }
+                if (fs.statSync(nroPath)) { remove.call(fs, nroPath); deleted = true; }
         } catch { /* not present */ }
-        return false;
+        // Also delete the containing folder (and any leftover files like logs).
+        // First remove all files in the folder, then remove the folder itself.
+        try {
+                const entries = (fs as any).readDirSync?.(`${dir}/`) as string[] | null;
+                if (entries) {
+                        for (const name of entries) {
+                                if (name && name !== '.' && name !== '..') {
+                                        try { remove.call(fs, `${dir}/${name}`); } catch { /* best-effort */ }
+                                }
+                        }
+                }
+        } catch { /* unreadable */ }
+        // Try to remove the directory itself. nx.js may expose rmdirSync,
+        // removeSync (for dirs), or neither — try all available options.
+        try { (fs as any).rmdirSync?.(dir); } catch { /* try next */ }
+        try { (fs as any).removeSync?.(dir); } catch { /* try next */ }
+        try { (fs as any).unlinkSync?.(dir); } catch { /* may not be supported */ }
+        return deleted;
 }

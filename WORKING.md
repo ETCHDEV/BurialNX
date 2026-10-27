@@ -201,6 +201,23 @@ understand and test each difference:
   safety measure until that scene can be reliably supported on Switch.
 - The game's own language table and fonts are read from the selected game.
   In-memory asset decoding and hashed-path lookup support its file layout.
+  In addition, the loader scans the game's `languages/` folder (and one level
+  above `www/`) for `.cld` language packs. A `.cld` is a `LANGDATA`-prefixed
+  JSON blob with translation tables (`sysLabel`, `sysMenus`, `labelLUT`,
+  `linesLUT`), an embedded base64 font (`fontFile` + `fontFace` + `fontSize`),
+  and translated images (`imgFiles`: hashed asset path → base64 PNG). When a
+  pack is found it is loaded INSTEAD of the default English data embedded in
+  `data/9c7050ae76645487`; the embedded font is registered as a `FontFace`
+  and `Window_Base.standardFontFace`/`standardFontSize` (and the Yanfly
+  `Param.DefaultFont`/`Param.FontSize`, `Graphics.fontFace`, and
+  `Bitmap.prototype.fontFace`/`fontSize`) are overridden to the pack's values;
+  and the asset reader is wrapped so `imgFiles` paths return the decoded
+  replacement images instead of reading the originals from the SD card. The
+  choice is persisted per-game under `localStorage` key
+  `burialnx-lang:<game-root>` and can be cycled from the pause menu
+  (hold Minus → "Another..." → Language). Russian (`ru.cld`) is the primary
+  target and is preferred when no saved choice exists; the default English
+  data is always the fallback when no `.cld` is readable.
 - Switch buttons map to RPG Maker input. Audio panning and asynchronous audio
   decoding are adapted to the nx.js APIs.
 - Local save keys preserve the earlier loader's shared or path-specific

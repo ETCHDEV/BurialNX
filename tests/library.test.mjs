@@ -272,3 +272,59 @@ test('extractExeIcon returns null for a non-PE buffer', async () => {
   new Uint8Array(buf).fill(0);
   assert.equal(m.extractExeIcon(buf), null);
 });
+
+test('parseLibrary loads the per-game language preference', async () => {
+  const lib = await loadLibraryModule();
+  const data = { version: 1, games: [
+    { id: 'g1', name: 'Game', root: 'sdmc:/games/a', sharedSaves: false, language: 'ru' },
+    { id: 'g2', name: 'Game2', root: 'sdmc:/games/b', sharedSaves: false, language: '' },
+    { id: 'g3', name: 'Game3', root: 'sdmc:/games/c', sharedSaves: false },
+  ] };
+  const parsed = lib.parseLibrary(JSON.stringify(data));
+  assert.equal(parsed.games[0].language, 'ru', 'g1 language = ru');
+  assert.equal(parsed.games[1].language, '', 'g2 language = "" (explicit English)');
+  assert.equal(parsed.games[2].language, undefined, 'g3 language = undefined (no preference)');
+});
+
+test('upsertGame preserves and updates the language field', async () => {
+  const lib = await loadLibraryModule();
+  const fs = memoryFs();
+  let file = lib.loadLibrary(fs);
+  file = lib.upsertGame(fs, file, { id: 'g1', name: 'Game', root: 'sdmc:/games/a', sharedSaves: false, language: 'ru' });
+  assert.equal(file.games[0].language, 'ru', 'language saved as ru');
+  // Update with a different language
+  file = lib.upsertGame(fs, file, { id: 'g1', name: 'Game', root: 'sdmc:/games/a', sharedSaves: false, language: '' });
+  assert.equal(file.games[0].language, '', 'language updated to "" (English)');
+  // Reload from disk to verify persistence
+  const reloaded = lib.loadLibrary(fs);
+  assert.equal(reloaded.games[0].language, '', 'language persisted to disk as ""');
+});
+
+test('moveGame swaps adjacent games and persists order to disk', async () => {
+  const lib = await loadLibraryModule();
+  const fs = memoryFs();
+  let file = lib.loadLibrary(fs);
+  file = lib.upsertGame(fs, file, { id: 'g1', name: 'Game A', root: 'sdmc:/games/a', sharedSaves: false });
+  file = lib.upsertGame(fs, file, { id: 'g2', name: 'Game B', root: 'sdmc:/games/b', sharedSaves: false });
+  file = lib.upsertGame(fs, file, { id: 'g3', name: 'Game C', root: 'sdmc:/games/c', sharedSaves: false });
+  // Initial order: A, B, C
+  assert.equal(file.games.map(g => g.id).join(','), 'g1,g2,g3');
+  // Move g1 down → B, A, C
+  file = lib.moveGame(fs, file, 'g1', 1);
+  assert.equal(file.games.map(g => g.id).join(','), 'g2,g1,g3');
+  // Move g3 up → B, C, A
+  file = lib.moveGame(fs, file, 'g3', -1);
+  assert.equal(file.games.map(g => g.id).join(','), 'g2,g3,g1');
+  // Persisted to disk
+  const reloaded = lib.loadLibrary(fs);
+  assert.equal(reloaded.games.map(g => g.id).join(','), 'g2,g3,g1');
+  // Boundary: moving first game up is a no-op
+  file = lib.moveGame(fs, file, 'g2', -1);
+  assert.equal(file.games.map(g => g.id).join(','), 'g2,g3,g1');
+  // Boundary: moving last game down is a no-op
+  file = lib.moveGame(fs, file, 'g1', 1);
+  assert.equal(file.games.map(g => g.id).join(','), 'g2,g3,g1');
+  // Non-existent id is a no-op
+  file = lib.moveGame(fs, file, 'nonexistent', 1);
+  assert.equal(file.games.map(g => g.id).join(','), 'g2,g3,g1');
+});

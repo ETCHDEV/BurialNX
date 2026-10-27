@@ -93,12 +93,254 @@ export function stripTopLevelUseStrict(source: string): string {
 
 type Language = Record<string, Record<string, string | string[]>>;
 
-export async function languageTable(assets: Reader): Promise<Language | null> {
-        const data = await assets.read('data/9c7050ae76645487');
-        if (!data) return null;
-        const text = new TextDecoder().decode(data);
+/**
+ * A fully-decoded language pack. The base `Language` type holds the translation
+ * tables used by translate(); this wrapper carries the extra metadata embedded
+ * in a `.cld` pack (font + translated images) so the loader can register them.
+ */
+export interface LanguagePack {
+        table: Language;
+        /** Logical font-family name to use for this language (e.g. 'bitter-pro-regular'). */
+        fontFace: string | null;
+        /** Font size in pixels to use for this language (e.g. 24 for Russian vs 28 English). */
+        fontSize: number | null;
+        /** Base64-encoded font file (TTF/OTF/WOFF) embedded in the .cld, or null. */
+        fontFile: string | null;
+        /** Map of hashed asset path → base64-encoded replacement image (PNG). */
+        imgFiles: Record<string, string>;
+        /** Human-readable language name (e.g. 'Русский'). */
+        langName: string | null;
+        /** The asset path this pack was loaded from, for diagnostics. */
+        source: string | null;
+}
+
+/** Parse a LANGDATA blob (from data/<hash> or languages/<code>.cld) into a LanguagePack. */
+export function parseLanguagePack(bytes: ArrayBuffer, source: string | null): LanguagePack {
+        const text = new TextDecoder().decode(bytes);
         if (!text.startsWith('LANGDATA')) throw new Error('Unsupported language data');
-        return JSON.parse(text.slice(8));
+        const raw = JSON.parse(text.slice(8)) as Record<string, unknown>;
+        // Extract the tables translate() actually reads; keep the rest as raw metadata.
+        const table: Language = {};
+        for (const key of ['linesLUT', 'labelLUT', 'sysLabel', 'sysMenus'] as const) {
+                const value = raw[key];
+                if (value && typeof value === 'object') (table as any)[key] = value;
+        }
+        const fontFace = typeof raw.fontFace === 'string' ? raw.fontFace : null;
+        const fontSize = typeof raw.fontSize === 'number' ? raw.fontSize : null;
+        const fontFile = typeof raw.fontFile === 'string' && raw.fontFile.length > 0 ? raw.fontFile : null;
+        const langName = typeof raw.langName === 'string' ? raw.langName : null;
+        const imgFiles = (raw.imgFiles && typeof raw.imgFiles === 'object' ? raw.imgFiles : {}) as Record<string, string>;
+        return { table, fontFace, fontSize, fontFile, imgFiles, langName, source };
+}
+
+/** The hashed asset path of the default (English) language data embedded in data/. */
+const DEFAULT_LANGUAGE_PATH = 'data/9c7050ae76645487';
+
+/**
+ * Load the default (English) language table. Kept for backward compatibility with
+ * tests and callers that only need the translation tables. Prefer loadLanguagePack().
+ */
+export async function languageTable(assets: Reader): Promise<Language | null> {
+        const data = await assets.read(DEFAULT_LANGUAGE_PATH);
+        if (!data) return null;
+        return parseLanguagePack(data, null).table;
+}
+
+/**
+ * Load a language pack from a `.cld` file. Falls back to the default English data
+ * embedded in data/ when the requested pack cannot be read. Always returns a pack
+ * (never null) when the default exists; returns null only if neither the requested
+ * pack nor the default could be read.
+ */
+export async function loadLanguagePack(assets: Reader, cldPath: string | null): Promise<LanguagePack | null> {
+        if (cldPath) {
+                const bytes = await assets.read(cldPath);
+                if (bytes) {
+                        try { return parseLanguagePack(bytes, cldPath); }
+                        catch { /* fall through to default */ }
+                }
+        }
+        const fallback = await assets.read(DEFAULT_LANGUAGE_PATH);
+        if (!fallback) return null;
+        return parseLanguagePack(fallback, DEFAULT_LANGUAGE_PATH);
+}
+
+/** A minimal Switch filesystem surface for scanning language folders. */
+export interface LanguageScanFs {
+        readDirSync?(path: string): string[] | null;
+        statSync?(path: string): { mode: number } | null;
+}
+
+export interface LanguageEntry {
+        /** Asset path suitable for `assets.read()` — relative to the game www root. Only set when the pack lives inside www (no `..`). */
+        path: string | null;
+        /** Absolute sdmc path for direct Switch.readFile() — always set. Used when the pack lives one level above www (assetPath rejects `..`). */
+        absPath: string;
+        /** Short code derived from the filename, e.g. 'ru' for 'ru.cld'. */
+        code: string;
+        /** Human-readable name decoded from the pack's langName, or the code. */
+        name: string;
+}
+
+/**
+ * Scan the `languages/` folder (and one level above the www root as a fallback)
+ * for `.cld` language packs. Returns entries sorted by code. The www-relative
+ * path is preferred because RPG Maker MV games ship languages there; the parent
+ * folder is checked because some builds place `languages/` next to the exe.
+ */
+export function scanLanguageFiles(fs: LanguageScanFs | null, gameRoot: string): LanguageEntry[] {
+        if (!fs?.readDirSync) return [];
+        const clean = gameRoot.replace(/\/+$/, '');
+        // The game root is the www folder. languages/ may be inside it, or one level up.
+        const candidates = [
+                { dir: `${clean}/languages`, relBase: 'languages', parent: false },
+                { dir: `${clean.replace(/\/www$/i, '')}/languages`, relBase: '../languages', parent: true },
+        ];
+        const seen = new Set<string>();
+        const entries: LanguageEntry[] = [];
+        for (const { dir, relBase, parent } of candidates) {
+                let names: string[] | null = null;
+                try { names = fs.readDirSync!(`${dir}/`); } catch { /* unreadable */ }
+                if (!names) continue;
+                for (const name of names) {
+                        if (!name || !/\.cld$/i.test(name)) continue;
+                        const code = name.replace(/\.cld$/i, '').toLowerCase();
+                        if (seen.has(code)) continue;
+                        seen.add(code);
+                        // For in-www languages, path is a relative asset path the Reader accepts.
+                        // For parent-folder languages, path is null (assetPath rejects `..`); callers read via absPath.
+                        const path = parent ? null : `${relBase}/${name}`;
+                        const absPath = `${dir}/${name}`;
+                        entries.push({ path, absPath, code, name: code });
+                }
+        }
+        // Sort by code for deterministic ordering. 'ru' (Russian) is the primary
+        // target language for this game; keep it first if present.
+        entries.sort((a, b) => (a.code === 'ru' ? -1 : b.code === 'ru' ? 1 : a.code.localeCompare(b.code)));
+        return entries;
+}
+
+/**
+ * Best-effort lookup of a human-readable name for a language pack by peeking at
+ * its `langName` field. Used so the scan results can show 'Русский' instead of 'ru'.
+ * Falls back to the code if the pack can't be read or parsed.
+ */
+export async function resolveLanguageName(assets: Reader, entry: LanguageEntry): Promise<string> {
+        const bytes = await assets.read(entry.path);
+        if (!bytes) return entry.code;
+        try {
+                const text = new TextDecoder().decode(bytes);
+                if (!text.startsWith('LANGDATA')) return entry.code;
+                const raw = JSON.parse(text.slice(8)) as Record<string, unknown>;
+                return typeof raw.langName === 'string' && raw.langName ? raw.langName : entry.code;
+        } catch { return entry.code; }
+}
+
+/** Decode a base64 string into an ArrayBuffer (used for embedded fonts/images). */
+function decodeBase64(base64: string): ArrayBuffer {
+        // Use atob when available (Switch runtime + tests); fall back to manual decode.
+        const clean = base64.replace(/\s+/g, '');
+        if (typeof atob === 'function') {
+                const binary = atob(clean);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                return bytes.buffer;
+        }
+        // Manual decode path (no atob).
+        const lookup = new Int8Array(128).fill(-1);
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+        const out: number[] = [];
+        let buffer = 0, bits = 0;
+        for (let i = 0; i < clean.length; i++) {
+                const c = clean.charCodeAt(i);
+                if (c >= 128) continue;
+                const v = lookup[c];
+                if (v < 0) { if (c === 61 /* = */) break; continue; }
+                buffer = (buffer << 6) | v;
+                bits += 6;
+                if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff); }
+        }
+        return new Uint8Array(out).buffer;
+}
+
+/**
+ * Register the font embedded in a language pack (if any) and override RPG Maker
+ * MV's font selection so the game actually uses it. The .cld's fontFile is a
+ * base64-encoded TTF/OTF/WOFF; we decode it, create a FontFace, and add it to the
+ * runtime font set. We also override Window_Base.standardFontFace and
+ * standardFontSize (and Yanfly's YEP_CoreEngine override of the same) so every
+ * window and bitmap draws with this language's font instead of GameFont.
+ */
+export function registerLanguageFont(runtime: any, pack: LanguagePack): void {
+        const face = pack.fontFace;
+        const size = pack.fontSize;
+        if (face && pack.fontFile) {
+                try {
+                        const bytes = decodeBase64(pack.fontFile);
+                        if (runtime.FontFace && runtime.fonts?.add) {
+                                runtime.fonts.add(new runtime.FontFace(face, bytes));
+                        }
+                } catch { /* best-effort: fall back to default font */ }
+        }
+        if (face) {
+                const base = runtime.Window_Base?.prototype;
+                if (base && typeof base.standardFontFace === 'function') {
+                        base.standardFontFace = function() { return face; };
+                }
+                // Yanfly's YEP_CoreEngine replaces standardFontFace to read Yanfly.Param.DefaultFont.
+                // Override that parameter so the YEP path also picks up the language font.
+                if (runtime.Yanfly?.Param) runtime.Yanfly.Param.DefaultFont = face;
+                // Graphics.fontFace is the Bitmap default; set it so raw Bitmap draws match.
+                if (runtime.Graphics) runtime.Graphics.fontFace = face;
+                // Bitmap's constructor default is 'GameFont'; update the prototype property too.
+                if (runtime.Bitmap?.prototype) runtime.Bitmap.prototype.fontFace = face;
+        }
+        if (size) {
+                const base = runtime.Window_Base?.prototype;
+                if (base && typeof base.standardFontSize === 'function') {
+                        base.standardFontSize = function() { return size; };
+                }
+                if (runtime.Yanfly?.Param) runtime.Yanfly.Param.FontSize = size;
+                if (runtime.Bitmap?.prototype) runtime.Bitmap.prototype.fontSize = size;
+        }
+}
+
+/**
+ * Wrap a Reader so that paths listed in the language pack's `imgFiles` return the
+ * base64-decoded replacement image instead of reading from disk. This applies
+ * translated parallaxes, title art, and any other localized images. Paths not in
+ * the pack fall through to the base reader unchanged.
+ */
+export function withLanguageImages(base: Reader, pack: LanguagePack): Reader {
+        const entries = Object.entries(pack.imgFiles);
+        if (!entries.length) return base;
+        // Pre-decode images lazily (the Russian pack has 44 images; decoding all
+        // upfront would spike memory). Cache the decoded buffer per path.
+        const cache = new Map<string, ArrayBuffer>();
+        const decode = (key: string): ArrayBuffer | null => {
+                const cached = cache.get(key);
+                if (cached) return cached;
+                try {
+                        const bytes = decodeBase64(pack.imgFiles[key]);
+                        cache.set(key, bytes);
+                        return bytes;
+                } catch { return null; }
+        };
+        return {
+                async read(path: string): Promise<ArrayBuffer | null> {
+                        const direct = pack.imgFiles[path];
+                        if (direct) { const decoded = decode(path); if (decoded) return decoded; }
+                        // imgFiles keys may omit extensions or use a hashed path that the
+                        // request normalizes; try a few close matches.
+                        if (path) {
+                                const noExt = path.replace(/\.[^/.]+$/, '');
+                                const viaNoExt = pack.imgFiles[noExt];
+                                if (viaNoExt) { const decoded = decode(noExt); if (decoded) return decoded; }
+                        }
+                        return base.read(path);
+                },
+        };
 }
 
 // Hoisted constants for translate() — avoid per-call allocation of the names
@@ -132,6 +374,94 @@ export async function registerFonts(assets: Reader, runtime: any): Promise<void>
                 if (!bytes) continue;
                 for (const face of [{}, { weight: 'bold' }, { style: 'italic' }, { style: 'italic', weight: 'bold' }]) {
                         runtime.fonts.add(new runtime.FontFace(family, bytes, face));
+                }
+        }
+}
+
+/**
+ * Wrap the game's plain-English system text (terms, plugin title strings) in
+ * translate() escape sequences so the loaded language pack can convert them.
+ *
+ * The game's $dataSystem.terms (commands, basic, params, messages) and plugin
+ * constants (e.g. Galv.CRED.titleText = "Credits") hold raw English strings.
+ * The .cld's sysMenus/sysLabel tables map those English keys to translations,
+ * but translate() only fires on `(sysMenus)[key]` / `(sysLabel)[key]` escape
+ * sequences. On PC the game's obfuscated language loader wraps these strings;
+ * BurialNX replicates that by wrapping every term that has a matching table key.
+ *
+ * Only strings whose value EXACTLY matches a table key are wrapped, so terms
+ * without a translation are left untouched (no ugly "(sysMenus)[...]" shown).
+ *
+ * This must run AFTER $dataSystem is loaded (DataManager.onLoad) and AFTER any
+ * plugin that sets title-text constants (i.e. after all scripts are evaluated).
+ */
+export function wrapSystemTerms(runtime: any, language: Language | null): void {
+        if (!language) return;
+        const sysMenus = language.sysMenus as Record<string, string | string[]> | undefined;
+        const sysLabel = language.sysLabel as Record<string, string | string[]> | undefined;
+        // The .cld's sysMenus keys don't always match the game's standard RPG Maker
+        // MV text. For example, the game's option label is "Always Dash" but the .cld
+        // uses "Run Always". This map bridges the gap: when a game string has no
+        // direct sysMenus/sysLabel key, check if a known alias exists.
+        const OPTION_ALIASES: Record<string, string> = {
+                'Always Dash': 'Run Always',
+                'BGM Volume': 'Volume BGM',
+                'SE Volume': 'Volume SFX',
+        };
+        const wrap = (value: unknown): unknown => {
+                if (typeof value !== 'string' || !value) return value;
+                if (value.startsWith('(')) return value; // already wrapped
+                if (sysMenus && sysMenus[value] !== undefined) return `(sysMenus)[${value}]`;
+                if (sysLabel && sysLabel[value] !== undefined) return `(sysLabel)[${value}]`;
+                // Try alias mapping: "Always Dash" → check sysMenus["Run Always"]
+                const alias = OPTION_ALIASES[value];
+                if (alias && sysMenus && sysMenus[alias] !== undefined) return `(sysMenus)[${alias}]`;
+                return value;
+        };
+        const wrapArray = (arr: unknown[] | undefined): void => {
+                if (!Array.isArray(arr)) return;
+                for (let i = 0; i < arr.length; i++) arr[i] = wrap(arr[i]);
+        };
+        const wrapObject = (obj: Record<string, unknown> | undefined): void => {
+                if (!obj || typeof obj !== 'object') return;
+                for (const key of Object.keys(obj)) obj[key] = wrap(obj[key]);
+        };
+        // 1. $dataSystem.terms (commands, basic, params, messages) — the main
+        //    source of menu/window text in RPG Maker MV.
+        const system = runtime.$dataSystem;
+        if (system?.terms) {
+                wrapArray(system.terms.commands);
+                wrapArray(system.terms.basic);
+                wrapArray(system.terms.params);
+                wrapObject(system.terms.messages);
+        }
+        // 2. $dataSystem.gameTitle — the .cld's sysLabel['Game'] holds the translated
+        //    game title (e.g. "Гроб для Энди и Лейли"). The English gameTitle is NOT the
+        //    key "Game"; the game's own language loader maps gameTitle → sysLabel['Game'].
+        //    Replicate that by wrapping the title in (sysLabel)[Game] unconditionally.
+        if (typeof system?.gameTitle === 'string' && system.gameTitle && sysLabel && sysLabel['Game'] !== undefined && !system.gameTitle.startsWith('(')) {
+                system.gameTitle = `(sysLabel)[Game]`;
+        }
+        // 3. The save/load prompts. The game's terms.messages.saveMessage is
+        //    "Save to which file?" but the .cld's sysLabel['Save'] = "Какой файл
+        //    перезаписать?" — the key 'Save' maps to the save prompt, not the raw
+        //    message text. Map them explicitly (same for Load).
+        if (system?.terms?.messages) {
+                const msgs = system.terms.messages;
+                if (typeof msgs.saveMessage === 'string' && msgs.saveMessage && !msgs.saveMessage.startsWith('(') && sysLabel && sysLabel['Save'] !== undefined) {
+                        msgs.saveMessage = `(sysLabel)[Save]`;
+                }
+                if (typeof msgs.loadMessage === 'string' && msgs.loadMessage && !msgs.loadMessage.startsWith('(') && sysLabel && sysLabel['Load'] !== undefined) {
+                        msgs.loadMessage = `(sysLabel)[Load]`;
+                }
+        }
+        // 4. Plugin title-text constants. Galv.CRED.titleText = "Credits" → sysMenus['Credits'].
+        const galv = runtime.Galv?.CRED;
+        if (galv && typeof galv.titleText === 'string') {
+                const wrapped = wrap(galv.titleText);
+                if (wrapped !== galv.titleText) {
+                        try { galv.titleText = wrapped; }
+                        catch { /* read-only; best-effort */ }
                 }
         }
 }
@@ -233,6 +563,28 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
         // The game's skipped desktop helper provides autoSave(). Keep its recovery
         // snapshot separate from ordinary slots so it cannot overwrite the player.
         const manager = runtime.DataManager;
+        // Wrap the game's system text (terms, gameTitle, plugin constants) in
+        // translate() escape sequences so the loaded language pack can convert
+        // the title-menu commands, item/skill names, save/load prompts, etc.
+        // This runs once now (for plugin constants like Galv.CRED.titleText that
+        // were set during script evaluation) and again when $dataSystem loads.
+        // Wrapped in try/catch so a translation failure never crashes the game.
+        try { wrapSystemTerms(runtime, language); } catch { /* best-effort */ }
+        if (manager && typeof manager.onLoad === 'function' && !manager.__bnxTermsWrap) {
+                const onLoad = manager.onLoad;
+                manager.__bnxTermsWrap = true;
+                manager.onLoad = function(data: any, name: string) {
+                        const result = onLoad.apply(this, arguments);
+                        // $dataSystem carries the terms (commands/basic/params/messages)
+                        // and gameTitle. Wrap them now so the title-menu and every window
+                        // that reads TextManager sees the escape sequences translate() hooks.
+                        if (name === '$dataSystem' || (data === runtime.$dataSystem && data?.terms)) {
+                                try { wrapSystemTerms(runtime, language); }
+                                catch { /* best-effort: untranslated text is not fatal */ }
+                        }
+                        return result;
+                };
+        }
         if (manager?.setupNewGame) {
                 const setup = manager.setupNewGame;
                 manager.setupNewGame = function() {
@@ -262,6 +614,19 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         const original = prototype?.[method];
                         if (typeof original === 'function') prototype[method] = function(text: unknown, ...rest: unknown[]) {
                                 return original.call(this, typeof text === 'string' ? translate(text, language) : text, ...rest);
+                        };
+                }
+                // RPG Maker MV's Window_Options.booleanStatusText returns 'ON'/'OFF'
+                // (hardcoded uppercase). The .cld's sysMenus has 'On'/'Off' keys → wrap
+                // them in escape sequences so translate() converts them (e.g. 'ON' →
+                // '(sysMenus)[On]' → 'Вкл.'). The translate() hook on drawText then
+                // converts them when the option status is drawn.
+                const options = runtime.Window_Options?.prototype;
+                if (options && typeof options.booleanStatusText === 'function') {
+                        const langMenus = language.sysMenus as Record<string, string | string[]> | undefined;
+                        options.booleanStatusText = function(value: boolean) {
+                                const raw = value ? 'On' : 'Off';
+                                return langMenus && langMenus[raw] !== undefined ? `(sysMenus)[${raw}]` : (value ? 'ON' : 'OFF');
                         };
                 }
         }

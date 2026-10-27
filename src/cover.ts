@@ -18,7 +18,7 @@ import { normalizePngTo8bitRgba } from './png-normalize';
  */
 
 const COVERS_DIR = 'sdmc:/switch/burialnx/covers';
-const COVER_EXTS = ['png', 'jpg', 'jpeg', 'ico', 'exe'];
+const COVER_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'exe'];
 
 export function coverPathFor(id: string): string { return `${COVERS_DIR}/${id}.png`; }
 
@@ -60,7 +60,7 @@ export function decodeCoverSource(fs: LibraryAccess, path: string): ArrayBuffer 
         let bytes: ArrayBuffer | null = null;
         try { bytes = fs.readFileSync(path); } catch { return null; }
         if (!bytes) return null;
-        if (ext === 'png' || ext === 'jpg' || ext === 'jpeg') return bytes;
+        if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'gif' || ext === 'webp') return bytes;
         if (ext === 'ico') return extractIco(bytes);
         if (ext === 'exe') return extractExeIcon(bytes);
         return null;
@@ -77,7 +77,7 @@ export function decodeCoverSourceLogged(fs: LibraryAccess, path: string, log: (s
         try { bytes = fs.readFileSync(path); } catch (error) { log(`Cover decode: readFileSync failed: ${error instanceof Error ? error.message : String(error)}`); return null; }
         if (!bytes) { log('Cover decode: readFileSync returned null'); return null; }
         log(`Cover decode: ${bytes.byteLength} bytes read`);
-        if (ext === 'png' || ext === 'jpg' || ext === 'jpeg') { log('Cover decode: passthrough'); return bytes; }
+        if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'gif' || ext === 'webp') { log('Cover decode: passthrough'); return bytes; }
         if (ext === 'ico') { const png = extractIco(bytes); log(`Cover decode: extractIco -> ${png ? png.byteLength : 'null'} bytes`); return png; }
         if (ext === 'exe') { const png = extractExeIcon(bytes); log(`Cover decode: extractExeIcon -> ${png ? png.byteLength : 'null'} bytes`); return png; }
         log(`Cover decode: unsupported extension ${ext}`);

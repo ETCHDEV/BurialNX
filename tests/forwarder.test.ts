@@ -224,11 +224,14 @@ test('decode then re-encode then decode produces the same section offsets', asyn
         assert.deepEqual(Array.from(new Uint8Array(rebuilt.buffer, s2.romfsOffset, s2.romfsSize)), Array.from(romfs));
 });
 
-test('forwarderPathFor produces the expected SD path (subfolder per game)', async () => {
+test('forwarderPathFor produces the expected SD path (subfolder per game, no spaces)', async () => {
         const fwd = await loadForwarderModule();
-        assert.equal(fwd.forwarderPathFor('My Game', 'g1abc23'), 'sdmc:/switch/My Game/My Game.nro');
-        // Special characters are stripped from the folder name.
-        assert.equal(fwd.forwarderPathFor('Game: Rebirth!', 'g2def45'), 'sdmc:/switch/Game Rebirth/Game Rebirth.nro');
+        // Spaces are replaced with underscores (hbmenu can't handle spaces in NRO paths).
+        assert.equal(fwd.forwarderPathFor('My Game', 'g1abc23'), 'sdmc:/switch/My_Game/My_Game.nro');
+        // Special characters are stripped; spaces → underscores.
+        assert.equal(fwd.forwarderPathFor('Game: Rebirth!', 'g2def45'), 'sdmc:/switch/Game_Rebirth/Game_Rebirth.nro');
+        // Multi-word game names (e.g. "The Coffin of Andy and Leyley").
+        assert.equal(fwd.forwarderPathFor('The Coffin of Andy and Leyley', 'g3abc'), 'sdmc:/switch/The_Coffin_of_Andy_and_Leyley/The_Coffin_of_Andy_and_Leyley.nro');
         // Empty name falls back to the game id.
         assert.equal(fwd.forwarderPathFor('', 'g3ghi78'), 'sdmc:/switch/g3ghi78/g3ghi78.nro');
 });
@@ -401,8 +404,9 @@ test('findRomfsFile handles empty romfs gracefully', async () => {
 
 test('forwarderExists reports presence via the LibraryAccess interface', async () => {
         const fwd = await loadForwarderModule();
+        // sanitizeGameName now replaces spaces with underscores.
         const files = new Map<string, { mode: number }>([
-                ['sdmc:/switch/My Game/My Game.nro', { mode: 0o100000 }],
+                ['sdmc:/switch/My_Game/My_Game.nro', { mode: 0o100000 }],
         ]);
         const fs = {
                 statSync: (p: string) => files.has(p) ? files.get(p)! : null,
@@ -412,4 +416,40 @@ test('forwarderExists reports presence via the LibraryAccess interface', async (
         };
         assert.equal(fwd.forwarderExists(fs as any, 'My Game', 'g1'), true);
         assert.equal(fwd.forwarderExists(fs as any, 'Other Game', 'g2'), false);
+});
+
+test('deleteForwarder removes the .nro file AND the containing folder', async () => {
+        const fwd = await loadForwarderModule();
+        // Simulate a forwarder at sdmc:/switch/My_Game/ with the .nro and a log file.
+        const files = new Map<string, { mode: number }>([
+                ['sdmc:/switch/My_Game/My_Game.nro', { mode: 0o100000 }],
+                ['sdmc:/switch/My_Game/native-host_0.log', { mode: 0o100000 }],
+        ]);
+        const dirs = new Set<string>(['sdmc:/switch/My_Game']);
+        const removed: string[] = [];
+        const fs = {
+                statSync: (p: string) => files.has(p) ? files.get(p)! : null,
+                readDirSync: (p: string) => {
+                        const prefix = p.replace(/\/$/, '');
+                        const names: string[] = [];
+                        for (const key of files.keys()) {
+                                if (key.startsWith(prefix + '/') && !key.slice(prefix.length + 1).includes('/')) {
+                                        names.push(key.slice(prefix.length + 1));
+                                }
+                        }
+                        return names.length > 0 ? names : null;
+                },
+                removeSync: (p: string) => { files.delete(p); removed.push(p); },
+                unlinkSync: undefined,
+                rmdirSync: (p: string) => { dirs.delete(p); removed.push(p); },
+                readFileSync: () => null,
+                writeFileSync: () => {},
+                mkdirSync: () => {},
+        };
+        // Delete the forwarder — should remove the .nro, the log file, AND the folder.
+        const result = fwd.deleteForwarder(fs as any, 'My Game', 'g1');
+        assert.equal(result, true, 'returns true because the .nro was deleted');
+        assert.ok(!files.has('sdmc:/switch/My_Game/My_Game.nro'), '.nro file deleted');
+        assert.ok(!files.has('sdmc:/switch/My_Game/native-host_0.log'), 'log file deleted');
+        assert.ok(!dirs.has('sdmc:/switch/My_Game'), 'folder deleted');
 });
