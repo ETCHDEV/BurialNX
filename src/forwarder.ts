@@ -135,6 +135,28 @@ export function patchGameIdInRomfs(romfs: Uint8Array, gameId: string): Uint8Arra
         return out;
 }
 
+/** Patch a string placeholder in a romfs blob. Searches for the
+ *  placeholder (as UTF-8 bytes) and overwrites it with the replacement
+ *  (which must be the same byte length). Returns a new Uint8Array — the
+ *  input is not modified. Throws if the placeholder is not found or
+ *  found more than once (ambiguous).
+ *
+ *  This is the generic version of patchGameIdInRomfs — used for the
+ *  MOD_FORCED placeholder ("MODFORCED_0" → "MODFORCED_1"). */
+export function patchStringInRomfs(romfs: Uint8Array, placeholder: string, replacement: string): Uint8Array {
+        const placeholderBytes = new TextEncoder().encode(placeholder);
+        const replacementBytes = new TextEncoder().encode(replacement);
+        if (placeholderBytes.length !== replacementBytes.length) {
+                throw new Error(`patchStringInRomfs: placeholder (${placeholderBytes.length} bytes) and replacement (${replacementBytes.length} bytes) must be the same byte length`);
+        }
+        const found = findAll(romfs, placeholderBytes);
+        if (found.length === 0) throw new Error(`patchStringInRomfs: placeholder "${placeholder}" not found in romfs`);
+        if (found.length > 1) throw new Error(`patchStringInRomfs: placeholder "${placeholder}" found ${found.length} times in romfs — ambiguous, refusing to patch`);
+        const out = new Uint8Array(romfs); // creates a copy
+        out.set(replacementBytes, found[0]);
+        return out;
+}
+
 /** Find all occurrences of `needle` in `haystack`. Returns the byte
  *  offsets where the needle starts. */
 function findAll(haystack: Uint8Array, needle: Uint8Array): number[] {
@@ -596,102 +618,102 @@ export interface ForwarderBuildResult {
 }
 
 /** Build a per-game forwarder NRO from burialnx.nro's own file and write
- *  it to the SD card. The forwarder, when launched from hbmenu, runs the
- *  forwarder's main.js (patched into the romfs in place of burialnx's
- *  main.js) which chain-loads burialnx.nro with --game <id>. */
+ *  it to the SD card.
+ *
+ *  BAKED-IN APPROACH (no chain-loading):
+ *  The forwarder IS a copy of burialnx.nro with TWO placeholders patched
+ *  in the romfs's main.js:
+ *    1. __FORWARDER_GAME_ID__ (64 '0' chars) → the game id (padded to 64)
+ *    2. __FORWARDER_MOD_FORCED__ ("MODFORCED_0") → "MODFORCED_1" if mod is on
+ *  At runtime, burialnx's main.ts checks these constants. If the game id
+ *  is NOT all zeros, this IS a forwarder → set forwarderTargetId and
+ *  auto-launch the game. NO chain-loading, NO envSetNextLoad → clean
+ *  Switch.exit() → hbmenu.
+ *
+ *  This replaces the old chain-load approach (forwarder-template's
+ *  main.js called app.launch(burialnx.nro, '--game', id) which set
+ *  envSetNextLoad — persistent on some hbloaders, causing re-chain
+ *  loops). */
 export async function buildForwarder(opts: ForwarderBuildOptions): Promise<ForwarderBuildResult> {
         const { game, cover, baseNro, outputPath, log } = opts;
         const SwitchAny = (globalThis as any).Switch;
         if (!SwitchAny?.writeFileSync) return { ok: false, error: 'Switch.writeFileSync unavailable' };
         try {
-                log(`forwarder: building for "${game.name}" (id=${game.id})`);
+                log(`forwarder: building for "${game.name}" (id=${game.id}) [BAKED-IN approach]`);
                 // 1. Decode the base NRO's structure (the code segment IS
                 //    the nx.js runtime — we reuse it unchanged).
                 const structure = decodeNroStructure(baseNro);
                 log(`forwarder: base nroSize=0x${structure.nroSize.toString(16)} icon=0x${structure.iconSize.toString(16)} nacp=0x${structure.nacpSize.toString(16)} romfs=0x${structure.romfsSize.toString(16)}`);
-                // 2. Find the `main.js` file data in the romfs. We'll
-                //    overwrite it with the forwarder's main.js (padded to
-                //    the same size with comment chars so the romfs layout
-                //    doesn't change — no romfs rebuild needed).
+                // 2. Get the romfs bytes (we'll patch placeholders IN PLACE —
+                //    no main.js overwrite, no padding, no romfs rebuild).
                 const romfsBytes = new Uint8Array(baseNro, structure.romfsOffset, structure.romfsSize);
-                const mainJsEntry = findRomfsFile(romfsBytes, 'main.js');
-                if (!mainJsEntry) { throw new Error('main.js not found in base NRO romfs — cannot build forwarder'); }
-                log(`forwarder: base main.js at offset=0x${mainJsEntry.offset.toString(16)} size=${mainJsEntry.size} bytes`);
-                // 3. Build the forwarder's main.js content: patch the
-                //    game-id placeholder in the __FORWARDER_MAIN_JS__
-                //    string, then pad to mainJsEntry.size with comment
-                //    chars (so the total byte length matches the original
-                //    main.js and the romfs file entry stays valid).
+                // 3. Patch the GAME_ID placeholder (64 '0' chars → game id,
+                //    space-padded to 64). patchGameIdInRomfs searches the
+                //    entire romfs for the 64-'0' byte sequence and overwrites
+                //    it. The sequence appears exactly once (in burialnx's
+                //    main.js, baked by the build-time define).
+                let patchedRomfs = patchGameIdInRomfs(romfsBytes, game.id);
+                log(`forwarder: patched GAME_ID placeholder (id="${game.id}")`);
+                // 4. Patch the MOD_FORCED placeholder ("MODFORCED_0" →
+                //    "MODFORCED_1" if the mod is enabled at build time).
+                //    This forces the mod on at auto-launch, even if the
+                //    user later disables it in the library.
+                //
+                //    CRITICAL: the placeholder strings are constructed via
+                //    String.fromCharCode (NOT as literals) so esbuild does
+                //    NOT inline them into main.js. If they were literals,
+                //    there would be TWO matches in the romfs (one from
+                //    main.ts's __FORWARDER_MOD_FORCED__ define, one from
+                //    this call) and patchStringInRomfs would throw
+                //    "ambiguous".
                 const modEnabled = game.mod !== undefined && game.mod !== null && game.modEnabled !== false;
-                const forwarderMainJs = patchGameIdInString(__FORWARDER_MAIN_JS__, game.id, modEnabled);
-                log(`forwarder: forwarder main.js = ${forwarderMainJs.length} chars (padded to ${mainJsEntry.size} bytes)`);
-                const forwarderMainBytes = new TextEncoder().encode(forwarderMainJs);
-                if (forwarderMainBytes.length > mainJsEntry.size) {
-                        throw new Error(`forwarder main.js (${forwarderMainBytes.length} bytes) is larger than the base main.js slot (${mainJsEntry.size} bytes) — cannot fit`);
+                if (modEnabled) {
+                        const modPh = String.fromCharCode(77,79,68,70,79,82,67,69,68,95,48); // "MODFORCED_0"
+                        const modRep = String.fromCharCode(77,79,68,70,79,82,67,69,68,95,49); // "MODFORCED_1"
+                        patchedRomfs = patchStringInRomfs(patchedRomfs, modPh, modRep);
+                        log(`forwarder: patched MOD_FORCED placeholder (mod ON)`);
+                } else {
+                        log(`forwarder: mod OFF — MOD_FORCED placeholder unchanged`);
                 }
-                // 4. Copy the entire base NRO (we'll patch the copy).
+                // 5. Copy the entire base NRO and apply the patched romfs.
                 //    This is the 54 MiB that makes each forwarder
                 //    self-contained.
                 const out = new Uint8Array(baseNro.byteLength);
                 out.set(new Uint8Array(baseNro));
-                // 5. Overwrite the main.js file data in the romfs with
-                //    the forwarder's main.js + comment padding. The
-                //    padding is a block comment (/* ... */) — safe for
-                //    any size (no line-length limit like // comments).
-                const mainJsStart = mainJsEntry.offset - out.byteOffset;
-                out.set(forwarderMainBytes, mainJsStart);
-                // Fill the rest with a BLOCK comment (/* + spaces + */).
-                // A single-line comment (// + spaces) would create a
-                // ~200 KB single-line comment with no newlines, which
-                // can choke V8's parser. A block comment has no such
-                // limit.
-                const padStart = mainJsStart + forwarderMainBytes.length;
-                const padEnd = mainJsStart + mainJsEntry.size;
-                if (padEnd - padStart >= 4) {
-                        out[padStart] = 0x2f; // '/'
-                        out[padStart + 1] = 0x2a; // '*'
-                        out[padEnd - 2] = 0x2a; // '*'
-                        out[padEnd - 1] = 0x2f; // '/'
-                        for (let i = padStart + 2; i < padEnd - 2; i++) out[i] = 0x20; // ' '
-                } else if (padEnd > padStart) {
-                        // Very small gap — just fill with spaces.
-                        for (let i = padStart; i < padEnd; i++) out[i] = 0x20;
-                }
-                log(`forwarder: patched main.js in romfs (${forwarderMainBytes.length} bytes + ${mainJsEntry.size - forwarderMainBytes.length} padding)`);
-                // 6. Patch the NACP in the copy: title = game name, author
-                //    = "BurialNX", application id = stable hash.
+                // Overwrite the romfs section with the patched romfs.
+                // The romfs size doesn't change (patch-in-place, same byte
+                // lengths), so the NRO layout stays valid.
+                out.set(patchedRomfs, structure.romfsOffset);
+                log(`forwarder: applied patched romfs (in-place, no main.js overwrite)`);
+                // 6. Patch the NACP: title = game name, author = "BurialNX",
+                //    application id = stable hash.
                 const nacpView = new Uint8Array(out.buffer, structure.nacpOffset, Math.min(structure.nacpSize, NACP_SIZE));
                 writeNacpTitle(nacpView, game.name);
                 writeNacpAuthor(nacpView, 'BurialNX');
                 writeNacpId(nacpView, forwarderIdFor(game.id));
                 // Zero out save-data fields so the Switch doesn't create
-                // save data for the forwarder title. This prevents the
-                // "cannot delete: save data exists" error when the user
-                // removes the forwarder from the HOME menu.
+                // save data for the forwarder title.
                 writeNacpForwarderDefaults(nacpView);
                 log(`forwarder: patched NACP (title="${game.name}", author="BurialNX")`);
                 // 7. Optionally patch the icon. If the cover can't be
-                //    encoded, keep the base NRO's existing icon (so the
-                //    forwarder still has one).
+                //    encoded, keep the base NRO's existing icon.
                 if (cover && (cover.path || cover.bytes)) {
                         const encoded = await encodeCoverToIconJpeg(cover, log);
                         if (encoded && encoded.byteLength > 0) {
                                 // The icon is variable-length (JPEG). We need to
                                 // rebuild the asset section with the new icon
                                 // size. The NACP and romfs sizes don't change.
-                                // Extract the code segment (unchanged) and
-                                // the patched romfs (with the new main.js).
                                 const code = new Uint8Array(out.buffer, 0, structure.nroSize);
-                                const patchedRomfs = new Uint8Array(out.buffer, structure.romfsOffset, structure.romfsSize);
+                                const finalRomfs = new Uint8Array(out.buffer, structure.romfsOffset, structure.romfsSize);
                                 const nacp = new Uint8Array(out.buffer, structure.nacpOffset, Math.min(structure.nacpSize, NACP_SIZE));
-                                const newNro = encodeNro(code, encoded, nacp, patchedRomfs);
+                                const newNro = encodeNro(code, encoded, nacp, finalRomfs);
                                 log(`forwarder: rebuilt NRO with new icon (${encoded.byteLength} bytes) — total ${newNro.byteLength} bytes`);
                                 try {
                                         const dir = forwarderDirFor(game.name, game.id);
                                         SwitchAny.mkdirSync?.(dir);
                                 } catch { /* may already exist */ }
                                 SwitchAny.writeFileSync(outputPath, newNro.buffer);
-                                log(`forwarder: written ${outputPath} (${newNro.byteLength} bytes)`);
+                                log(`forwarder: written ${outputPath} (${newNro.byteLength} bytes) [BAKED-IN, no chain-load]`);
                                 return { ok: true, path: outputPath, bytes: newNro.byteLength };
                         } else {
                                 log('forwarder: icon encoding failed — keeping base NRO icon');
@@ -699,14 +721,13 @@ export async function buildForwarder(opts: ForwarderBuildOptions): Promise<Forwa
                 }
                 // 8. No icon change (or icon encoding failed) — write the
                 //    patched copy directly. The asset section is unchanged
-                //    (same icon, same NACP size, same romfs size), so we
-                //    just write the patched buffer.
+                //    (same icon, same NACP size, same romfs size).
                 try {
                         const dir = forwarderDirFor(game.name, game.id);
                         SwitchAny.mkdirSync?.(dir);
                 } catch { /* may already exist */ }
                 SwitchAny.writeFileSync(outputPath, out.buffer);
-                log(`forwarder: written ${outputPath} (${out.byteLength} bytes)`);
+                log(`forwarder: written ${outputPath} (${out.byteLength} bytes) [BAKED-IN, no chain-load]`);
                 return { ok: true, path: outputPath, bytes: out.byteLength };
         } catch (e) {
                 const error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);

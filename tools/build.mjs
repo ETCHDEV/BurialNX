@@ -23,26 +23,25 @@ try {
   await copyFile(join(project, 'romfs', 'nxjs.ini'), join(staging, 'romfs', 'nxjs.ini'));
   await prepareIcon(project, staging, { defaultIcon });
 
-  // Bundle the forwarder's main.js (from forwarder-template/romfs/main.ts)
-  // to a STRING and inject it via esbuild's `define` as
-  // __FORWARDER_MAIN_JS__. At runtime, src/forwarder.ts patches the
-  // 64-'0' game-id placeholder in this string and writes it into the
-  // romfs of a COPY of burialnx.nro itself — so each forwarder is a
-  // self-contained FAT NRO that uses burialnx.nro's own code segment
-  // (the nx.js runtime) as its base. No 54 MiB template embedded in
-  // burialnx.nro's romfs — burialnx.nro stays at ~54 MiB.
-  const forwarderMainResult = await build({
-    entryPoints: [join(project, 'forwarder-template', 'romfs', 'main.ts')],
-    bundle: true,
-    write: false,
-    format: 'esm',
-    target: 'es2022',
-    define: { __DEBUG__: 'false' },
-  });
-  const forwarderMainJs = forwarderMainResult.outputFiles[0].text;
-  if (!forwarderMainJs.includes('0'.repeat(64))) {
-    throw new Error('forwarder-template/romfs/main.ts does not contain the 64-zero GAME_ID placeholder — the runtime forwarder builder cannot patch it');
-  }
+  // === Baked-in forwarder placeholders ==================================
+  // burialnx.nro's main.js contains TWO placeholder string literals that
+  // the runtime forwarder builder patches (byte-level search + replace in
+  // the romfs) to turn a COPY of burialnx.nro into a per-game forwarder:
+  //
+  //   __FORWARDER_GAME_ID__ = "0000...0000" (64 '0' chars)
+  //     → patched to the game id (UTF-8, space-padded to 64 chars)
+  //     → at startup, if the value is NOT all zeros, this IS a forwarder
+  //       → set forwarderTargetId and auto-launch the game
+  //       → NO chain-loading, NO envSetNextLoad → clean Switch.exit() → hbmenu
+  //
+  //   __FORWARDER_MOD_FORCED__ = "MODFORCED_0"
+  //     → patched to "MODFORCED_1" if the game's mod is enabled
+  //     → forces the mod on at auto-launch (same as the legacy --mod argv)
+  //
+  // This replaces the old chain-load approach (forwarder-template/romfs/main.ts
+  // called app.launch(burialnx.nro, '--game', id) which set envSetNextLoad
+  // — persistent on some hbloaders, causing re-chain loops). The forwarder
+  // IS burialnx (same main.js) with a baked-in game id — no chain-loading.
 
   await build({
     entryPoints: [join(project, 'src', 'main.ts')],
@@ -52,7 +51,8 @@ try {
     target: 'es2022',
     define: {
       __DEBUG__: JSON.stringify(debug),
-      __FORWARDER_MAIN_JS__: JSON.stringify(forwarderMainJs),
+      __FORWARDER_GAME_ID__: JSON.stringify('0'.repeat(64)),
+      __FORWARDER_MOD_FORCED__: JSON.stringify('MODFORCED_0'),
     },
   });
   const require = createRequire(import.meta.url);

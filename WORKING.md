@@ -59,7 +59,8 @@ dispatched events: nx.js kills the process with a frozen "Press + to exit"
 screen for ANY uncaught exception or unhandled rejection unless the event
 is canceled, and the loader shows its own recoverable error screen instead.
 There is no in-process session reboot: returning to the library means
-quitting the app (`quitApp()` → `teardownGame()` → `Switch.exit()`) and
+quitting the app (`quitApp('return-to-library')` → `teardownGame()` →
+`chainToLibrary()` → `app.launch(burialnx.nro)` without `--game`) and
 relaunching it from hbmenu, which is a guaranteed clean cold boot — Horizon
 OS reserves the process memory and reclaims it on exit, the only reliably
 clean reset on this OS. An in-process reboot (re-running the app bundle from
@@ -76,6 +77,30 @@ field: it re-reads `vk.value`/`vk.cursorIndex` every frame (so the preview
 tracks typing even without `change` events), anchors the field above the
 keyboard's real on-screen rectangle (`vk.boundingRect` from `show()`), and
 falls back to a fixed top band without geometry.
+- `quitApp(mode)` now takes a `QuitMode` (`'shutdown'` | `'return-to-library'`)
+  and chooses the path by context:
+  - **Library grid Quit / `+` confirmation, forwarder-launched game exit,
+    error screen B** → `'shutdown'`: calls `Switch.exit()` and returns to
+    hbmenu. For LEGACY argv forwarders (chain-load approach), a `.fwd-exit-flag`
+    file is written so the next boot can detect a stale-next-load re-chain
+    (if hbloader didn't clear `envSetNextLoad`). For BAKED-IN forwarders,
+    no flag is written (no `envSetNextLoad` was set). Labels: "Quit BurialNX" /
+    "Quit BurialNX?".
+  - **Library-launched game exit (pause-menu "Quit", `+` confirmation)** →
+    `'return-to-library'`: `chainToLibrary()` chain-loads `burialnx.nro`
+    without `--game` → the library grid shows. Labels: "Return to library" /
+    "Return to library?".
+- **Baked-in forwarder (no chain-loading)**: the forwarder IS a copy of
+  `burialnx.nro` with two placeholders patched in the romfs's main.js:
+  `__FORWARDER_GAME_ID__` (64 `'0'` chars → game id) and
+  `__FORWARDER_MOD_FORCED__` (`"MODFORCED_0"` → `"MODFORCED_1"` if mod is on).
+  At runtime, burialnx checks these constants. If the game id is NOT all
+  zeros, this IS a forwarder → set `forwarderTargetId` and auto-launch the
+  game. NO chain-loading, NO `envSetNextLoad` → quitting is a clean
+  `Switch.exit()` → hbmenu. This replaces the old chain-load approach
+  (`forwarder-template/romfs/main.ts` called `app.launch(burialnx.nro,
+  '--game', id)` which set `envSetNextLoad` — persistent on some hbloaders,
+  causing re-chain loops).
 - `src/runtime-plan.ts` selects the game's normal load handler or, if absent,
   starts its boot scene when no scene is already active or queued.
 - `src/folders.ts` and `src/settings.ts` handle SD selection and remembered paths.
@@ -109,25 +134,29 @@ falls back to a fixed top band without geometry.
 - `src/saves.ts` supports separate SD or explicitly selected game-folder
   storage, retains recovery copies on interrupted writes, and imports Steam
   files only into an empty separate destination.
-- `src/forwarder.ts` builds per-game forwarder NROs at runtime. A forwarder
-  is a small self-contained nx.js NRO whose `main.js` reads a sidecar JSON
-  next to itself and chain-loads `burialnx.nro` with `--game <id>` (via
-  `Switch.Application(...).launch`, which nx.js implements as a call to
-  libnx `envSetNextLoad` — the same primitive sphaira's `nro_launch` uses).
-  The module is pure JS (no Switch access at module top level): it decodes
-  the NRO0/ASET layout, patches the NACP title/author/id, re-encodes a
-  256×256 JPEG icon from the game cover via `OffscreenCanvas.convertToBlob`,
-  and rebuilds the asset section. The template NRO is embedded at build
-  time into burialnx.nro's own romfs (`romfs:/forwarder-template.nro`,
-  see `forwarder-template/`), so the runtime builder only needs to copy +
-  patch it per game.
-- `main.ts` now also parses `Switch.argv` for `--game <id>` at startup and,
-  if found and the id is in the library, auto-launches the game directly
-  (the entry point for forwarder chain-loads). The launch flow reports
-  per-stage progress to a centered progress bar (`renderLoading`) instead
-  of the old top-left text panel. The new `forwarder-building` phase
-  drives `buildForwarder()` with the same progress bar, and ignores the
-  Plus button so a multi-MiB NRO write is never interrupted mid-write.
+- `src/forwarder.ts` builds per-game forwarder NROs at runtime using the
+  BAKED-IN approach: the forwarder IS a copy of `burialnx.nro` with two
+  placeholders patched in the romfs's main.js (`__FORWARDER_GAME_ID__` 64-'0'
+  → game id; `__FORWARDER_MOD_FORCED__` "MODFORCED_0" → "MODFORCED_1" if mod
+  is on). No chain-loading, no `envSetNextLoad`. The module is pure JS (no
+  Switch access at module top level): it decodes the NRO0/ASET layout,
+  patches the placeholders in place (same byte length, no romfs rebuild),
+  patches the NACP title/author/id, re-encodes a 256×256 JPEG icon from
+  the game cover via `OffscreenCanvas.convertToBlob`, and rebuilds the
+  asset section (only when the icon changes).
+- `main.ts` now also checks the baked-in `__FORWARDER_GAME_ID__` constant
+  at startup — if it is NOT all zeros, this IS a forwarder NRO → set
+  `forwarderTargetId` and auto-launch the game. A legacy argv fallback
+  (`--game <id>`) is kept for old forwarders built before this change.
+  The launch flow reports per-stage progress to a centered progress bar
+  (`renderLoading`) instead of the old top-left text panel. The new
+  `forwarder-building` phase drives `buildForwarder()` with the same
+  progress bar, and ignores the Plus button so a multi-MiB NRO write is
+  never interrupted mid-write. At startup, `main.ts` also checks for a
+  stale `.fwd-exit-flag` file (written by `quitApp('shutdown')` before
+  `Switch.exit()` for LEGACY argv forwarders only): if the flag is recent
+  and this is NOT a baked-in forwarder, `forwarderTargetId` is cleared so
+  the library grid shows instead of the game restarting in a loop.
 
 
 ## Why compatibility code is needed

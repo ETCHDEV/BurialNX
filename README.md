@@ -7,8 +7,8 @@ improved BurialNX loader.
 
 ### Files
 
-- `burialnx.nro` — Release build (54.02 MiB). Use this for normal play.
-- `burialnx-debug.nro` — Debug build (54.02 MiB). Adds diagnostic logging
+- `burialnx.nro` — Release build (54.04 MiB). Use this for normal play.
+- `burialnx-debug.nro` — Debug build (54.04 MiB). Adds diagnostic logging
   to `sdmc:/switch/burialnx/LOGS/native-host.log`, asks for save location
   on every launch, and exposes the snapshot/direct-screen menu items.
 
@@ -238,4 +238,55 @@ functionality, run on hardware and exercise:
    to exit.
 5. **Delete forwarder NRO** in the game-options screen removes the
    forwarder `.nro` and its sidecar `.json`.
+
+### What changed in this build (exit modes + baked-in forwarder)
+
+- **Two distinct exit paths** are now chosen by context, so the user no
+  longer sees an unwanted user-selection dialog + loading splash when
+  exiting a forwarder-launched game:
+  - **Return to library** (library-launched games): the pause-menu "Quit"
+    entry (hold Minus) and the `+` confirmation window are renamed to
+    **"Return to library"** / **"Return to library?"**. Selecting either
+    chain-loads `burialnx.nro` without `--game`, which lands the user back
+    on the library grid — exactly where they came from.
+  - **Complete shutdown** (library grid Quit tile / `+` confirmation, and
+    forwarder-launched game exit): the labels stay **"Quit BurialNX"** /
+    **"Quit BurialNX?"**. Selecting either calls `Switch.exit()` and
+    returns to hbmenu (or the HOME menu, for a title-override launch).
+- **Baked-in forwarder (no chain-loading)**: the forwarder is no longer a
+  small NRO that chain-loads `burialnx.nro` with `--game <id>` (that
+  approach set `envSetNextLoad`, which is persistent on the user's
+  hbloader and caused an infinite game-restart loop on every exit).
+  Instead, the forwarder **IS** a copy of `burialnx.nro` with two
+  placeholders patched in the romfs:
+  1. `__FORWARDER_GAME_ID__` (64 `'0'` chars) → the game id (padded to 64)
+  2. `__FORWARDER_MOD_FORCED__` (`"MODFORCED_0"`) → `"MODFORCED_1"` if mod is on
+  At runtime, burialnx checks these constants. If the game id is NOT all
+  zeros, this IS a forwarder → auto-launch the game directly. **No
+  chain-loading, no `envSetNextLoad`** → quitting is a clean
+  `Switch.exit()` → hbmenu.
+- The error screen's B button also picks the mode: **"Press B to exit
+  BurialNX."** for a forwarder-launched game, **"Press B to return to
+  the library."** for a library-launched game.
+
+### Verifying the exit modes on Switch
+
+1. Launch a game from the **library grid** (not a forwarder). Hold Minus,
+   navigate to the last entry — it now reads **"Return to library"** (not
+   "Quit BurialNX"). Select it: burialnx briefly reloads and the library
+   grid shows. Relaunch the same game: it starts cleanly (cold boot).
+2. From the library grid, hold `+` (or press A on the **Quit BurialNX**
+   tile): the confirmation window reads **"Quit BurialNX?"**. Confirm:
+   BurialNX exits to hbmenu (or the HOME menu) without showing the
+   library again.
+3. **Recreate your forwarder NRO** (game-options → "Recreate forwarder
+   NRO") with the new `burialnx.nro` — the new forwarder uses the
+   baked-in game id (no chain-loading). Launch it: the game starts
+   directly. Hold Minus: the last entry reads **"Quit BurialNX"**. Hold
+   `+`: the window reads **"Quit BurialNX?"**. Select either: BurialNX
+   exits cleanly to hbmenu (no re-chain loop).
+4. Force an error (e.g. point a forwarder at a game whose folder was
+   moved). The error screen shows **"Press B to exit BurialNX."**
+   (forwarder launch) or **"Press B to return to the library."**
+   (library launch). Press B: the corresponding exit path runs.
 
