@@ -16,6 +16,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # GITHUB_TOKEN по умолчанию read-only — для создания релизов
+    # нужны права на запись в репозиторий.
+    permissions:
+      contents: write
 
     steps:
       # 1. Checkout кода
