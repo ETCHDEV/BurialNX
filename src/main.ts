@@ -709,7 +709,20 @@ try {
 // per-game keymap of its own).
 try {
         globalKeymap = loadKeyMap(Switch as unknown as LibraryAccess);
+        // Seed the working copy with EVERYTHING the loaded map carries
+        // (labels, keyCodes, sticks), not just buttons — otherwise the
+        // first time the editor opens it would show 'none' for sticks
+        // even when keymap.json has stick bindings saved.
         editingKeymap = { buttons: [...globalKeymap.buttons] };
+        if (globalKeymap.labels) editingKeymap.labels = [...globalKeymap.labels];
+        if (globalKeymap.keyCodes) editingKeymap.keyCodes = [...globalKeymap.keyCodes];
+        if (globalKeymap.sticks) {
+                editingKeymap.sticks = {};
+                for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
+                        const b = globalKeymap.sticks[dir];
+                        if (b) editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                }
+        }
         log(`_11: loadKeyMap ok, ${globalKeymap.buttons.filter((b) => b !== 'none').length} active bindings`);
 } catch (error) { log(`_11: loadKeyMap failed: ${error instanceof Error ? error.message : String(error)}`); keymapValid = false; }
 
@@ -1079,6 +1092,79 @@ function renderQuitDialog(): void {
         ctx.fillText('A: Yes', screen.width / 2 - 70, boxY + 95);
         ctx.fillStyle = '#f85149';
         ctx.fillText('B: No', screen.width / 2 + 70, boxY + 95);
+        ctx.textAlign = 'left';
+        ctx.restore();
+}
+
+/** Small centered popup for success/info notices — same visual style as
+ *  renderQuitDialog (compact, centered, opaque rounded box, no full-screen
+ *  overlay) but for single-button acknowledgment ("B: OK") instead of a
+ *  yes/no question. Replaces the old full-screen `panel(...)` notice that
+ *  hid the library/options screen behind a big dark rectangle.
+ *
+ *  The box auto-sizes to the message: long text (e.g. a forwarder path)
+ *  word-wraps to a 480px max line width and the box grows downward, so a
+ *  short "Name changed." gets a tidy little box while a long build result
+ *  still fits without overflowing the screen.
+ *
+ *  The underlying screen shows through — the game keeps rendering during a
+ *  game session, and for the library/game-options the previous frame's
+ *  content is retained (those screens are static, so the stale frame reads
+ *  as the real background). */
+function renderNoticePopup(msg: string): void {
+        if (!ctx) return;
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        // Word-wrap the message to a max line width so long notices
+        // (forwarder paths, multi-sentence results) stay on screen.
+        const maxLineWidth = 480;
+        ctx.font = '22px sans-serif';
+        ctx.textBaseline = 'alphabetic';
+        const words = (msg || '').split(/\s+/).filter(Boolean);
+        const lines: string[] = [];
+        let line = '';
+        for (const w of words) {
+                const test = line ? line + ' ' + w : w;
+                if (ctx.measureText(test).width > maxLineWidth && line) {
+                        lines.push(line);
+                        line = w;
+                } else {
+                        line = test;
+                }
+        }
+        if (line) lines.push(line);
+        if (!lines.length) lines.push('');
+        // Box geometry — auto-size to the wrapped text.
+        const padX = 36, padTop = 30, lineH = 28, btnH = 44;
+        let maxW = 0;
+        for (const l of lines) { const lw = ctx.measureText(l).width; if (lw > maxW) maxW = lw; }
+        const boxW = Math.max(300, Math.min(maxW + padX * 2, maxLineWidth + padX * 2));
+        const boxH = padTop + lines.length * lineH + btnH;
+        const boxX = Math.floor((screen.width - boxW) / 2);
+        const boxY = Math.floor((screen.height - boxH) / 2);
+        // Box (opaque, rounded, subtle border — same palette as renderQuitDialog).
+        ctx.fillStyle = '#1f2229';
+        roundedRectPath(boxX, boxY, boxW, boxH, 12);
+        ctx.fill();
+        ctx.strokeStyle = '#3a3f4b'; ctx.lineWidth = 1;
+        ctx.stroke();
+        // Thin green accent bar on the left edge — a quiet "success/info"
+        // cue that matches the 'ok' color used throughout the keymap UI.
+        ctx.fillStyle = '#3fb950';
+        ctx.fillRect(boxX, boxY + 12, 4, boxH - 24);
+        // Message lines (centered).
+        ctx.fillStyle = '#f4f3ef';
+        ctx.textAlign = 'center';
+        const textTop = boxY + padTop + 18;
+        for (let i = 0; i < lines.length; i++) {
+                ctx.fillText(lines[i], boxX + boxW / 2, textTop + i * lineH);
+        }
+        // "B: OK" dismiss hint (centered, green).
+        ctx.font = '18px sans-serif';
+        ctx.fillStyle = '#3fb950';
+        ctx.fillText('B: OK', boxX + boxW / 2, boxY + boxH - 16);
         ctx.textAlign = 'left';
         ctx.restore();
 }
@@ -1476,7 +1562,7 @@ function renderLibrary() {
         }
         // Footer hint
         ctx.fillStyle = '#9aa0b4';
-        ctx.fillText('A: Play  X: Options  Y: Add game  Hold Minus: Menu  Hold Plus: Quit', 28, screen.height - 24);
+        ctx.fillText('D-pad: navigate (Up/Down: row)  A: Play  X: Options  Y: Add game  Hold Minus: Menu  Hold Plus: Quit', 28, screen.height - 24);
         ctx.restore();
 }
 function drawPlaceholderCover(x: number, y: number, w: number, h: number) {
@@ -1625,8 +1711,9 @@ const KEYMAP_COLORS: Record<string, string> = {
 
 // Full PC keyboard layout (adapted from autorun's launcher_input.c keycap
 // array). Positions are in "key units" (1 unit = 1 standard key width).
-// The keyboard occupies x=0..14, y=0..5.3. Navigation keys are at x=15.5..17.5.
-// Mouse buttons are drawn separately on the right side.
+// The keyboard occupies x=0..15, y=0..5.3. The navigation + arrow cluster
+// is at x=15.5..20 (3 columns of 1.5-unit keys, touching — no gaps — so the
+// right block reads as one evenly-stretched unit like a real keyboard).
 // Each key has a JavaScript keyCode and is looked up in KEYCODE_TO_VKEY.
 interface KeyDef { label: string; keyCode: number; x: number; y: number; w: number; h: number; }
 const KEYBOARD_LAYOUT: KeyDef[] = [
@@ -1677,18 +1764,22 @@ const KEYBOARD_LAYOUT: KeyDef[] = [
         { label: 'Alt', keyCode: 18, x: 2.75, y: 5.3, w: 1.25, h: 1 }, { label: 'Space', keyCode: 32, x: 4, y: 5.3, w: 6, h: 1 },
         { label: 'Alt', keyCode: 18, x: 10, y: 5.3, w: 1.25, h: 1 }, { label: 'Win', keyCode: 92, x: 11.25, y: 5.3, w: 1.25, h: 1 },
         { label: 'Menu', keyCode: 93, x: 12.5, y: 5.3, w: 1.25, h: 1 }, { label: 'Ctrl', keyCode: 17, x: 13.75, y: 5.3, w: 1.25, h: 1 },
-        // Navigation cluster — keys have 1.3-unit spacing (0.3 gap between
-        // adjacent keys in each row) for visual clarity.
-        { label: 'Prt', keyCode: 44, x: 15.5, y: 0, w: 1, h: 1 }, { label: 'Scr', keyCode: 145, x: 16.8, y: 0, w: 1, h: 1 },
-        { label: 'Pause', keyCode: 19, x: 18.1, y: 0, w: 1, h: 1 },
-        { label: 'Ins', keyCode: 45, x: 15.5, y: 1.3, w: 1, h: 1 }, { label: 'Home', keyCode: 36, x: 16.8, y: 1.3, w: 1, h: 1 },
-        { label: 'PgUp', keyCode: 33, x: 18.1, y: 1.3, w: 1, h: 1 },
-        { label: 'Del', keyCode: 46, x: 15.5, y: 2.3, w: 1, h: 1 }, { label: 'End', keyCode: 35, x: 16.8, y: 2.3, w: 1, h: 1 },
-        { label: 'PgDn', keyCode: 34, x: 18.1, y: 2.3, w: 1, h: 1 },
-        // Arrow keys (back at original y positions, same 1.3-unit spacing).
-        { label: '↑', keyCode: 38, x: 16.8, y: 4.3, w: 1, h: 1 },
-        { label: '←', keyCode: 37, x: 15.5, y: 5.3, w: 1, h: 1 }, { label: '↓', keyCode: 40, x: 16.8, y: 5.3, w: 1, h: 1 },
-        { label: '→', keyCode: 39, x: 18.1, y: 5.3, w: 1, h: 1 },
+        // Navigation cluster + arrow keys — 3 columns, each key 1.5 units
+        // wide and TOUCHING (no gap), so the whole right block reads as one
+        // evenly-stretched unit like a real keyboard's nav/arrow cluster.
+        // Col1 x=15.5, Col2 x=17, Col3 x=18.5 (each w=1.5, adjacent).
+        { label: 'Prt', keyCode: 44, x: 15.5, y: 0, w: 1.5, h: 1 }, { label: 'Scr', keyCode: 145, x: 17, y: 0, w: 1.5, h: 1 },
+        { label: 'Pause', keyCode: 19, x: 18.5, y: 0, w: 1.5, h: 1 },
+        { label: 'Ins', keyCode: 45, x: 15.5, y: 1.3, w: 1.5, h: 1 }, { label: 'Home', keyCode: 36, x: 17, y: 1.3, w: 1.5, h: 1 },
+        { label: 'PgUp', keyCode: 33, x: 18.5, y: 1.3, w: 1.5, h: 1 },
+        { label: 'Del', keyCode: 46, x: 15.5, y: 2.3, w: 1.5, h: 1 }, { label: 'End', keyCode: 35, x: 17, y: 2.3, w: 1.5, h: 1 },
+        { label: 'PgDn', keyCode: 34, x: 18.5, y: 2.3, w: 1.5, h: 1 },
+        // Arrow keys — same 3 columns, 1.5-unit width, touching (no gaps),
+        // matching the nav cluster above so the whole right block reads as
+        // one evenly-stretched unit like a real keyboard's arrow cluster.
+        { label: '↑', keyCode: 38, x: 17, y: 4.3, w: 1.5, h: 1 },
+        { label: '←', keyCode: 37, x: 15.5, y: 5.3, w: 1.5, h: 1 }, { label: '↓', keyCode: 40, x: 17, y: 5.3, w: 1.5, h: 1 },
+        { label: '→', keyCode: 39, x: 18.5, y: 5.3, w: 1.5, h: 1 },
         // "none" key — clears the binding (keyCode 0 → 'none' fallback).
         // Positioned right of Esc with same spacing as Esc→backtick.
         { label: 'none', keyCode: 0, x: 1, y: 0, w: 1, h: 1 },
@@ -1802,7 +1893,7 @@ const KEYMAP_GRID_ROWS = 6;
 const KEYMAP_CELL_W = 280, KEYMAP_CELL_H = 85, KEYMAP_CELL_GAP = 8;
 const KEYMAP_GRID_START_Y = 108;
 const KEYMAP_KB_SCALE = 55;
-const KEYMAP_KB_UNITS_W = 18;
+const KEYMAP_KB_UNITS_W = 20; // keyboard x=0..15 + nav cluster x=15.5..20
 const KEYMAP_KB_UNITS_H = 9.7; // keyboard y=0..5.3 + doubled gap + vkey rows y=7.7..9.7
 
 interface Rect { x: number; y: number; w: number; h: number; }
@@ -2176,7 +2267,39 @@ async function launch() {
                 setLoadingProgress(0.92, 'Settling runtime…');
                 await host.settled();
                 setLoadingProgress(0.95, 'Installing compatibility…');
-                installGameCompatibility(runtime, selectedGame, sharedSaves, language, pngFix, currentEntry?.keymap || globalKeymap);
+                installGameCompatibility(runtime, selectedGame, sharedSaves, language, pngFix, mergedKeymap());
+                // Wrap Input._updateGamepadState so pollStickBindings runs
+                // AFTER it — this is the CRITICAL timing fix for vkey stick
+                // bindings (keyCode 0 → vkey name like 'ok', 'cancel').
+                //
+                // MV's Input.update calls _updateGamepadState() FIRST, which
+                // reads face buttons + left-stick axes and sets
+                // _currentState[vkeyName] via edge detection (true on press,
+                // false on release). THEN it iterates _currentState to detect
+                // triggered/held/released for the frame.
+                //
+                // If pollStickBindings ran BEFORE _updateGamepadState (as it
+                // did when called from the frame loop), a stick-driven vkey
+                // (e.g. R↓→ok → _currentState['ok'] = true) would be
+                // OVERRIDDEN by _updateGamepadState setting
+                // _currentState['ok'] = false (button A not pressed → release
+                // edge). The stick binding would be silently dropped.
+                //
+                // By wrapping _updateGamepadState to call pollStickBindings
+                // AFTER the original, our stick bindings are the FINAL write
+                // to _currentState before Input.update's iteration — so
+                // _updateGamepadState's edge-detected false can't clobber
+                // our true. Combined with the vkey fix (keyCode 0 → label as
+                // string key), this makes right-stick→vkey bindings actually
+                // fire in-game.
+                if (runtime.Input?._updateGamepadState && !(runtime.Input as any).__bnxStickWrap) {
+                        const originalUpdateGamepad = runtime.Input._updateGamepadState;
+                        (runtime.Input as any).__bnxStickWrap = true;
+                        runtime.Input._updateGamepadState = function(...args: unknown[]) {
+                                originalUpdateGamepad.apply(this, args);
+                                try { pollStickBindings(); } catch { /* best-effort */ }
+                        };
+                }
                 mapPrefetch = new MapPrefetcher(assets, log);
                 installMapPrefetch(runtime, mapPrefetch, log);
                 if (!saveLocation) throw new Error('No save location selected');
@@ -2277,30 +2400,185 @@ function overrideKeymapForSaveLoadScene(): void {
 // Polls the gamepad analog sticks and simulates keyboard key presses
 // for the bound keyCodes via Input._currentState. This lets the user
 // bind L-stick/R-stick directions to movement keys (W/S/A/D, etc.).
+//
+// MERGE SEMANTICS (the fix for "right-stick bindings don't fire"):
+// When a per-game keymap exists, its stick bindings OVERRIDE the global
+// default PER DIRECTION — not wholesale. Previously, if the per-game
+// keymap had `sticks: { lUp, lDown, lLeft, lRight }` (left stick only,
+// e.g. from an earlier edit session), `pollStickBindings` used ONLY
+// those four directions and ignored the global right-stick bindings
+// (`rUp/rDown/rLeft/rRight`). Result: left stick worked, right stick
+// was dead — even though the user HAD bound right-stick keys (to the
+// global keymap). Now each direction falls back to the global binding
+// when the per-game keymap doesn't override it, so a per-game keymap
+// that only customizes SOME directions still inherits the rest.
+
+/** Build a MERGED KeyMap: the per-game keymap (if any) takes precedence
+ *  per-button/per-direction, and the global default fills every gap.
+ *  This is the single source of truth for "what keymap is active right
+ *  now" — used by installGameCompatibility (to set gamepadMapper at
+ *  launch) and by saveEditingKeymap (to re-apply after an edit).
+ *
+ *  Without this merge, a per-game keymap that only overrides SOME
+ *  buttons/directions would silently drop the global bindings for the
+ *  rest — the root cause of the "right stick doesn't fire" bug: the
+ *  per-game keymap had left-stick bindings but not right-stick ones,
+ *  and the global right-stick bindings were ignored. */
+function mergedKeymap(): KeyMap {
+        const per = currentEntry?.keymap;
+        const base = globalKeymap;
+        if (!per) return base;
+        // Buttons: per-game overrides per index, global fills the rest.
+        const buttons: VirtualKey[] = [];
+        for (let i = 0; i < 16; i++) buttons[i] = per.buttons[i] ?? base.buttons[i];
+        const result: KeyMap = { buttons };
+        // Labels: merge — per-game label wins, fall back to global.
+        if (per.labels || base.labels) {
+                const labels: string[] = [];
+                for (let i = 0; i < 16; i++) labels[i] = per.labels?.[i] ?? base.labels?.[i] ?? '';
+                result.labels = labels;
+        }
+        // KeyCodes: merge — per-game keyCode wins, fall back to global.
+        if (per.keyCodes || base.keyCodes) {
+                const keyCodes: number[] = [];
+                for (let i = 0; i < 16; i++) keyCodes[i] = per.keyCodes?.[i] ?? base.keyCodes?.[i] ?? 0;
+                result.keyCodes = keyCodes;
+        }
+        // Sticks: merge per direction.
+        const perSticks = per.sticks;
+        const baseSticks = base.sticks;
+        if (perSticks || baseSticks) {
+                const sticks: NonNullable<KeyMap['sticks']> = {};
+                for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
+                        const b = perSticks?.[dir] ?? baseSticks?.[dir];
+                        if (b) sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                }
+                result.sticks = sticks;
+        }
+        return result;
+}
+
+// Track previous stick-direction active states for EDGE-DETECTED release.
+// Without this, pollStickBindings would set _currentState[key] = false
+// EVERY frame the stick is idle — which would override a face button's
+// held-true for the same vkey (e.g. if button A is mapped to 'ok' and
+// R↓ is also bound to 'ok', releasing R↓ while holding A would
+// prematurely release 'ok'). With edge detection, we only set false on
+// the release TRANSITION (stick was active last frame, now inactive).
+const prevStickDirActive: Record<string, boolean> = {};
+
 function pollStickBindings(): void {
         const input = runtime.Input;
         if (!input?._currentState) return;
-        const km = (currentEntry?.keymap) || globalKeymap;
-        if (!km.sticks) return;
-        const pad = (navigator as any).getGamepads?.()?.[0];
-        if (!pad || !pad.axes || pad.axes.length < 4) return;
-        const threshold = 0.5;
-        const lx = pad.axes[0] || 0, ly = pad.axes[1] || 0;
-        const rx = pad.axes[2] || 0, ry = pad.axes[3] || 0;
-        const s = km.sticks;
-        const apply = (binding: { keyCode: number; label: string } | undefined, active: boolean) => {
-                if (!binding) return;
-                if (active) input._currentState[binding.keyCode] = true;
-                else if (input._currentState[binding.keyCode] !== undefined) input._currentState[binding.keyCode] = false;
+        const perGameSticks = currentEntry?.keymap?.sticks;
+        const globalSticks = globalKeymap.sticks;
+        // Per-direction merge: per-game wins, global fills the gaps.
+        const s = {
+                lUp: perGameSticks?.lUp || globalSticks?.lUp,
+                lDown: perGameSticks?.lDown || globalSticks?.lDown,
+                lLeft: perGameSticks?.lLeft || globalSticks?.lLeft,
+                lRight: perGameSticks?.lRight || globalSticks?.lRight,
+                rUp: perGameSticks?.rUp || globalSticks?.rUp,
+                rDown: perGameSticks?.rDown || globalSticks?.rDown,
+                rLeft: perGameSticks?.rLeft || globalSticks?.rLeft,
+                rRight: perGameSticks?.rRight || globalSticks?.rRight,
         };
-        apply(s.lUp, ly < -threshold);
-        apply(s.lDown, ly > threshold);
-        apply(s.lLeft, lx < -threshold);
-        apply(s.lRight, lx > threshold);
-        apply(s.rUp, ry < -threshold);
-        apply(s.rDown, ry > threshold);
-        apply(s.rLeft, rx < -threshold);
-        apply(s.rRight, rx > threshold);
+        // No stick bindings at all (neither per-game nor global) — bail.
+        if (!s.lUp && !s.lDown && !s.lLeft && !s.lRight && !s.rUp && !s.rDown && !s.rLeft && !s.rRight) return;
+        const pad = (navigator as any).getGamepads?.()?.[0];
+        if (!pad) return;
+        const axes = pad.axes;
+        if (!axes || axes.length < 2) return;
+        const threshold = 0.5;
+        const lx = Number(axes[0]) || 0, ly = Number(axes[1]) || 0;
+        const rx = Number(axes[2]) || 0, ry = Number(axes[3]) || 0;
+
+        // Two PATHS for stick bindings, mirroring how face buttons are handled:
+        //
+        // PATH A — KEYBOARD keyCode bindings (keyCode > 0, e.g. arrow keys):
+        //   Fire Input._onKeyDown/_onKeyUp with a synthetic KeyboardEvent on
+        //   edge press/release. This runs the game's keyMapper, which
+        //   translates keyCode → vkey (e.g. 38 → 'up') and sets
+        //   _currentState['up'] = true/false — the SAME path a real keyboard
+        //   key press takes. Without this, setting _currentState[38] directly
+        //   does NOT translate to a vkey, so Input.dir4 (which reads
+        //   _currentState['up'] etc.) never sees the press. This is why
+        //   "right-stick → arrow keys" didn't work in-game.
+        //
+        // PATH B — VKEY bindings (keyCode 0, e.g. 'ok', 'cancel', 'up'):
+        //   Set _currentState[vkeyName] directly (e.g. _currentState['ok']=true).
+        //   This is the SAME thing gamepadMapper does for face buttons —
+        //   _currentState keyed by vkey name string. No keyMapper translation
+        //   needed (the vkey IS the final key). With edge-detected release +
+        //   OR-merge (multiple stick directions can bind to the same vkey).
+        //
+        // Both paths run per-frame with edge detection, so holding a stick
+        // direction = one keydown (fires once), releasing = one keyup.
+
+        // First: compute each direction's current active state.
+        const dirNames = ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const;
+        const dirActive: Record<string, boolean> = {
+                lUp: ly < -threshold, lDown: ly > threshold,
+                lLeft: lx < -threshold, lRight: lx > threshold,
+                rUp: ry < -threshold, rDown: ry > threshold,
+                rLeft: rx < -threshold, rRight: rx > threshold,
+        };
+
+        // PATH A: keyCode bindings — edge-detected _onKeyDown/_onKeyUp.
+        for (const name of dirNames) {
+                const binding = s[name as keyof typeof s];
+                if (!binding || binding.keyCode === 0) continue; // vkey, handled in PATH B
+                const active = dirActive[name];
+                const wasActive = !!prevStickDirActive[name];
+                if (active && !wasActive) {
+                        // Press edge — fire keydown. This runs the game's keyMapper
+                        // (keyCode → vkey) AND sets _currentState[keyCode]=true,
+                        // mirroring a real keyboard key press.
+                        if (typeof input._onKeyDown === 'function') {
+                                const ev = makeSyntheticKeyboardEvent(binding.keyCode);
+                                ev.type = 'keydown';
+                                input._onKeyDown(ev);
+                        }
+                } else if (!active && wasActive) {
+                        // Release edge — fire keyup.
+                        if (typeof input._onKeyUp === 'function') {
+                                const ev = makeSyntheticKeyboardEvent(binding.keyCode);
+                                ev.type = 'keyup';
+                                input._onKeyUp(ev);
+                        }
+                }
+        }
+
+        // PATH B: vkey bindings — directly set _currentState[vkeyName], with
+        // OR-merge (multiple stick directions → same vkey) and edge-detected
+        // release (only set false on the release transition, not every idle
+        // frame — otherwise we'd fight _updateGamepadState's management of
+        // the same vkey from face buttons).
+        const vkeyActive = new Map<string, boolean>();
+        for (const name of dirNames) {
+                const binding = s[name as keyof typeof s];
+                if (!binding || binding.keyCode !== 0) continue; // keyCode, handled in PATH A
+                const active = dirActive[name];
+                vkeyActive.set(binding.label, (vkeyActive.get(binding.label) || false) || active);
+        }
+        for (const [vkey, active] of vkeyActive) {
+                if (active) {
+                        input._currentState[vkey] = true;
+                } else {
+                        // Only set false if some direction bound to this vkey
+                        // was active last frame (release transition).
+                        let justReleased = false;
+                        for (const name of dirNames) {
+                                const binding = s[name as keyof typeof s];
+                                if (!binding || binding.keyCode !== 0) continue;
+                                if (binding.label === vkey && prevStickDirActive[name]) { justReleased = true; break; }
+                        }
+                        if (justReleased) input._currentState[vkey] = false;
+                }
+        }
+
+        // Save current states for next frame's edge detection.
+        for (const name of dirNames) prevStickDirActive[name] = dirActive[name];
 }
 
 /** Build a synthetic KeyboardEvent-like object that RPG Maker MV's
@@ -2350,12 +2628,19 @@ function makeSyntheticKeyboardEvent(keyCode: number) {
 function pollButtonBindings(): void {
         const input = runtime.Input;
         if (!input) return;
-        const km = (currentEntry?.keymap) || globalKeymap;
-        if (!km.keyCodes) return;
+        // Per-button MERGE (same semantics as pollStickBindings): the per-game
+        // keymap's keyCode overrides the global one PER BUTTON, so a per-game
+        // keymap that only customizes SOME buttons still inherits the rest
+        // from the global default. Without this, a per-game keymap with a
+        // partial keyCode array would silently drop the global bindings for
+        // the buttons it doesn't override.
+        const perGameKc = currentEntry?.keymap?.keyCodes;
+        const globalKc = globalKeymap.keyCodes;
+        if (!perGameKc && !globalKc) return;
         const pad = (navigator as any).getGamepads?.()?.[0];
         if (!pad || !pad.buttons) return;
         for (let i = 0; i < 16; i++) {
-                const kc = km.keyCodes[i];
+                const kc = perGameKc?.[i] || globalKc?.[i];
                 if (!kc) continue; // No keyCode binding — gamepadMapper handles it.
                 const pressed = !!pad.buttons[i]?.pressed;
                 const wasPressed = !!input._buttonKeyState?.[i];
@@ -2417,6 +2702,37 @@ const GAME_OPTIONS_COUNT = 14;
 
 function libraryTileCount() { return library.games.length + LIBRARY_ACTION_TILES; }
 
+/** Navigate the library grid vertically by a full row, preserving the
+ *  column. Wraps around (top row ↑ → same column on the bottom row, and
+ *  vice versa) so the cursor cycles through one column on every press,
+ *  mirroring how horizontal Left/Right cycle through one row.
+ *
+ *  When the target cell doesn't exist (the last row is partial — e.g.
+ *  only 2 action tiles fill a 4-wide row), the cursor clamps to the
+ *  last valid tile so the column-jump is minimal instead of skipping
+ *  past the end of the list.
+ *
+ *  Returns the cursor unchanged when there is only a single row
+ *  (total <= cols): vertical movement has no meaning on a 1-row grid,
+ *  and the caller asked for up/down only "when rows become 2 or more".
+ *
+ *  `direction` is -1 for Up, +1 for Down. */
+function libraryNavigateRow(cursor: number, total: number, cols: number, direction: -1 | 1): number {
+        if (total <= cols) return cursor; // single row — no vertical movement
+        const rowCount = Math.ceil(total / cols);
+        const row = Math.floor(cursor / cols);
+        const col = cursor % cols;
+        let newRow = row + direction;
+        if (newRow < 0) newRow = rowCount - 1;        // wrap top → bottom
+        else if (newRow >= rowCount) newRow = 0;       // wrap bottom → top
+        let target = newRow * cols + col;
+        // Partial last row: the target column may not exist there.
+        // Clamp to the last valid tile so the cursor lands on the nearest
+        // available cell instead of skipping past the end of the list.
+        if (target >= total) target = total - 1;
+        return target;
+}
+
 let frameLoggedFirst = false;
 function frame(now: number) {
         try {
@@ -2429,8 +2745,21 @@ function frame(now: number) {
                         if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
                         else if (!waitForRelease) {
                                 const total = libraryTileCount();
-                                if (edge(12) || edge(14)) libraryCursor = (libraryCursor + total - 1) % total;
-                                if (edge(13) || edge(15)) libraryCursor = (libraryCursor + 1) % total;
+                                // Horizontal: D-Left/D-Right move by one tile,
+                                // wrapping through the whole list (row 0
+                                // col 0 ← wraps to the last tile, etc.).
+                                if (edge(14)) libraryCursor = (libraryCursor + total - 1) % total;
+                                if (edge(15)) libraryCursor = (libraryCursor + 1) % total;
+                                // Vertical: D-Up/D-Down move by a FULL ROW
+                                // (LIBRARY_COLS), preserving the column, so the
+                                // user can move between the two rows of the 4×2
+                                // grid instead of stepping one tile at a time.
+                                // Wraps top↔bottom on the same column. Only
+                                // active when there are 2+ rows; on a single-
+                                // row grid Up/Down are no-ops (Left/Right cover
+                                // all horizontal movement already).
+                                if (edge(12)) libraryCursor = libraryNavigateRow(libraryCursor, total, LIBRARY_COLS, -1);
+                                if (edge(13)) libraryCursor = libraryNavigateRow(libraryCursor, total, LIBRARY_COLS, 1);
                                 // Page boundary: switch page when crossing rows.
                                 const pageStart = libraryPage * LIBRARY_PAGE_SIZE;
                                 if (libraryCursor < pageStart) { libraryPage = Math.max(0, libraryPage - 1); invalidateCoverCache(); }
@@ -2843,11 +3172,18 @@ function frame(now: number) {
                                 // Use the centered quit dialog (compact, game visible).
                                 renderQuitDialog();
                         } else {
-                                panel(['BurialNX', message, 'B: return'], true);
+                                // Small centered popup (same style as the exit dialog)
+                                // for success/info notices — replaces the old
+                                // full-screen panel that hid the underlying screen.
+                                renderNoticePopup(message);
                         }
                         if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
-                        else if (!waitForRelease && (buttons?.[0]?.pressed && !previousButtons[0])) {
+                        else if (!waitForRelease && ((buttons?.[0]?.pressed && !previousButtons[0]) || (!exitNoticeArmed && buttons?.[1]?.pressed && !previousButtons[1]))) {
                                 // B: cancel — return to previous phase.
+                                // For a non-exit notice (success/info popup), A also
+                                // dismisses (acts as "OK") — same as B. For an exit
+                                // notice (exitNoticeArmed), A is handled by the next
+                                // branch and confirms the quit/return-to-library.
                                 exitNoticeArmed = false; exitArmed = false;
                                 if (host) { menu.dismiss(); phase = 'game'; }
                                 else { phase = currentEntry ? 'game-options' : 'library'; waitForRelease = true; }
@@ -2890,11 +3226,14 @@ function frame(now: number) {
                         // the user has remapped buttons for gameplay but expects
                         // standard A/B in the save/load menu.
                         overrideKeymapForSaveLoadScene();
-                        // Poll analog stick bindings: read the gamepad axes
-                        // and simulate key presses for bound keyCodes via
-                        // Input._currentState. This lets the user bind
-                        // L-stick/R-stick directions to movement keys.
-                        pollStickBindings();
+                        // NOTE: pollStickBindings() is now called from the
+                        // _updateGamepadState wrapper (installed in launch()),
+                        // NOT from the frame loop. This ensures it runs AFTER
+                        // _updateGamepadState processes face buttons — so a
+                        // stick-driven vkey (e.g. R↓→ok → _currentState['ok'])
+                        // isn't overridden by _updateGamepadState's edge-detected
+                        // false for the same vkey. See the wrapper comment in
+                        // launch() for the full rationale.
                         // Poll face-button keyCode bindings: for each button
                         // with a non-zero keyCode, fire Input._onKeyDown/
                         // _onKeyUp with a synthetic KeyboardEvent so the
@@ -2935,8 +3274,32 @@ function frame(now: number) {
                                 if (host && currentEntry) {
                                         // Auto-promote: create a per-game keymap seeded with the
                                         // current global default so subsequent edits are scoped.
+                                        // Copy EVERYTHING (buttons, labels, keyCodes, sticks) —
+                                        // not just buttons. Previously this only copied buttons,
+                                        // so the seeded per-game keymap had NO stick bindings
+                                        // (and no keyCodes/labels). The keymap editor then showed
+                                        // 'none' for every stick direction, and if the user re-bound
+                                        // only the LEFT stick (because it was the one they cared
+                                        // about at the moment), the per-game keymap ended up with
+                                        // left-stick bindings only — and because the per-game
+                                        // keymap took precedence over global in pollStickBindings,
+                                        // the RIGHT-stick bindings the user had set globally were
+                                        // silently ignored. Now the seed is a FULL copy of the
+                                        // global keymap, so the editor shows the user's existing
+                                        // bindings and they can edit individual directions without
+                                        // losing the rest.
                                         if (!currentEntry.keymap) {
-                                                const seeded: LibraryEntry = { ...currentEntry, keymap: { buttons: [...globalKeymap.buttons] } };
+                                                const seededKm: KeyMap = { buttons: [...globalKeymap.buttons] };
+                                                if (globalKeymap.labels) seededKm.labels = [...globalKeymap.labels];
+                                                if (globalKeymap.keyCodes) seededKm.keyCodes = [...globalKeymap.keyCodes];
+                                                if (globalKeymap.sticks) {
+                                                        seededKm.sticks = {};
+                                                        for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
+                                                                const b = globalKeymap.sticks[dir];
+                                                                if (b) seededKm.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                                                        }
+                                                }
+                                                const seeded: LibraryEntry = { ...currentEntry, keymap: seededKm };
                                                 if (rememberLibrary(seeded)) currentEntry = seeded;
                                         }
                                         openKeymapEditor(currentEntry);
@@ -3027,7 +3390,21 @@ function nextKey(key: VirtualKey): VirtualKey {
 function applyPreset(index: number) {
         const preset = PRESETS[index];
         if (!preset) return;
+        // A preset only redefines the 16 face-button → vkey mappings. It does
+        // NOT touch analog-stick bindings (presets don't model sticks), so the
+        // user's L/R-stick → keyboard-key bindings survive a preset switch.
+        // Without preserving sticks here, applying any preset would silently
+        // wipe the user's stick bindings (same root cause as the editor
+        // display bug — sticks were dropped on every KeyMap copy).
+        const savedSticks = editingKeymap.sticks;
         editingKeymap = { buttons: [...preset.map.buttons] };
+        if (savedSticks) {
+                editingKeymap.sticks = {};
+                for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
+                        const b = savedSticks[dir];
+                        if (b) editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                }
+        }
         saveEditingKeymap();
         if (__DEBUG__) log(`Applied preset: ${preset.name}`);
 }
@@ -3065,10 +3442,10 @@ function saveEditingKeymap() {
         }
         if (host && runtime?.Input) {
                 try {
-                        const active = (keymapTarget && keymapTarget !== 'global' && (keymapTarget as LibraryEntry).keymap)
-                                ? (keymapTarget as LibraryEntry).keymap!
-                                : globalKeymap;
-                        applyKeyMap(runtime, active);
+                        // Re-apply the MERGED keymap (per-game + global) to the
+                        // running game's gamepadMapper, so a change to either the
+                        // per-game or global keymap takes effect immediately.
+                        applyKeyMap(runtime, mergedKeymap());
                         if (__DEBUG__) log('Keymap re-applied to running game');
                 } catch (error) { log(`Could not re-apply keymap: ${String(error)}`); }
         }
@@ -3081,12 +3458,28 @@ function saveEditingKeymap() {
 function openKeymapEditor(target: 'global' | LibraryEntry) {
         keymapTarget = target;
         const source = target === 'global' ? globalKeymap : (target.keymap || globalKeymap);
-        // Copy BOTH buttons AND labels — without labels, the editor
-        // shows the vkey (e.g. 'ok') instead of the bound label
-        // (e.g. '1', 'W', 'Enter'). This was the root cause of the
-        // "bindings reset to ok" bug.
+        // Copy buttons, labels, keyCodes AND sticks from the source keymap.
+        // Missing any one of these caused display bugs:
+        //  - no labels  → editor shows the vkey ('ok') instead of the bound
+        //    key label ('1', 'W', 'Enter') — the "bindings reset to ok" bug.
+        //  - no sticks   → analog-stick bindings (e.g. L-stick ↑ = arrow key)
+        //    work at runtime (pollStickBindings reads currentEntry.keymap /
+        //    globalKeymap directly) but the editor grid shows 'none' for every
+        //    stick direction, so the user thinks nothing is assigned. This
+        //    was the root cause of the "stick bindings don't show in settings"
+        //    bug.
         editingKeymap = { buttons: [...source.buttons] };
         if (source.labels) editingKeymap.labels = [...source.labels];
+        if (source.keyCodes) editingKeymap.keyCodes = [...source.keyCodes];
+        if (source.sticks) {
+                // Shallow-clone each stick binding so editing the working copy
+                // never mutates the saved source map.
+                editingKeymap.sticks = {};
+                for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
+                        const b = source.sticks[dir];
+                        if (b) editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                }
+        }
         keymapCursor = 0;
         waitForRelease = true;
         phase = 'keymap';
