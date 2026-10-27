@@ -656,19 +656,31 @@ function quitApp(mode: QuitMode) {
         log(`_exit: calling Switch.exit() [wasForwarder=${wasForwarder}]`);
         if (realExit) {
                 allowExit = true;
-                // CRITICAL: Remove all session event listeners BEFORE calling
-                // Switch.exit(). The Atmosphere crash report showed infinite
-                // recursion (stack overflow) during exit — the repeating stack
-                // pattern (nxjs C++ → V8 → C++ → V8 → ...) indicates that
-                // Switch.exit() dispatches a beforeunload event, and the
-                // handler's execution triggers another beforeunload (or
-                // similar event), creating an unbreakable recursive loop that
-                // overflows the 1 MB stack. Removing the listeners means
-                // Switch.exit() can't dispatch events to our handlers, breaking
-                // the recursion cycle. Also deferred to the next tick via
-                // setTimeout so the current frame() returns cleanly first.
+                // CRITICAL: The Atmosphere crash reports (3 separate crashes, all
+                // identical) show infinite recursion in the nx.js event loop during
+                // Switch.exit(): the repeating stack pattern (nxjs C++ → V8 → C++ →
+                // V8 → ...) overflows the 1 MB stack. Switch.exit() dispatches events
+                // (beforeunload, error, etc.) to our handlers, which trigger JavaScript
+                // callbacks, which call back into C++, creating the cycle.
+                //
+                // Previous fix (removeBeforeUnloadListener only) was INSUFFICIENT —
+                // the crash still occurs. The crash happens even on release builds.
+                //
+                // NEW FIX: remove the beforeunload listener IMMEDIATELY (so the
+                // beforeunload during the current tick is harmless), then inside
+                // the setTimeout callback (right before Switch.exit), remove ALL
+                // remaining listeners (error, unhandledrejection). This ensures
+                // that when Switch.exit() runs on the next tick, NO event listeners
+                // are registered — no recursion is possible.
+                //
+                // The error/unhandledrejection listeners are kept active BETWEEN
+                // quitApp returning and the setTimeout firing, so residual errors
+                // from the retired game frame loop are still suppressed (the test
+                // "retired game frame loop" verifies this — it dispatches a fake
+                // error event synchronously, before the setTimeout fires).
                 removeBeforeUnloadListener();
                 setTimeout(() => {
+                        removeAllSessionListeners();
                         try { realExit(); } catch (e) { log(`_exit: Switch.exit threw: ${e instanceof Error ? e.message : String(e)}`); }
                 }, 0);
         }
@@ -1354,6 +1366,17 @@ function registerSessionListeners() {
  *  path test verifies this). Those listeners don't cause recursion because
  *  fail() has an early-return guard (if (phase === 'error') return). */
 function removeBeforeUnloadListener() {
+        try { globalThis.removeEventListener('beforeunload', sessionBeforeUnloadGuard); } catch { /* best-effort */ }
+}
+/** Remove ALL session event listeners (error, unhandledrejection, beforeunload).
+ *  Called INSIDE the setTimeout callback, right before Switch.exit() — so that
+ *  Switch.exit() can't dispatch ANY events to our handlers. The error and
+ *  unhandledrejection listeners are kept active between quitApp returning and
+ *  the setTimeout firing (so residual errors are still suppressed), then
+ *  removed inside the callback. */
+function removeAllSessionListeners() {
+        try { globalThis.removeEventListener('error', sessionErrorListener); } catch { /* best-effort */ }
+        try { globalThis.removeEventListener('unhandledrejection', sessionRejectionListener); } catch { /* best-effort */ }
         try { globalThis.removeEventListener('beforeunload', sessionBeforeUnloadGuard); } catch { /* best-effort */ }
 }
 
