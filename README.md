@@ -1,8 +1,8 @@
 # ⚰️ BurialNX
 
-**Independent Switch homebrew loader for The Coffin of Andy and Leyley**
+**Independent Switch homebrew loader for RPG Maker MV Games**
 
-BurialNX is a Nintendo Switch homebrew application built on [nx.js](https://github.com/tofuness/nx.js) that runs RPG Maker MV games on the Switch. It is not a general-purpose RPG Maker player — it is specifically tailored for *The Coffin of Andy and Leyley* (TCOAAL).
+BurialNX is a Nintendo Switch homebrew application built on [nx.js](https://github.com/tofuness/nx.js) that runs RPG Maker MV games on the Switch. It is not a general-purpose RPG Maker player — it is specifically tested on *The Coffin of Andy and Leyley* (TCOAAL).
 
 ---
 
