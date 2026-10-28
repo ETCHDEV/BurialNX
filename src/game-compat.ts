@@ -264,6 +264,44 @@ function decodeBase64(base64: string): ArrayBuffer {
         return new Uint8Array(out).buffer;
 }
 
+/** Roll back a Game_Interpreter that is waiting on a message (`_waitMode ==
+ *  'message'`) so the save captures it at the ShowText (101) / ShowChoices
+ *  (102) command instead of PAST the choice branches. On load (and on
+ *  resume after save), the interpreter re-runs 101/102 → setupChoices
+ *  re-populates $gameMessage + re-establishes the choice callback → the
+ *  choice re-displays (instead of being skipped because $gameMessage isn't
+ *  saved). The 101/401/102 commands are display-only, so re-running them
+ *  has no side effects.
+ *
+ *  Scans the interpreter's `_list` backwards from `_index - 1` for a command
+ *  with code 101 (ShowText, preferred — re-runs text + choices) or 102
+ *  (ShowChoices, fallback — choices only), stopping at a lower indent
+ *  (outside the message block). Sets `_index` to that command, clears
+ *  `_waitMode`, and clears `$gameMessage` so the re-run re-populates it
+ *  fresh. */
+function rollbackInterpreterForMessageWait(interp: any, runtime: any): void {
+        if (!interp || interp._waitMode !== 'message') return;
+        const list = interp._list;
+        if (!Array.isArray(list) || interp._index == null) return;
+        const startIndent = interp._indent ?? 0;
+        let target101 = -1, target102 = -1;
+        for (let i = interp._index - 1; i >= 0; i--) {
+                const cmd = list[i];
+                if (!cmd) continue;
+                // Stop at a lower indent (we've left the message block).
+                if (typeof cmd.indent === 'number' && cmd.indent < startIndent) break;
+                if (cmd.code === 101) { target101 = i; break; }       // ShowText — prefer (re-runs text + choices)
+                if (cmd.code === 102 && target102 < 0) target102 = i; // ShowChoices — fallback
+        }
+        const target = target101 >= 0 ? target101 : target102;
+        if (target < 0) return; // No 101/102 found — can't roll back safely.
+        interp._index = target;
+        interp._waitMode = '';
+        // Clear $gameMessage so the re-run re-populates it fresh (avoids
+        // stale text/choices state lingering from before the save).
+        try { runtime.$gameMessage?.clear?.(); } catch { /* best-effort */ }
+}
+
 /**
  * Register the font embedded in a language pack (if any) and override RPG Maker
  * MV's font selection so the game actually uses it. The .cld's fontFile is a
@@ -629,11 +667,165 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
         if (manager && typeof manager.autoSave !== 'function') manager.autoSave = function() {
                 try {
                         const data = runtime.JsonEx.stringify(this.makeSaveContents());
+                        // Write the recovery snapshot to the SD card, NOT localStorage.
+                        // nx.js implements localStorage on top of account save data, so the
+                        // first `localStorage.setItem(...)` lazily launches the profile-picker
+                        // applet (because startupUserAccount=0 means no user is preselected).
+                        // That would interrupt gameplay with a "select a user" dialog every
+                        // time autosave fires. Redirecting to a regular file on the SD card
+                        // keeps the recovery-snapshot feature working without ever touching
+                        // localStorage — consistent with how installSdSaves() writes the
+                        // game's own .rpgsave slots to the SD card.
+                        const SwitchAny = (globalThis as any).Switch;
+                        const dir = 'sdmc:/switch/burialnx/autosaves';
+                        try { SwitchAny?.mkdirSync?.(dir); } catch { /* dir may already exist */ }
+                        const path = `${dir}/${encodeURIComponent(root)}.rpgsave`;
                         // Do not overwrite recovery snapshots made by the previous loader.
-                        runtime.localStorage.setItem(`BurialNX Autosave:${encodeURIComponent(root)}`, runtime.LZString.compressToBase64(data));
+                        SwitchAny.writeFileSync(path, runtime.LZString.compressToBase64(data));
                         return true;
                 } catch { return false; }
         };
+        // === Fix: save mid-choice → load should resume ON the choice, not skip past it. ===
+        //
+        // RPG Maker MV's `DataManager.makeSaveContents` deliberately EXCLUDES
+        // `$gameMessage` from the save data (see the comment in rpg_managers.js:
+        // "A save data does not contain $gameTemp, $gameMessage, and $gameTroop").
+        // The interpreter's `_waitMode='message'` IS saved (it's on the
+        // Game_Interpreter, serialized via $gameMap). So on load:
+        //   - the interpreter is at the ShowChoices command (index past 101/102,
+        //     pointing at the first choice branch 402), `_waitMode='message'`;
+        //   - `$gameMessage` is fresh/empty (not saved);
+        //   - `updateWaitMode('message')` → `$gameMessage.isBusy()` = false →
+        //     `_waitMode=''` → the interpreter ADVANCES past the choice branches;
+        //   - the branches (402) check `_branch[indent]` which is unset (the
+        //     choice callback was never called) → skipBranch → the game skips
+        //     the entire choice → the user is "thrown further" than the choice.
+        //
+        // FIX: wrap `DataManager.makeSaveContents` to, BEFORE serializing, roll
+        // the waiting interpreter's `_index` BACK to the ShowText (101) or
+        // ShowChoices (102) command that set up the message, and clear
+        // `_waitMode`. The save then captures the interpreter at the 101/102
+        // command (not waiting). On load (and on resume after save), the
+        // interpreter RE-RUNS 101/102 → setupChoices re-populates $gameMessage
+        // + re-establishes the choice callback → setWaitMode('message') → the
+        // choice re-displays. The 101/401/102 commands are display-only (no
+        // side effects), so re-running them is safe.
+        const dataManager = runtime.DataManager;
+        if (dataManager && typeof dataManager.makeSaveContents === 'function' && !dataManager.__bnxSaveRollbackWrap) {
+                const origMakeSaveContents = dataManager.makeSaveContents;
+                dataManager.makeSaveContents = function() {
+                        try {
+                                // Roll back any interpreter waiting on a message so the choice
+                                // re-displays on load instead of being skipped.
+                                const candidates = [];
+                                if (runtime.$gameMap?._interpreter) candidates.push(runtime.$gameMap._interpreter);
+                                if (runtime.$gameTroop?._interpreter) candidates.push(runtime.$gameTroop._interpreter);
+                                for (const interp of candidates) rollbackInterpreterForMessageWait(interp, runtime);
+                        } catch { /* best-effort — never block the save */ }
+                        return origMakeSaveContents.apply(this, arguments);
+                };
+                dataManager.__bnxSaveRollbackWrap = true;
+        }
+        // === Defensive: prevent the "Cannot read properties of undefined
+        // (reading 'bitmap' / 'getPixel')" crashes when resuming from
+        // Scene_Save/Scene_Load during a dialogue choice. ===
+        //
+        // Root cause (from studying the game's rpg_core.js / rpg_windows.js):
+        // `SceneManager.pop` → `goto(prevClass)` → `new Scene_Map()` — a FRESH
+        // scene is created (scenes don't "resume"). Scene_Map.create →
+        // createMessageWindow → new Window_Message + sub-windows. Scene_Map.start
+        // → Window_Message.update → (canStart || startInput) → startMessage /
+        // _choiceWindow.start() → refresh → createContents → `this.contents =
+        // new Bitmap(...)` → setter `this._windowContentsSprite.bitmap = value`
+        // AND drawItem → resetTextColor → textColor → `this.windowskin.getPixel`.
+        // If `_windowContentsSprite` or `_windowskin` is undefined at that
+        // moment → crash.
+        //
+        // IMPORTANT: the earlier fix only suppressed `canStart`, but
+        // Window_Message.update falls through to `startInput()` when canStart
+        // is false — and startInput → `$gameMessage.isChoice()` →
+        // `_choiceWindow.start()` STILL runs the choice re-draw during the
+        // suppress window. So the suppress must cover the WHOLE message
+        // processing loop (update), not just canStart.
+        //
+        // Two-layer fix:
+        //  (1) Suppress `Window_Message.update`'s message-processing loop for
+        //      a few frames after a save/load pop (flag set by
+        //      installSaveLoadPopHook). Only the parent Window_Base.update
+        //      (window animation / openness) runs; startMessage AND startInput
+        //      (→ choice window start → refresh → drawItem → getPixel) are
+        //      deferred until the fresh scene's windows fully settle.
+        //  (2) Make Window.prototype.contents AND windowskin getters robust
+        //      against a missing _windowContentsSprite / _windowskin: lazily
+        //      create a dummy sprite+bitmap instead of crashing. Belt-and-braces
+        //      that catches any remaining undefined-sprite/bitmap access.
+        const WindowMessage = runtime.Window_Message?.prototype;
+        const WindowBaseUpdate = runtime.Window_Base?.prototype?.update;
+        if (WindowMessage && typeof WindowMessage.update === 'function' && !WindowMessage.__bnxUpdateWrap) {
+                const origUpdate = WindowMessage.update;
+                WindowMessage.update = function() {
+                        const g = runtime as any;
+                        if (g._bnxSuppressMessageStart && g._bnxSuppressMessageStart > 0) {
+                                g._bnxSuppressMessageStart--;
+                                // Skip the message/choice processing loop (the `while`
+                                // in Window_Message.update that calls canStart /
+                                // startMessage / startInput → _choiceWindow.start).
+                                // Only run the parent Window_Base.update so the
+                                // window still animates (openness etc.). This
+                                // defers BOTH startMessage AND the choice-window
+                                // start until the fresh scene's windows settle.
+                                if (typeof WindowBaseUpdate === 'function') WindowBaseUpdate.call(this);
+                                return;
+                        }
+                        return origUpdate.apply(this, arguments);
+                };
+                WindowMessage.__bnxUpdateWrap = true;
+        }
+        const WindowProto = runtime.Window?.prototype;
+        // Defensive: `contents` getter/setter — lazily create a dummy
+        // _windowContentsSprite + 1x1 bitmap if undefined (prevents the
+        // "reading 'bitmap'" crash).
+        const contentsDesc = WindowProto ? Object.getOwnPropertyDescriptor(WindowProto, 'contents') : undefined;
+        if (contentsDesc && !WindowProto.__bnxContentsWrap) {
+                WindowProto.__bnxContentsWrap = true;
+                Object.defineProperty(WindowProto, 'contents', {
+                        get: function() {
+                                if (!this._windowContentsSprite) {
+                                        this._windowContentsSprite = new runtime.Sprite();
+                                        this._windowContentsSprite.bitmap = new runtime.Bitmap(1, 1);
+                                }
+                                return this._windowContentsSprite.bitmap;
+                        },
+                        set: function(value: any) {
+                                if (!this._windowContentsSprite) this._windowContentsSprite = new runtime.Sprite();
+                                this._windowContentsSprite.bitmap = value;
+                        },
+                        configurable: true,
+                });
+        }
+        // Defensive: `windowskin` getter — lazily create a dummy _windowskin
+        // bitmap if undefined (prevents the "reading 'getPixel'" crash in
+        // Window_Base.textColor → this.windowskin.getPixel).
+        const windowskinDesc = WindowProto && !WindowProto.__bnxWindowskinWrap ? Object.getOwnPropertyDescriptor(WindowProto, 'windowskin') : undefined;
+        if (windowskinDesc && windowskinDesc.get) {
+                WindowProto.__bnxWindowskinWrap = true;
+                const origWindowskinGet = windowskinDesc.get;
+                Object.defineProperty(WindowProto, 'windowskin', {
+                        get: function() {
+                                if (this._windowskin == null) {
+                                        // Lazily create a dummy 1x1 bitmap AND try to load the real
+                                        // windowskin so textColor/getPixel don't crash on undefined.
+                                        // Bitmap.getPixel on a 1x1 returns a transparent-ish color
+                                        // (no crash) — enough to survive the resume frame.
+                                        this._windowskin = new runtime.Bitmap(1, 1);
+                                        try { this._windowskin = runtime.ImageManager?.loadSystem?.('Window') ?? this._windowskin; } catch { /* keep dummy */ }
+                                }
+                                return origWindowskinGet.call(this);
+                        },
+                        set: windowskinDesc.set,
+                        configurable: true,
+                });
+        }
         if (language) {
                 const message = runtime.Game_Message?.prototype;
                 if (message) {

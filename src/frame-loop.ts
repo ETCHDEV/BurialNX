@@ -28,12 +28,13 @@ import { renderGameOptions } from './render-options';
 import { renderKeymap, renderRenameKb } from './keymap-render';
 import { renderQuitDialog, renderNoticePopup, hud } from './render-overlay';
 import { diagnoseScene } from './diagnostics';
-import { overrideKeymapForSaveLoadScene } from './save-load-keymap';
+import { overrideKeymapForSaveLoadScene, isSaveLoadKeymapActive } from './save-load-keymap';
 import { pollButtonBindings } from './stick-bindings';
 import { libraryTileCount, libraryNavigateRow } from './library-nav';
 import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection } from './selection';
 import { getAllPickKeys, findNearestKey } from './keymap-layout';
 import { openKeymapEditor, applyPreset, saveEditingKeymap, handleKeymapTouch, mergedKeymap } from './keymap-editor';
+import { menuButtonIndicesFor, faceButtonLetter } from './keymap';
 import { suggestGameName, finishAddGame, startForwarderBuild } from './add-game';
 import { saveUserCoverLogged, deriveDefaultCover, coverPathFor } from './cover';
 import { invalidateCoverCache } from './cover-cache';
@@ -124,6 +125,20 @@ export function frame(now: number) {
                 const buttons = (navigator as any).getGamepads?.()?.[0]?.buttons || null;
                 const down = (id: number) => !!buttons?.[id]?.pressed;
                 const edge = (id: number) => down(id) && !S.previousButtons[id];
+                // Dynamic confirm/cancel button indices for the loader's OWN
+                // menus (save-choice, game-save-choice, import-confirm, notice,
+                // pause menu). If the active keymap (per-game merged with the
+                // global default) maps Nintendo A/B to ok/cancel, the menus
+                // mirror that assignment so a player who swapped A/B for the
+                // game gets the SAME swap in every loader screen. See
+                // menuButtonIndicesFor() in src/keymap.ts for the exact rule.
+                // `mc` / `mx` are the CONFIRM / CANCEL button indices; `lc` /
+                // `lx` are their printable letters ('A'/'B') for panel hints.
+                const m = menuButtonIndicesFor(mergedKeymap());
+                const mc = m.confirm, mx = m.cancel;
+                const lc = faceButtonLetter(mc), lx = faceButtonLetter(mx);
+                const edgeC = () => down(mc) && !S.previousButtons[mc];
+                const edgeX = () => down(mx) && !S.previousButtons[mx];
                 if (S.phase === 'library') {
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
@@ -150,7 +165,7 @@ export function frame(now: number) {
                                 const isAction = S.libraryCursor >= S.library.games.length;
                                 const actionIdx = S.libraryCursor - S.library.games.length;
                                 const entry = !isAction ? S.library.games[S.libraryCursor] : null;
-                                if (edge(1)) {
+                                if (edgeC()) {
                                         if (isAction) {
                                                 if (actionIdx === 0) { S.browser = new FolderBrowser((Switch as any), 'game', 'sdmc:/switch/burialnx'); S.pickerPurpose = 'add-game'; S.waitForRelease = true; S.phase = 'picker'; }
                                                 else if (actionIdx === 1) openKeymapEditor('global');
@@ -216,8 +231,8 @@ export function frame(now: number) {
                                                 try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                                         }
                                 }
-                                if (edge(0)) { S.waitForRelease = true; S.phase = 'library'; }
-                                else if (edge(1)) {
+                                if (edgeX()) { S.waitForRelease = true; S.phase = 'library'; }
+                                else if (edgeC()) {
                                         if (S.gameOptionsCursor === 0) {
                                                 // Play
                                                 if (S.currentEntry) { loadEntryIntoState(S.currentEntry); startOrChooseSaves(); }
@@ -345,8 +360,8 @@ export function frame(now: number) {
                                         if (edge(13)) S.keymapPickCursor = findNearestKey(S.keymapPickCursor, 0, 1);  // Down
                                         if (edge(14)) S.keymapPickCursor = findNearestKey(S.keymapPickCursor, -1, 0); // Left
                                         if (edge(15)) S.keymapPickCursor = findNearestKey(S.keymapPickCursor, 1, 0);  // Right
-                                        // A: bind the selected key
-                                        if (edge(1)) {
+                                        // CONFIRM: bind the selected key
+                                        if (edgeC()) {
                                                 const def = getAllPickKeys()[S.keymapPickCursor];
                                                 if (def && def.label) {
                                                         if (S.keymapCursor < 16) {
@@ -363,16 +378,16 @@ export function frame(now: number) {
                                                         S.waitForRelease = true;
                                                 }
                                         }
-                                        // B: back to button grid
-                                        if (edge(0)) { S.keymapPicking = false; S.waitForRelease = true; }
+                                        // CANCEL: back to button grid
+                                        if (edgeX()) { S.keymapPicking = false; S.waitForRelease = true; }
                                 } else {
                                         // Phase 1: button grid navigation (24 entries: 16 buttons + 8 stick dirs)
                                         if (edge(12)) S.keymapCursor = (S.keymapCursor + 20) % 24;
                                         if (edge(13)) S.keymapCursor = (S.keymapCursor + 4) % 24;
                                         if (edge(14)) { const r = S.keymapCursor % 4; S.keymapCursor = r === 0 ? S.keymapCursor + 3 : S.keymapCursor - 1; }
                                         if (edge(15)) { const r = S.keymapCursor % 4; S.keymapCursor = r === 3 ? S.keymapCursor - 3 : S.keymapCursor + 1; }
-                                        // A: enter keyboard picker for this button/stick
-                                        if (edge(1)) { S.keymapPicking = true; S.keymapPickCursor = 0; S.waitForRelease = true; }
+                                        // CONFIRM: enter keyboard picker for this button/stick
+                                        if (edgeC()) { S.keymapPicking = true; S.keymapPickCursor = 0; S.waitForRelease = true; }
                                         // X: clear binding (set to none)
                                         if (edge(3)) {
                                                 if (S.keymapCursor < 16) {
@@ -384,8 +399,8 @@ export function frame(now: number) {
                                                 }
                                                 saveEditingKeymap();
                                         }
-                                        // B: back to library/game
-                                        if (edge(0)) { S.waitForRelease = true; S.phase = S.host ? 'game' : 'library'; if (S.host) S.menu.dismiss(); }
+                                        // CANCEL: back to library/game
+                                        if (edgeX()) { S.waitForRelease = true; S.phase = S.host ? 'game' : 'library'; if (S.host) S.menu.dismiss(); }
                                         // Presets
                                         if (edge(4)) applyPreset(0);
                                         if (edge(5)) applyPreset(1);
@@ -401,8 +416,8 @@ export function frame(now: number) {
                         else if (!S.waitForRelease) {
                                 if (edge(13)) S.gameOptionsCursor = (S.gameOptionsCursor + 1) % 2;
                                 if (edge(12)) S.gameOptionsCursor = (S.gameOptionsCursor + 2) % 2;
-                                if (edge(0)) { S.waitForRelease = true; S.phase = 'game-options'; } // B: back
-                                else if (edge(1) && S.currentEntry) {
+                                if (edgeX()) { S.waitForRelease = true; S.phase = 'game-options'; } // CANCEL: back
+                                else if (edgeC() && S.currentEntry) {
                                         if (S.gameOptionsCursor === 0) {
                                                 // Option 1: Type a custom name — open the keyboard.
                                                 const vk = (navigator as any)?.virtualKeyboard;
@@ -487,7 +502,7 @@ export function frame(now: number) {
                                 }
                                 S.ctx.font = '16px sans-serif';
                                 S.ctx.fillStyle = '#6e7681';
-                                S.ctx.fillText('Up/Down: select  A: choose  B: back', 28, (screen as any).height - 20);
+                                S.ctx.fillText(`Up/Down: select  ${lc}: choose  ${lx}: back`, 28, (screen as any).height - 20);
                                 S.ctx.restore();
                         }
                 } else if (S.phase === 'rename-kb' || S.phase === 'add-game-name') {
@@ -511,7 +526,7 @@ export function frame(now: number) {
                                 }
                                 if (edge(14) && S.renameCursor > 0) S.renameCursor--;
                                 if (edge(15) && S.renameCursor < S.renameBuffer.length - 1) S.renameCursor++;
-                                if (edge(1)) { // A: confirm
+                                if (edgeC()) { // CONFIRM: save
                                         if (S.currentEntry) {
                                                 const updated: any = { ...S.currentEntry, name: S.renameBuffer };
                                                 if (rememberLibrary(updated)) { S.currentEntry = updated; S.message = 'Name changed.'; }
@@ -519,13 +534,13 @@ export function frame(now: number) {
                                                 S.waitForRelease = true; S.phase = 'notice';
                                         }
                                 }
-                                if (edge(0)) { S.waitForRelease = true; S.phase = 'game-options'; } // B: cancel
+                                if (edgeX()) { S.waitForRelease = true; S.phase = 'game-options'; } // CANCEL: back
                         }
-                        panel(S.ctx!, ['BurialNX — rename game', 'Up/Down: cycle char  Left/Right: move  A: save  B: cancel', `Name: ${S.renameBuffer}`, `Pos: ${S.renameCursor + 1}/${S.renameBuffer.length}`], true);
+                        panel(S.ctx!, ['BurialNX — rename game', `Up/Down: cycle char  Left/Right: move  ${lc}: save  ${lx}: cancel`, `Name: ${S.renameBuffer}`, `Pos: ${S.renameCursor + 1}/${S.renameBuffer.length}`], true);
                 } else if (S.phase === 'picker') {
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
-                                const result = S.browser.step(buttons);
+                                const result = S.browser.step(buttons, mc, mx);
                                 if (result !== undefined) {
                                         if (S.pickerPurpose === 'game' && result !== null) {
                                                 S.selectedGame = result; S.sharedSaves = S.browser.sharedSaves;
@@ -632,7 +647,7 @@ export function frame(now: number) {
                                 }
                         }
                         const first = Math.max(0, Math.min(S.browser.selected - 7, S.browser.entries.length - 12));
-                        const hint = S.browser.mode === 'game' ? 'A: open  B: back/cancel  X: select  Y: select (shared saves)' : S.browser.mode === 'mod' ? 'A: open  B: back/cancel  X: select  Y: no mod' : S.browser.mode === 'image' ? 'A: pick file  B: back/cancel' : 'A: open  B: back/cancel  X: select';
+                        const hint = S.browser.mode === 'game' ? `${lc}: open  ${lx}: back/cancel  X: select  Y: select (shared saves)` : S.browser.mode === 'mod' ? `${lc}: open  ${lx}: back/cancel  X: select  Y: no mod` : S.browser.mode === 'image' ? `${lc}: pick file  ${lx}: back/cancel` : `${lc}: open  ${lx}: back/cancel  X: select`;
                         const showFiles = S.browser.mode === 'image';
                         const entryLines = S.browser.entries.slice(first, first + 12).map((name: string, index: number) => {
                                 const marker = first + index === S.browser.selected ? '> ' : '  ';
@@ -645,27 +660,27 @@ export function frame(now: number) {
                                 return `${marker}${name}${tag}`;
                         });
                         panel(S.ctx!, [`BurialNX — select ${S.browser.mode} ${showFiles ? 'image' : 'folder'}`, `${S.browser.path}/`,
-                                'Up/Down: highlight  A: open/select  B: parent  X: select', hint, S.browser.message,
+                                `Up/Down: highlight  ${lc}: open/select  ${lx}: parent  X: select`, hint, S.browser.message,
                                 ...entryLines], true);
                 } else if (S.phase === 'save-choice') {
-                        panel(S.ctx!, ['BurialNX — save location', 'A: Switch user save data', 'X: choose an SD-card folder', 'Y: use the game’s save folder', ...(S.choiceFromMenu ? ['B: cancel'] : ['Select where new saves will be stored.'])], true);
+                        panel(S.ctx!, ['BurialNX — save location', `${lc}: Switch user save data`, 'X: choose an SD-card folder', 'Y: use the game’s save folder', ...(S.choiceFromMenu ? [`${lx}: cancel`] : ['Select where new saves will be stored.'])], true);
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
-                        else if (!S.waitForRelease && buttons?.[1]?.pressed && !S.previousButtons[1]) chooseSaves({ kind: 'switch' });
+                        else if (!S.waitForRelease && edgeC()) chooseSaves({ kind: 'switch' });
                         else if (!S.waitForRelease && buttons?.[3]?.pressed && !S.previousButtons[3]) { const saveStart = S.saveLocation?.kind === 'sd' ? S.saveLocation.folder : (S.selectedGame?.replace(/\/www$/i, '') || S.selectedGame); S.browser = new FolderBrowser((Switch as any), 'saves', saveStart); S.pickerPurpose = S.choiceFromMenu ? 'menu-saves' : 'startup-saves'; S.waitForRelease = true; S.phase = 'picker'; }
                         else if (!S.waitForRelease && buttons?.[2]?.pressed && !S.previousButtons[2]) { S.waitForRelease = true; S.phase = 'game-save-choice'; }
-                        else if (!S.waitForRelease && S.choiceFromMenu && buttons?.[0]?.pressed && !S.previousButtons[0]) { S.menu.dismiss(); S.phase = 'game'; }
+                        else if (!S.waitForRelease && S.choiceFromMenu && edgeX()) { S.menu.dismiss(); S.phase = 'game'; }
                 } else if (S.phase === 'game-save-choice') {
                         const folders = gameSaveFolders(S.selectedGame!);
-                        panel(S.ctx!, ['BurialNX — use game-folder saves', 'Saves will be written in the game folder. Back them up first.', `A: ${folders[0]}`, ...(folders[1] ? [`X: ${folders[1]}`] : []), 'A missing save folder will be created. B: back.'], true);
+                        panel(S.ctx!, ['BurialNX — use game-folder saves', 'Saves will be written in the game folder. Back them up first.', `${lc}: ${folders[0]}`, ...(folders[1] ? [`X: ${folders[1]}`] : []), `A missing save folder will be created. ${lx}: back.`], true);
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
-                        else if (!S.waitForRelease && buttons?.[1]?.pressed && !S.previousButtons[1]) chooseSaves({ kind: 'game', folder: folders[0] });
+                        else if (!S.waitForRelease && edgeC()) chooseSaves({ kind: 'game', folder: folders[0] });
                         else if (!S.waitForRelease && folders[1] && buttons?.[3]?.pressed && !S.previousButtons[3]) chooseSaves({ kind: 'game', folder: folders[1] });
-                        else if (!S.waitForRelease && buttons?.[0]?.pressed && !S.previousButtons[0]) { S.waitForRelease = true; S.phase = 'save-choice'; }
+                        else if (!S.waitForRelease && edgeX()) { S.waitForRelease = true; S.phase = 'save-choice'; }
                 } else if (S.phase === 'import-confirm') {
-                        panel(S.ctx!, ['BurialNX — Steam saves', `Current destination: ${S.saveLocation && S.saveLocation.kind !== 'switch' ? S.saveLocation.folder : 'Switch user save data'}`, 'A: import game-folder Steam saves into this empty location', 'B: skip', 'Existing saves are never overwritten.'], true);
+                        panel(S.ctx!, ['BurialNX — Steam saves', `Current destination: ${S.saveLocation && S.saveLocation.kind !== 'switch' ? S.saveLocation.folder : 'Switch user save data'}`, `${lc}: import game-folder Steam saves into this empty location`, `${lx}: skip`, 'Existing saves are never overwritten.'], true);
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
-                        else if (!S.waitForRelease && ((buttons?.[1]?.pressed && !S.previousButtons[1]) || (buttons?.[0]?.pressed && !S.previousButtons[0]))) {
-                                const wantsImport = !!buttons?.[1]?.pressed;
+                        else if (!S.waitForRelease && (edgeC() || edgeX())) {
+                                const wantsImport = edgeC();
                                 if (S.choiceFromMenu) {
                                         try { S.message = wantsImport ? `Imported ${importSteamSaves(S.runtime, Switch as any, S.selectedGame!, S.saveLocation!)} Steam save slots.` : 'Import cancelled.'; }
                                         catch (error) { S.message = `Import failed: ${String(error)}`; }
@@ -683,16 +698,16 @@ export function frame(now: number) {
                                 renderNoticePopup(S.message);
                         }
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
-                        else if (!S.waitForRelease && ((buttons?.[0]?.pressed && !S.previousButtons[0]) || (!S.exitNoticeArmed && buttons?.[1]?.pressed && !S.previousButtons[1]))) {
-                                // B: cancel — return to previous phase.
-                                // For a non-exit notice (success/info popup), A also
-                                // dismisses (acts as "OK") — same as B. For an exit
-                                // notice (exitNoticeArmed), A is handled by the next
+                        else if (!S.waitForRelease && (edgeX() || (!S.exitNoticeArmed && edgeC()))) {
+                                // CANCEL: return to previous phase.
+                                // For a non-exit notice (success/info popup), CONFIRM also
+                                // dismisses (acts as "OK") — same as CANCEL. For an exit
+                                // notice (exitNoticeArmed), CONFIRM is handled by the next
                                 // branch and confirms the quit/return-to-library.
                                 S.exitNoticeArmed = false; S.exitArmed = false;
                                 if (S.host) { S.menu.dismiss(); S.phase = 'game'; }
                                 else { S.phase = S.currentEntry ? 'game-options' : 'library'; S.waitForRelease = true; }
-                        } else if (!S.waitForRelease && S.exitNoticeArmed && buttons?.[1]?.pressed && !S.previousButtons[1]) {
+                        } else if (!S.waitForRelease && S.exitNoticeArmed && edgeC()) {
                                 // A: confirm quit/return-to-library. The exit
                                 // behavior flag (see the exitBehavior
                                 // lifecycle) decides what quitApp() does; the
@@ -708,9 +723,9 @@ export function frame(now: number) {
                                 }
                         }
                 } else if (S.phase === 'error') {
-                        panel(S.ctx!, ['BurialNX — game could not start', S.message, __DEBUG__ ? `Details: ${(globalThis as any).__hostLogPath || ''}` : 'Try the debug build for details.', S.exitBehavior === 'restart' ? 'Press B to return to the library.' : 'Press B to exit BurialNX.'], true);
+                        panel(S.ctx!, ['BurialNX — game could not start', S.message, __DEBUG__ ? `Details: ${(globalThis as any).__hostLogPath || ''}` : 'Try the debug build for details.', S.exitBehavior === 'restart' ? `Press ${lx} to return to the library.` : `Press ${lx} to exit BurialNX.`], true);
                         if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
-                        else if (!S.waitForRelease && buttons?.[0]?.pressed && !S.previousButtons[0]) {
+                        else if (!S.waitForRelease && edgeX()) {
                                 S.waitForRelease = true;
                                 // A failed launch leaves half-installed game state behind. Exit
                                 // the app (teardown + exit) so the next launch is a guaranteed
@@ -732,7 +747,7 @@ export function frame(now: number) {
                         // per-game remapped layout. This prevents confusion when
                         // the user has remapped buttons for gameplay but expects
                         // standard A/B in the save/load menu.
-                        overrideKeymapForSaveLoadScene(log);
+                        overrideKeymapForSaveLoadScene(log, S.currentEntry, S.globalKeymap);
                         // NOTE: pollStickBindings() is now called from the
                         // _updateGamepadState wrapper (installed in launch()),
                         // NOT from the frame loop. This ensures it runs AFTER
@@ -740,14 +755,20 @@ export function frame(now: number) {
                         // stick-driven vkey (e.g. R↓→ok → _currentState['ok'])
                         // isn't overridden by _updateGamepadState's edge-detected
                         // false for the same vkey. See the wrapper comment in
-                        // launch() for the full rationale.
-                        // Poll face-button keyCode bindings: for each button
-                        // with a non-zero keyCode, fire Input._onKeyDown/
-                        // _onKeyUp with a synthetic KeyboardEvent so the
-                        // game's keyMapper translates it (same path as a
-                        // real keyboard key press). Buttons without a
-                        // keyCode binding are handled by gamepadMapper.
-                        pollButtonBindings(S.currentEntry, S.globalKeymap);
+                        // launch() for the full rationale. The wrapper ALSO skips
+                        // pollStickBindings while the save/load scene is active
+                        // (isSaveLoadKeymapActive) — see save-load-keymap.ts.
+                        //
+                        // SKIP pollButtonBindings while the save/load scene is
+                        // active: this is the fix for the "press B in the save
+                        // menu → game fast-forwards" bug. pollButtonBindings fires
+                        // Input._onKeyDown(B's keyCode) every frame; during
+                        // Scene_Save those keydowns leave stale _currentState
+                        // (e.g. pageDown=held) that Scene_Map reads as "fast-forward"
+                        // the moment the save menu closes. overrideKeymapForSaveLoadScene
+                        // also clears button-keyCode state on enter/exit so nothing
+                        // survives the scene boundary.
+                        if (!isSaveLoadKeymapActive()) pollButtonBindings(S.currentEntry, S.globalKeymap);
                         if (now - S.lastMemoryCheck >= 5000) {
                                 S.lastMemoryCheck = now;
                                 try {
@@ -761,7 +782,10 @@ export function frame(now: number) {
                         // menu opens immediately (holdMs=0). If bound, require
                         // 800ms hold (so the game's binding fires on press).
                         const minusBound = ((S.currentEntry?.keymap) || S.globalKeymap).buttons[8] !== 'none';
-                        const action = S.menu.step(buttons, now, minusBound ? 800 : 0);
+                        // Pass the dynamic confirm/cancel indices so the pause
+                        // menu mirrors the game's ok/cancel button mapping (the
+                        // same swap the save-choice / notice screens above use).
+                        const action = S.menu.step(buttons, now, minusBound ? 800 : 0, mc, mx);
                         if (S.mapPrefetch && S.fps >= 50 && !S.menu.blocksInput && typeof S.runtime.Scene_Map === 'function' &&
                                 S.runtime.SceneManager?._scene instanceof S.runtime.Scene_Map && S.runtime.SceneManager._sceneStarted &&
                                 !S.runtime.SceneManager._nextScene && !S.runtime.SceneManager._stopped && S.runtime.$dataMap && !S.runtime.$gamePlayer?.isTransferring?.()) {

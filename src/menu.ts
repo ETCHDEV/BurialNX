@@ -28,9 +28,19 @@ export class PauseMenu {
         get currentItems(): MenuItem[] { return this.page === 1 ? this.itemsPage1 : this.itemsPage2; }
         get blocksInput() { return this.open || this.waitForRelease; }
         dismiss() { this.open = false; this.waitForRelease = true; this.page = 1; }
-        step(buttons: ArrayLike<{ pressed: boolean }> | null, now: number, holdMs = 800): MenuItem | null {
+        step(buttons: ArrayLike<{ pressed: boolean }> | null, now: number, holdMs = 800, confirmIndex = 1, cancelIndex = 0): MenuItem | null {
                 const down = (id: number) => !!buttons?.[id]?.pressed;
                 const just = (id: number) => down(id) && !this.pressed[id];
+                // The pause menu mirrors the game's ok/cancel button mapping:
+                // the button the game uses for 'ok' selects/confirms menu items,
+                // the button the game uses for 'cancel' closes the menu / goes
+                // back. confirmIndex/cancelIndex are computed by
+                // menuButtonIndicesFor() in src/keymap.ts and passed in from the
+                // frame loop (frame-loop.ts). Defaults (1, 0) reproduce the
+                // long-standing BurialNX convention for games that haven't
+                // remapped A/B.
+                const justConfirm = () => just(confirmIndex);
+                const justCancel = () => just(cancelIndex);
                 if (!down(8)) { this.start = undefined; this.armed = true; }
                 else if (this.armed) {
                         this.start ??= now;
@@ -43,25 +53,25 @@ export class PauseMenu {
                         if (just(12)) this.selected = (this.selected + items.length - 1) % items.length;
                         if (just(13)) this.selected = (this.selected + 1) % items.length;
                         // Left/Right on the Language item cycle through languages with
-                        // auto-confirm (no A press needed). The frame function reads
+                        // auto-confirm (no confirm press needed). The frame function reads
                         // languageCycle and saves the new preference immediately.
                         if (items[this.selected] === 'language') {
                                 if (just(14)) this.languageCycle = -1; // Left
                                 if (just(15)) this.languageCycle = 1;  // Right
                         }
-                        if (just(0)) { // B: close (or go back to page 1)
+                        if (justCancel()) { // CANCEL: close (or go back to page 1)
                                 if (this.page === 2) { this.page = 1; this.selected = 4; }
                                 else { this.open = false; this.waitForRelease = true; }
                         }
-                        else if (just(1)) {
+                        else if (justConfirm()) {
                                 action = items[this.selected];
                                 if (action === 'fps') this.fps = !this.fps;
                                 if (action === 'another') { this.page = 2; this.selected = 0; action = null; }
                                 else if (action === 'back') { this.page = 1; this.selected = 4; action = null; }
                                 else if (action === 'continue' || action === 'save' || action === 'load') { this.open = false; this.waitForRelease = true; }
-                                else if (action === 'language') { this.languageCycle = 1; action = null; } // A = cycle forward
+                                else if (action === 'language') { this.languageCycle = 1; action = null; } // confirm = cycle forward
                         }
-                } else if (this.waitForRelease && !down(0) && !down(1) && !down(12) && !down(13)) this.waitForRelease = false;
+                } else if (this.waitForRelease && !down(confirmIndex) && !down(cancelIndex) && !down(12) && !down(13)) this.waitForRelease = false;
                 for (let index = 0; index < 16; index++) this.pressed[index] = down(index);
                 return action;
         }

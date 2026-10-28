@@ -276,19 +276,23 @@ class FakeVirtualKeyboard extends EventTarget {
   moveCursor(cursor) { this.cursorIndex = cursor; this.dispatchEvent(new Event('cursormove')); }
 }
 
-test('the Switch user is selected at application startup, not at first game launch', async () => {
-  // nx.js lazily shows the system profile selector from the localStorage
-  // getter. The loader now touches localStorage during startup (before any
-  // game is launched), so the user selection and save-data mount happen
-  // while the splash is still on screen — like a retail Switch title.
+test('the Switch user is NOT selected at application startup — localStorage is never touched', async () => {
+  // BurialNX ships with startupUserAccount = 0 in its NACP (see
+  // tools/nacp-patch.mjs), so the OS never preselects a user. nx.js's
+  // localStorage is backed by account save data, so the FIRST access to
+  // localStorage lazily launches the profile-picker applet — which would
+  // pop the "select a user" dialog at startup. To keep that dialog from
+  // EVER appearing, the loader must not touch localStorage at startup.
+  // This test pins that: localStorage is accessed ZERO times during boot
+  // and during library browsing / launching.
   let touches = 0;
-  const storage = { get length() { touches++; return 0; } };
+  const storage = { get length() { touches++; return 0; }, getItem: () => null, setItem() { touches++; }, removeItem() { touches++; } };
   const ui = await picker(false, { root: 'sdmc:/game/www', sharedSaves: false, mod: null, saves: { kind: 'switch' } }, new Map(), { manual: true, localStorage: storage });
-  assert.equal(touches, 1, 'localStorage was touched exactly once during startup');
-  // And no further touches while merely browsing the library.
+  assert.equal(touches, 0, 'localStorage was not touched at all during startup (no profile dialog)');
+  // And still no touches while merely browsing the library.
   await ui.tick();
   await ui.tick([1]); // A on the migrated game → launch starts.
-  assert.equal(touches, 1, 'the launch does not trigger a second profile selection');
+  assert.equal(touches, 0, 'the launch path also does not touch localStorage');
 });
 
 test('rename seeds the software keyboard with the current name and ignores Plus while typing', async () => {

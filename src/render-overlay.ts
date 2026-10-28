@@ -11,8 +11,21 @@
 
 import { S } from './state';
 import { roundedRectPath } from './canvas-utils';
+import { menuButtonIndicesFor, faceButtonLetter } from './keymap';
+import { mergedKeymap } from './keymap-editor';
 
 declare const __DEBUG__: boolean;
+
+/** The CONFIRM/CANCEL button letters ('A'/'B') for the active keymap, so
+ *  the overlay hints ("A: choose", "B: back", "A: Yes", "B: No", "B: OK")
+ *  match whichever button the game actually maps to ok/cancel. Computed
+ *  lazily on each render (cheap — two array lookups + a merge). */
+function menuLetters(): { confirm: string; cancel: string } {
+        try {
+                const m = menuButtonIndicesFor(mergedKeymap());
+                return { confirm: faceButtonLetter(m.confirm), cancel: faceButtonLetter(m.cancel) };
+        } catch { return { confirm: 'A', cancel: 'B' }; }
+}
 
 /** Heads-up display: the pause menu when open, or a compact FPS counter
  *  in the top-left when the FPS toggle is on. Called from launch()'s
@@ -68,8 +81,10 @@ export function renderPauseMenu(): void {
                 language: `Language: ${currentLanguageLabel()}`,
         };
         const items = S.menu.currentItems;
-        // Top bar (always visible when menu is open).
-        const topBar = 'BurialNX  |  Up/Down: select  A: choose  B: back/close'
+        // Top bar (always visible when menu is open). The A/B hints mirror
+        // the game's ok/cancel button mapping (see menuLetters()).
+        const letters = menuLetters();
+        const topBar = `BurialNX  |  Up/Down: select  ${letters.confirm}: choose  ${letters.cancel}: back/close`
                 + (S.menu.fps ? `  |  ${S.fps.toFixed(1)} FPS` : '');
         // FIXED panel size — accommodates the larger page (page 2 with
         // 8 items in debug, 6 in release). Using a fixed size means
@@ -153,10 +168,13 @@ export function renderQuitDialog(): void {
         S.ctx.fillText(S.message || 'Quit BurialNX?', (screen as any).width / 2, boxY + 50);
         // Buttons.
         S.ctx.font = '18px sans-serif';
+        // The Yes/No hints use the CONFIRM/CANCEL letters so a player who
+        // swapped A/B for the game gets the same swap here.
+        const letters = menuLetters();
         S.ctx.fillStyle = '#3fb950';
-        S.ctx.fillText('A: Yes', (screen as any).width / 2 - 70, boxY + 95);
+        S.ctx.fillText(`${letters.confirm}: Yes`, (screen as any).width / 2 - 70, boxY + 95);
         S.ctx.fillStyle = '#f85149';
-        S.ctx.fillText('B: No', (screen as any).width / 2 + 70, boxY + 95);
+        S.ctx.fillText(`${letters.cancel}: No`, (screen as any).width / 2 + 70, boxY + 95);
         S.ctx.textAlign = 'left';
         S.ctx.restore();
 }
@@ -250,10 +268,14 @@ export function renderNoticePopup(msg: string): void {
         for (let i = 0; i < lines.length; i++) {
                 S.ctx.fillText(lines[i], boxX + boxW / 2, textTop + i * lineH);
         }
-        // "B: OK" dismiss hint (centered, green).
+        // Dismiss hint (centered, green). Use the CONFIRM letter — a
+        // success/info notice is dismissed by the same button the game
+        // uses for 'ok' (both confirm and cancel dismiss a non-exit
+        // notice, but the hint reads more naturally as confirm/OK).
+        const letters = menuLetters();
         S.ctx.font = '18px sans-serif';
         S.ctx.fillStyle = '#3fb950';
-        S.ctx.fillText('B: OK', boxX + boxW / 2, boxY + boxH - 16);
+        S.ctx.fillText(`${letters.confirm}: OK`, boxX + boxW / 2, boxY + boxH - 16);
         S.ctx.textAlign = 'left';
         S.ctx.restore();
 }

@@ -44,6 +44,7 @@ import { validSaveLocation, remember, rememberLibrary, getGameLanguage, setGameL
 import { suggestGameName, finishAddGame, startForwarderBuild } from './add-game';
 import { mergedKeymap, openKeymapEditor, saveEditingKeymap, applyPreset, handleKeymapTouch } from './keymap-editor';
 import { frame } from './frame-loop';
+import { installLocalStorageShim } from './localstorage-shim';
 // Shared mutable state object — every field that used to be a `let` at the
 // top of this file now lives on `S` (see src/state.ts). Functions moved into
 // other modules (render-*, frame-loop, game-launch, game-lifecycle, etc.)
@@ -72,6 +73,23 @@ const settingsPath = 'sdmc:/switch/burialnx/settings.json';
 // Numbered checkpoint logs so a crash leaves a clear trail of which step
 // succeeded last. The user can then share the log and we know exactly where
 // to look. Format: `_N: <step>` with N incrementing across the whole init.
+
+// === localStorage shim (install BEFORE anything else can touch it) ======
+// This is the SECOND half of the "no profile dialog" fix. The FIRST half
+// (startupUserAccount=0 in the NACP + removing the startup `void storage
+// .length`) stopped the dialog at app boot. But nx.js's native localStorage
+// getter STILL lazily launches the profile-picker applet on first access —
+// and RPG Maker MV games/plugins reference `localStorage` directly during
+// script eval (before installSdSaves overrides StorageManager). That
+// re-triggered the dialog when the user pressed A on a game tile.
+//
+// installLocalStorageShim() replaces globalThis.localStorage with an
+// in-memory + SD-card-backed shim (sdmc:/switch/burialnx/localstorage.json)
+// that never touches account save data. Installed here, at the very first
+// init step, so it is in place for the entire app lifetime — library,
+// game launch, script eval, gameplay, autosave, everything. Idempotent.
+installLocalStorageShim();
+
 try {
         S.ctx = screen.getContext('2d');
         log(`_2: screen.getContext returned ${S.ctx ? 'a context' : 'null'}`);
@@ -83,20 +101,34 @@ try {
 // global), so the call site passes it explicitly.
 drawSplash(S.ctx, 'Loading…');
 
-// === Switch user selection (standard system flow) ======================
-// nx.js shows the system profile selector lazily from the localStorage
-// getter: without this, the "select a user" dialog pops up only when the
-// first launched game touches its saves — in the middle of the session.
-// Touching localStorage here selects the Switch user and mounts the
-// application's save data once, at application startup, before the library
-// appears — the same point where retail Switch games ask for the profile.
-// Title-override launches already carry a preselected user, so normally no
-// dialog appears at all; Album/applet launches get the standard selector.
-try {
-        const storage = (globalThis as any).localStorage;
-        if (storage) { void storage.length; log('_3: save data mounted for the selected user at startup'); }
-        else log('_3: no user save data available (localStorage disabled)');
-} catch (error) { log(`_3: user selection/save mount failed: ${error instanceof Error ? error.message : String(error)}`); }
+// === Switch user selection (fully disabled — no profile dialog) ========
+// Two things cooperate to suppress the "select a user" profile dialog:
+//
+//   1. tools/build.mjs patches the NACP with startupUserAccount = 0, so the
+//      Switch OS does NOT preselect a user or pop its own profile picker at
+//      launch, relaunch, post-sleep resume, or return from a forwarder.
+//
+//   2. THIS block deliberately does NOT touch localStorage. nx.js implements
+//      localStorage on top of account save data; the very first access to
+//      localStorage lazily calls libnx `accountGetPreselectedUser`, and
+//      when no user is preselected (startupUserAccount=0) that call falls
+//      back to LAUNCHING THE PROFILE-PICKER APPLETPLET — i.e. exactly the
+//      dialog we are trying to avoid. An earlier version of this block did
+//      `void storage.length;` "to mount save data early"; that single line
+//      was the reason the dialog kept appearing at startup even after the
+//      NACP flag was flipped. It is gone now.
+//
+// Nothing the app does at startup needs a user:
+//   • settings.json and library.json are on the SD card via
+//     Switch.writeFileSync at sdmc:/switch/burialnx/;
+//   • RPG Maker MV game saves are on the SD card via installSdSaves()
+//     overriding StorageManager to write .rpgsave files in the per-game
+//     save folder;
+//   • the autosave snapshot in src/game-compat.ts is redirected to the SD
+//     card too (see that file) so it never reaches localStorage mid-game.
+// So no user is requested, no dialog appears, and the app boots straight
+// into the library grid on every launch.
+log('_3: startupUserAccount=0 in NACP, localStorage intentionally untouched — no profile dialog');
 // Log how much memory the runtime actually granted (the nxjs.ini
 // [memory] heap_limit request) so debug logs prove the heap budget.
 if (__DEBUG__) try {

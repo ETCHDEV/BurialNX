@@ -1,0 +1,30 @@
+[main 36b4942] refactor: декомпозиция src/main.ts и внедрение глобального состояния- Сокращен src/main.ts: 4098 - строк (~11% от оригинала).- Создан типизированный объект состояния S в src/state.ts, заменивший ~60 модульных let-переменных. Вынесенные модули работают с S напрямую без бойлерплейта.- Добавлен вспомогательный скрипт tools/rewrite-state.py для прозрачности процесса (выполнял замену let - Логика и функции не менялись, изменен только scope переменных (добавлен параметр ctx для функций, зависящих от контекста).Вынесено 26 новых модулей в src/:* Архитектура и ядро:  - state.ts (205 стр.): AppState тип + createState() + синглтон S.  - frame-loop.ts (911 стр.): frame() - главный rAF-диспетчер.  - game-lifecycle.ts (250 стр.): teardownGame, quitApp, realExit.  - game-launch.ts (275 стр.): launch() - async-пайплайн запуска игры.  - error-handling.ts (125 стр.): fail, failRequest, сессионные листенеры.  - log.ts (67 стр.): debugLines, log(), console-overrides.  - diagnostics.ts (52 стр.): diagnoseScene, resetDiagnostics.* Управление и раскладка (Keymap):  - stick-bindings.ts (244 стр.): pollStickBindings, pollButtonBindings.  - keymap-editor.ts (224 стр.): mergedKeymap, handleKeymapTouch, openKeymapEditor.  - keymap-layout.ts (206 стр.): KEYMAP_COLORS, KEYBOARD_LAYOUT, навигация по клавишам.  - keymap-geometry.ts (74 стр.): KEYMAP-константы, keymapButtonCellRect, геометрические функции.  - keymap-render.ts (240 стр.): renderKeymap, renderButtonGrid, рендеринг пикеров.  - save-load-keymap.ts (42 стр.): overrideKeymapForSaveLoadScene.* Интерфейс и рендеринг:  - render-overlay.ts (259 стр.): renderPauseMenu, renderQuitDialog, hud.  - render-library.ts (184 стр.): renderLibrary, константы библиотеки.  - render-options.ts (134 стр.): renderGameOptions.  - cover-cache.ts (131 стр.): loadCoverImage, invalidateCoverCache.  - loading-screen.ts (100 стр.): состояние + функции управления экраном загрузки.  - action-icons.ts (75 стр.): actionIcons, loadActionIcons.  - splash.ts (50 стр.): drawSplash(), fatal().  - canvas-utils.ts (45 стр.): roundedRectPath, panel, truncateForDisplay.* Логика данных и сессий:  - add-game.ts (153 стр.): suggestGameName, finishAddGame, startForwarderBuild.  - game-session.ts (137 стр.): GameSessionSnapshot, beginGameSession, endGameSession.  - selection.ts (129 стр.): validSaveLocation, currentSelection, загрузка сейвов в стейт.  - library-nav.ts (43 стр.): libraryTileCount, libraryNavigateRow.  - forwarder-argv.ts (36 стр.): parseForwarderTarget.
+ Date: Wed Oct 28 17:00:48 2026 +0300
+ 28 files changed, 4746 insertions(+), 3801 deletions(-)
+ create mode 100644 src/action-icons.ts
+ create mode 100644 src/add-game.ts
+ create mode 100644 src/canvas-utils.ts
+ create mode 100644 src/cover-cache.ts
+ create mode 100644 src/diagnostics.ts
+ create mode 100644 src/error-handling.ts
+ create mode 100644 src/forwarder-argv.ts
+ create mode 100644 src/frame-loop.ts
+ create mode 100644 src/game-launch.ts
+ create mode 100644 src/game-lifecycle.ts
+ create mode 100644 src/game-session.ts
+ create mode 100644 src/keymap-editor.ts
+ create mode 100644 src/keymap-geometry.ts
+ create mode 100644 src/keymap-layout.ts
+ create mode 100644 src/keymap-render.ts
+ create mode 100644 src/library-nav.ts
+ create mode 100644 src/loading-screen.ts
+ create mode 100644 src/log.ts
+ create mode 100644 src/render-library.ts
+ create mode 100644 src/render-options.ts
+ create mode 100644 src/render-overlay.ts
+ create mode 100644 src/save-load-keymap.ts
+ create mode 100644 src/selection.ts
+ create mode 100644 src/splash.ts
+ create mode 100644 src/state.ts
+ create mode 100644 src/stick-bindings.ts
+ create mode 100644 tools/rewrite-state.py

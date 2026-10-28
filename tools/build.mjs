@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { prepareIcon } from './icon.mjs';
+import { patchNacpDefaults } from './nacp-patch.mjs';
 
 const flags = process.argv.slice(2);
 if (flags.some((flag) => flag !== '--debug' && flag !== '--default-icon')) throw new Error('Usage: npm run build -- [--debug] [--default-icon]');
@@ -66,34 +67,35 @@ try {
   const require = createRequire(import.meta.url);
   execFileSync(process.execPath, [require.resolve('@nx.js/nro/dist/main.js'), '--fat'], { cwd: staging, stdio: 'inherit' });
 
-  // Post-build: patch the NACP's save-data fields to be CONSISTENT.
-  // The @nx.js/patch-nacp package sets userAccountSaveDataSize from
-  // package.json (32768 = 32 KiB) but leaves userAccountSaveDataJournalSize
-  // at its NACP template default (0x180000 = 1.5 MiB). The inconsistency
-  // (32 KiB save data but 1.5 MiB journal) caused Switch error 2016-0910.
+  // === NACP post-build patching ==========================================
+  // Delegated to tools/nacp-patch.mjs so the logic is unit-tested (see
+  // tests/nacp-patch.test.mjs). The high-level intent:
+  //   - startupUserAccount = 0  → the Switch OS does NOT show the "select a
+  //     user" profile dialog at launch, relaunch, post-sleep resume, or
+  //     return from a forwarder. The app drops straight into the library.
+  //   - saveDataSize / journalSize kept consistent (32 KiB = 32 KiB) to
+  //     avoid Switch error 2016-0910 (the @nx.js/patch-nacp step leaves the
+  //     journal at its 1.5 MiB template default, which mismatched the
+  //     32 KiB save-data size).
+  //   - bcatDeliveryCacheStorageSize zeroed (unused).
   //
-  // Fix: set journalSize = saveDataSize = 32768 (consistent). Also
-  // zero bcatDeliveryCacheStorageSize (not needed). Keep
-  // startupUserAccount = 1 (the template default) so the user-selection
-  // dialog appears and save data is mounted → localStorage works →
-  // RPG Maker MV game saves work.
-  //
-  // The per-game forwarder NACP is separately zeroed by
-  // writeNacpForwarderDefaults() (saveData=0, journal=0,
-  // startupUserAccount=0) — the forwarder doesn't need save data.
+  // WHY startupUserAccount=0 IS SAFE FOR THE MAIN APP (not just forwarders):
+  //   • The app's own settings.json + library.json are written DIRECTLY to
+  //     sdmc:/switch/burialnx/ via Switch.writeFileSync — no localStorage.
+  //   • RPG Maker MV game saves never touch localStorage: installSdSaves()
+  //     in src/saves.ts overrides runtime.StorageManager.{save,load,exists,
+  //     remove,backup,...} to read/write regular .rpgsave files inside the
+  //     per-game save folder on the SD card.
+  //   • The autosave snapshot in src/game-compat.ts and the startup
+  //     localStorage probe in src/main.ts are both wrapped in try/catch and
+  //     degrade silently when localStorage is unavailable.
+  // See the matching long comment in src/main.ts (the startup localStorage
+  // probe) and src/forwarder.ts (writeNacpForwarderDefaults) — the main
+  // app and forwarders now use the same no-profile-dialog behavior.
   const builtNroPath = join(staging, 'burialnx.nro');
   const nroBuf = Buffer.from(readFileSync(builtNroPath));
-  const nroSize = nroBuf.readUInt32LE(0x18);
-  const assetBase = nroSize;
-  const nacpRel = nroBuf.readUInt32LE(assetBase + 0x18);
-  const nacpAbs = assetBase + nacpRel;
-  // userAccountSaveDataSize (0x3080, s64) = 32768 (from package.json, already set)
-  // userAccountSaveDataJournalSize (0x3088, s64) = 32768 (match saveDataSize)
-  nroBuf.writeBigUInt64LE(32768n, nacpAbs + 0x3088);
-  // bcatDeliveryCacheStorageSize (0x3090, s64) = 0 (not needed)
-  nroBuf.writeBigUInt64LE(0n, nacpAbs + 0x3090);
+  console.log(patchNacpDefaults(nroBuf));
   writeFileSync(builtNroPath, nroBuf);
-  console.log(`Patched NACP: saveDataSize=32768, journalSize=32768, bcatSize=0 (consistent, enables localStorage for game saves, prevents 2016-0910)`);
 
   await copyFile(builtNroPath, join(project, debug ? 'burialnx-debug.nro' : 'burialnx.nro'));
 } finally {

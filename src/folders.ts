@@ -57,14 +57,20 @@ export class FolderBrowser {
                 this.selected = Math.min(this.selected, Math.max(0, this.entries.length - 1));
                 this.pickedFile = null;
         }
-        step(buttons: ArrayLike<{ pressed: boolean }> | null): string | null | undefined {
+        step(buttons: ArrayLike<{ pressed: boolean }> | null, confirmIndex = 1, cancelIndex = 0): string | null | undefined {
                 const down = (id: number) => !!buttons?.[id]?.pressed;
                 const edge = (id: number) => down(id) && !this.previous[id];
+                // CONFIRM (the game's 'ok' button) opens/selects; CANCEL (the
+                // game's 'cancel' button) goes to the parent / cancels at root.
+                // confirmIndex/cancelIndex come from menuButtonIndicesFor() so
+                // the picker mirrors the game's A/B mapping — see frame-loop.ts.
+                const edgeConfirm = () => edge(confirmIndex);
+                const edgeCancel = () => edge(cancelIndex);
                 let result: string | null | undefined;
                 if (edge(12) && this.entries.length) this.selected = (this.selected + this.entries.length - 1) % this.entries.length;
                 if (edge(13) && this.entries.length) this.selected = (this.selected + 1) % this.entries.length;
                 const entry = this.entries[this.selected];
-                if (edge(1) && entry) {
+                if (edgeConfirm() && entry) {
                         if (this.mode === 'image' || this.mode === 'file') {
                                 // In image/file mode A picks a file, not a folder.
                                 const info = this.fs.statSync(join(this.path, entry));
@@ -72,12 +78,12 @@ export class FolderBrowser {
                                 else { this.path = join(this.path, entry); this.selected = 0; this.message = ''; this.refresh(); }
                         } else { this.path = join(this.path, entry); this.selected = 0; this.message = ''; this.refresh(); }
                 }
-                // B navigates to the parent folder. At the SD root, B cancels
-                // the picker for every mode (returns null), so the user can
+                // CANCEL navigates to the parent folder. At the SD root, CANCEL
+                // cancels the picker for every mode (returns null), so the user can
                 // always back out to the previous menu — not just from the
                 // 'saves' / 'image' modes. The legacy 'game' purpose also
                 // returns null so the new library picker can be cancelled.
-                if (edge(0)) {
+                if (edgeCancel()) {
                         if (this.path !== 'sdmc:') { this.path = this.path.slice(0, this.path.lastIndexOf('/')); this.selected = 0; this.message = ''; this.refresh(); }
                         else result = null;
                 }

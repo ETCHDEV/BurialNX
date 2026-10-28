@@ -95,6 +95,104 @@ export const PRESETS: { name: string; map: KeyMap }[] = [
         },
 ];
 
+/** Nintendo face-button LETTERS for the 16 gamepad button indices, where
+ *  the index follows the Web Gamepad API standard mapping (which BurialNX
+ *  uses via `navigator.getGamepads()[0].buttons`):
+ *    0 = South = Nintendo B (bottom)
+ *    1 = East  = Nintendo A (right)
+ *    2 = North = Nintendo X (top)
+ *    3 = West  = Nintendo Y (left)
+ *  4..11 are shoulder/trigger/stick-clicks (L/R/ZL/ZR/Minus/Plus/LSt/RSt),
+ *  12..15 are the D-pad. Only the face buttons (0..3) have meaningful
+ *  single-letter labels; the rest render their index so they're never
+ *  blank. This is what the loader's own menu panels use to print the
+ *  correct "A:" / "B:" hint for whichever button the active keymap maps
+ *  to ok/cancel (see menuButtonIndices). */
+export const FACE_BUTTON_LETTERS: readonly string[] = Object.freeze([
+        'B', 'A', 'X', 'Y', '4', '5', '6', '7', '-', '+', 'L3', 'R3', 'D↑', 'D↓', 'D←', 'D→',
+]);
+
+/** The printable letter for a gamepad button index (0..15). Face buttons
+ *  return their Nintendo label ('B'/'A'/'X'/'Y'); others return a short
+ *  symbol. Never returns an empty string. */
+export function faceButtonLetter(index: number): string {
+        return FACE_BUTTON_LETTERS[index] ?? String(index);
+}
+
+/** keyCode constants used to detect "ok" / "cancel" roles from a button's
+ *  optional keyCode binding (the `keyCodes` array on a KeyMap). RPG Maker
+ *  MV's default Input.keyMapper maps these keyCodes to the named vkeys:
+ *    enter (13) → 'ok', space (32) → 'ok', esc (27) → 'escape' (≈ cancel).
+ *  So a button bound to keyCode 13 "is ok" for menu purposes even if its
+ *  vkey entry is 'none' — the game's keyMapper translates the fired keydown
+ *  to 'ok' at runtime. */
+export const KEYCODE_ENTER = 13;
+export const KEYCODE_SPACE = 32;
+export const KEYCODE_ESCAPE = 27;
+
+/** True if button `i` acts as the "ok" (confirm) role in the game — either
+ *  via its vkey being 'ok', OR via its keyCode binding being enter/space
+ *  (which RPG Maker MV's keyMapper translates to 'ok'). */
+function isOkRoleAt(keymap: KeyMap, i: number): boolean {
+        if (keymap.buttons[i] === 'ok') return true;
+        const kc = keymap.keyCodes?.[i];
+        return kc === KEYCODE_ENTER || kc === KEYCODE_SPACE;
+}
+
+/** True if button `i` acts as the "cancel" role in the game — either via
+ *  its vkey being 'cancel' or 'escape' (RPG Maker MV treats 'escape' as a
+ *  cancel/back key alongside 'cancel'), OR via its keyCode binding being
+ *  esc (27, which the keyMapper maps to 'escape'). */
+function isCancelRoleAt(keymap: KeyMap, i: number): boolean {
+        const v = keymap.buttons[i];
+        if (v === 'cancel' || v === 'escape') return true;
+        const kc = keymap.keyCodes?.[i];
+        return kc === KEYCODE_ESCAPE;
+}
+
+/** Determine which face-button indices act as CONFIRM (ok) and CANCEL in
+ *  the loader's OWN menus (pause menu, save-choice, save/load scene,
+ *  quit/return notice, keymap editor, picker, rename, game-options,
+ *  library — EVERY loader screen).
+ *
+ *  Rule (per the user's spec, with the priority made explicit):
+ *
+ *    1. A is checked FIRST. If A (Nintendo A, button 1) is set to
+ *       ok(enter/space) or cancel(esc) — by vkey OR by keyCode — A
+ *       determines BOTH menu roles: A = its role, B = the opposite.
+ *       This holds REGARDLESS of what B is set to ("вне зависимости от
+ *       того что на B установлено").
+ *
+ *    2. Only if A is NOT set (not ok/enter/space AND not cancel/esc) do we
+ *       check B (Nintendo B, button 0). If B is set to ok or cancel, B
+ *       determines both roles: B = its role, A = the opposite.
+ *
+ *    3. If NEITHER A nor B is set → default: A = ok (confirm), B = cancel.
+ *
+ *  "Set to ok"   = vkey 'ok'                 OR keyCode enter(13)/space(32).
+ *  "Set to cancel" = vkey 'cancel'/'escape'  OR keyCode esc(27).
+ *
+ *  Only buttons 0 and 1 (Nintendo A/B) are considered — X/Y/shoulders/
+ *  D-pad never become the menu confirm/cancel.
+ *
+ *  Button indices follow the Web Gamepad API standard mapping BurialNX
+ *  uses: 0 = Nintendo B (South), 1 = Nintendo A (East). Returns
+ *  { confirm, cancel } where both are 0 or 1. */
+export function menuButtonIndicesFor(keymap: KeyMap): { confirm: number; cancel: number } {
+        const A = 1; // Nintendo A (East) = button index 1
+        const B = 0; // Nintendo B (South) = button index 0
+        // Priority: A first. If A is set (ok or cancel), A wins and B takes
+        // the opposite role — regardless of B's own binding.
+        if (isOkRoleAt(keymap, A)) return { confirm: A, cancel: B };
+        if (isCancelRoleAt(keymap, A)) return { confirm: B, cancel: A };
+        // A is NOT set → check B. If B is set, B wins and A takes the
+        // opposite role.
+        if (isOkRoleAt(keymap, B)) return { confirm: B, cancel: A };
+        if (isCancelRoleAt(keymap, B)) return { confirm: A, cancel: B };
+        // Neither A nor B is set → default: A = ok (confirm), B = cancel.
+        return { confirm: A, cancel: B };
+}
+
 export function parseKeyMap(text: string): KeyMap {
         const data = JSON.parse(text);
         if (!data || typeof data !== 'object') throw new Error('Invalid key map');
