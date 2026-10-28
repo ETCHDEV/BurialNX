@@ -45,7 +45,7 @@ Options are fully translated — Always Dash, BGM/SFX Volume, On/Off — using t
 - **Mod support** — select a mod folder, enable/disable per-game
 - **Save management** — Switch user data, SD card, or game folder; import Steam saves
 
-### 🌍 Localization (Russian)
+### 🌍 Localization (.cld files in games)
 - **`.cld` language pack** loading — text, embedded font, translated images
 - **Full translation** — menu items, dialogue, options (Always Dash → Всегда бежать, BGM Volume → Громкость музыки, On/Off → Вкл./Выкл.)
 - **YEP_MessageCore override** — dialogue windows use the localized font with Cyrillic glyphs
@@ -56,7 +56,7 @@ Options are fully translated — Always Dash, BGM/SFX Volume, On/Off — using t
 - **Selection border** renders on top of cover images
 - **Cover format support** — PNG, JPG, JPEG, GIF, WebP, ICO, EXE (auto-detect from magic bytes)
 - **Marquee scrolling** for long game names
-- **Touch screen** support for all UI navigation
+- **Touch screen** support for part of UI navigation - Key Remapping.
 
 ### 🕹️ Key Remapping
 - **Visual keyboard picker** — 60+ keys, navigate with D-pad or touch
