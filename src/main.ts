@@ -30,31 +30,20 @@ const debugLines: string[] = [];
 const runtime = globalThis as any;
 const settingsPath = 'sdmc:/switch/burialnx/settings.json';
 const logsPath = 'sdmc:/switch/burialnx/LOGS';
-// Each app launch gets its own numbered log file: native-host_1.log,
-// native-host_2.log, … so the user can attach the log from a specific
-// session without it being overwritten by a later one. The number is
-// derived by scanning the LOGS directory for the highest existing N.
-// Falls back to the legacy single-file path if the directory can't be
-// scanned (e.g. SD read error).
-function pickLogPath(): string {
-        try {
-                (Switch as any).mkdirSync?.(logsPath);
-                let maxN = 0;
-                const entries = (Switch as any).readDirSync?.(`${logsPath}/`) as string[] | null;
-                if (entries) {
-                        for (const name of entries) {
-                                const m = /^native-host_(\d+)\.log$/i.exec(name || '');
-                                if (m) { const n = parseInt(m[1], 10); if (n > maxN) maxN = n; }
-                        }
-                }
-                return `${logsPath}/native-host_${maxN + 1}.log`;
-        } catch { return `${logsPath}/native-host.log`; }
-}
-const hostLogPath = pickLogPath();
+// One log file per launch, overwritten on every start. The earlier numbered
+// scheme (native-host_1.log, native-host_2.log, …) accumulated one file per
+// session on the SD card and buried the useful log under dozens of stale
+// ones; now the most recent session always wins and the file is the single
+// source of truth for "what happened on the last run".
+const hostLogPath = `${logsPath}/native-host.log`;
 // Start diagnostics before accessing the screen or enumerating the SD card.
 try { (Switch as any).mkdirSync?.('sdmc:/switch/burialnx'); } catch { /* report write failures later */ }
 if (__DEBUG__) {
         try { (Switch as any).mkdirSync?.(logsPath); } catch { /* diagnostics are optional */ }
+        // Truncate the previous session's log so this file always holds
+        // exactly one launch (writeFileSync opens in "w" mode). All later
+        // writes (log(), fatal()) append to the freshly truncated file.
+        try { (Switch as any).writeFileSync?.(hostLogPath, new ArrayBuffer(0)); } catch { /* optional */ }
         log(`--- BurialNX debug session ${new Date().toISOString()} ---`);
         log(`Log file: ${hostLogPath}`);
         log('Initializing screen');
@@ -160,6 +149,17 @@ let host: ReturnType<typeof createBrowserHost> | undefined;
 let mapPrefetch: MapPrefetcher | undefined;
 let frames = 0, sampleStart = 0, fps = 0;
 let lastFrame = 0, lastMemoryCheck = 0;
+// Wall-clock timestamp of the last frame() call. Used to detect system
+// sleep/wake: rAF does not fire during sleep, so a >3 s gap between
+// consecutive frame() calls means the console slept and woke. nx.js
+// v1.0.0-beta.7 has NO GPU surface recovery after wake (no AppletHook, no
+// EGL/Skia re-init) — the GPU syncpts are stale, and the next heavy GPU
+// present (game launch's font atlas + texture uploads) crashes with
+// 0x95D (LibnxBinder BadValue — stale binder fence on eglSwapBuffers).
+// The light library render survives wake, so we detect it and chain-reload
+// into a FRESH process (fresh GPU surface) before any heavy GPU work.
+let lastFrameWall = 0;
+const WAKE_GAP_MS = 3000;
 let fit = true;
 let saved: GameSelection | null = null;
 let settingsValid = true;
@@ -279,11 +279,6 @@ let exitArmed = false;
 let exitArmedAt = 0;
 let exitNoticeArmed = false;
 let allowExit = false;
-// The exit mode chosen when the + confirmation (or pause-menu Quit) was
-// armed. 'shutdown' = leave BurialNX entirely (library grid Quit, or a
-// forwarder-launched game's exit); 'return-to-library' = a library-
-// launched game's exit (relaunch burialnx.nro without --game).
-let pendingExitMode: QuitMode = 'shutdown';
 const realExit = typeof (Switch as any).exit === 'function' ? (Switch as any).exit.bind(Switch) : null;
 // Plus(+) hold timer — the quit dialog only appears when + is held
 // for 500ms (like Minus for the pause menu). Prevents accidental exits.
@@ -508,88 +503,81 @@ function teardownGame() {
         } catch { /* best-effort */ }
 }
 
-// === Exit modes ========================================================
-// Two distinct exit paths, chosen by context:
+// === Exit behavior ======================================================
+// ONE flag decides what "exiting BurialNX" does for the whole session:
 //
-//   'return-to-library' — used when a LIBRARY-LAUNCHED game exits (pause
-//     menu or + confirmation). We chain-load burialnx.nro WITHOUT --game via
-//     app.launch(), which sets a NEW envSetNextLoad (overwriting the stale
-//     forwarder one). hbloader reloads burialnx → library grid shows.
+//   'shutdown' — fully close BurialNX (plain Switch.exit() → hbmenu).
+//   'restart'  — relaunch burialnx.nro (chainToLibrary) → the library grid
+//                shows in a fresh, clean process.
 //
-//   'shutdown' — used for (a) the library grid's own Quit tile / +
-//     confirmation, (b) a FORWARDER-LAUNCHED game's exit, and (c) the
-//     error screen's B button. We call Switch.exit() and rely on hbloader
-//     to check envSetNextLoad:
-//       - If hbloader CLEARS envSetNextLoad after chain-loading (standard
-//         hbmenu behavior): the stale forwarder next-load is gone → hbmenu. ✅
-//       - If hbloader does NOT clear (some custom loaders): the stale
-//         next-load persists → burialnx re-chains. The re-launch detection
-//         at startup catches this and shows the library (NOT the game) so
-//         the user is not stuck in a game-restart loop. The user can then
-//         try quitting again from the library.
+// Lifecycle (deterministic — no exit state can ever survive a game session):
+//   1. EVERY app load starts with 'shutdown': quitting from the library
+//      grid (Quit tile, + confirmation, error screens without a game)
+//      always closes the app IMMEDIATELY — one press, every time.
+//   2. Launching a game FROM THE LIBRARY sets 'restart': exiting that game
+//      (pause-menu Quit, + confirmation, the error screen's B) relaunches
+//      burialnx and the library grid shows.
+//   3. Launching a game via a FORWARDER (baked-in or legacy argv) keeps
+//      'shutdown': exiting that game fully closes BurialNX.
+//   4. The 'restart' in (2) is a fresh app load → back at (1): the flag is
+//      'shutdown' again automatically, so the next quit from the library
+//      closes the app immediately. The restart itself resets the flag —
+//      no stale "return to library" state can leak into the library session.
 //
-// CRITICAL: nx.js's Application.launch() uses the CONSTRUCTOR's path for
-// envSetNextLoad (not the launch() argument). So `new Switch.Application('')`
-// throws (fopen('') fails) — we CANNOT set envSetNextLoad to an empty path
-// via the JS API. The only way to "clear" the stale next-load is to
-// OVERWRITE it with a valid NRO path (app.launch(burialnx.nro)), which
-// chains to that NRO. This is what 'return-to-library' does.
-//
-type QuitMode = 'shutdown' | 'return-to-library';
+// The flag is deliberately IN-MEMORY ONLY (no marker files, no boot-time
+// detection): every load starts from the same clean 'shutdown' default and
+// only an actual game launch can arm the restart — nothing else.
+type ExitBehavior = 'shutdown' | 'restart';
+let exitBehavior: ExitBehavior = 'shutdown';
 
-// Path to the forwarder-exit flag file. Written just before a shutdown
-// attempt so the next boot can detect a stale-next-load re-chain.
-const FORWARDER_EXIT_FLAG = 'sdmc:/switch/burialnx/.fwd-exit-flag';
-// A re-launch is only "stale" if the flag was written within this window.
-const RE_LAUNCH_WINDOW_MS = 30_000;
-
-function writeForwarderExitFlag(): void {
-        try {
-                const SwitchAny = (Switch as any);
-                const payload = new TextEncoder().encode(String(Date.now()));
-                if (typeof SwitchAny?.writeFileSync === 'function') {
-                        SwitchAny.writeFileSync(FORWARDER_EXIT_FLAG, payload.buffer);
-                        log(`_exit: flag written -> ${FORWARDER_EXIT_FLAG}`);
-                }
-        } catch (e) { log(`_exit: flag write FAILED: ${e instanceof Error ? e.message : String(e)}`); }
-}
-
-function clearForwarderExitFlag(): void {
+// One-time cleanup: versions 0.1.6–0.1.8 wrote a .fwd-exit-flag marker file
+// to the SD card for their boot-time re-chain detection. Nothing reads it
+// anymore — remove it when present so no stale artifact from those builds
+// survives on the card.
+function removeLegacyExitFlagFile(): void {
         try {
                 const SwitchAny = (Switch as any);
                 const remove = SwitchAny?.removeSync || SwitchAny?.unlinkSync;
-                if (typeof remove === 'function') {
-                        try { remove.call(SwitchAny, FORWARDER_EXIT_FLAG); return; } catch { /* not present */ }
-                }
-                try { SwitchAny?.writeFileSync?.(FORWARDER_EXIT_FLAG, new ArrayBuffer(0)); } catch { /* ignore */ }
+                if (typeof remove === 'function') { try { remove.call(SwitchAny, 'sdmc:/switch/burialnx/.fwd-exit-flag'); } catch { /* not present */ } }
         } catch { /* best-effort */ }
-}
-
-/** Read the forwarder-exit flag and return true if it was written within
- *  the re-launch window (i.e. burialnx was just re-chained by a stale
- *  envSetNextLoad after a shutdown attempt). Also returns the timestamp
- *  for diagnostic logging. */
-function checkForwarderRelaunch(): { recent: boolean; ageMs: number } {
-        try {
-                const SwitchAny = (Switch as any);
-                if (typeof SwitchAny?.readFileSync !== 'function') return { recent: false, ageMs: -1 };
-                const data = SwitchAny.readFileSync(FORWARDER_EXIT_FLAG) as ArrayBuffer | null;
-                if (!data || data.byteLength === 0) return { recent: false, ageMs: -1 };
-                const text = new TextDecoder().decode(new Uint8Array(data)).trim();
-                const ts = parseInt(text, 10);
-                if (!Number.isFinite(ts) || ts <= 0) return { recent: false, ageMs: -1 };
-                const age = Date.now() - ts;
-                return { recent: age >= 0 && age <= RE_LAUNCH_WINDOW_MS, ageMs: age };
-        } catch { return { recent: false, ageMs: -1 }; }
 }
 
 /** Chain-load burialnx.nro WITHOUT --game so the library grid shows.
  *  Sets a NEW envSetNextLoad (overwriting the stale forwarder one) and
- *  exits the process. If the chain fails (burialnx.nro not found), throws
- *  so the caller can fall back to Switch.exit(). */
+ *  stops the event loop — the process exits through the regular teardown
+ *  path and the loader chain-loads burialnx into a FRESH process, whose
+ *  exitBehavior starts at 'shutdown' again (see the flag lifecycle above).
+ *  If the chain fails (both NRO paths missing), throws so the caller can
+ *  fall back to Switch.exit().
+ *
+ *  CRITICAL: the FIRST argument to app.launch() MUST be the burialnx.nro
+ *  path — nx.js's resolve_entrypoint treats argv[1] as a file path (a
+ *  ".nro" suffix means "bootstrap this NRO"; anything else is opened as a
+ *  .js file and the chain dies with "No such file or directory").
+ *
+ *  NOTE: app.launch() RETURNS normally after a successful chain (nx.js
+ *  source/ns.cc — it only calls envSetNextLoad + stops the event loop;
+ *  the process exits when the current script finishes unwinding). Do NOT
+ *  throw after it: that would misread every successful chain as a failure
+ *  and run the plain-exit fallback right after arming the chain. */
 function chainToLibrary(): void {
         const SwitchAny = (Switch as any);
-        let nroPath = BURIALNX_NRO_PATH;
+        // Use the ACTUALLY RUNNING NRO path as the chain target. The hardcoded
+        // BURIALNX_NRO_PATH assumes the file is at sdmc:/switch/burialnx/burialnx.nro,
+        // but the user may have renamed it (e.g. BurialNX-v0.1.5.nro) — in that case
+        // Application(burialnx.nro) fails with "No such file or directory" and we
+        // fall back to burialnx-debug.nro, chaining to a DIFFERENT file from what
+        // the loader actually loaded. The loader then either ignores envSetNextLoad
+        // (reloading the original) or loads the wrong NRO. Using Switch.argv[0]
+        // guarantees the chain target is the file the loader actually loaded this
+        // boot — so envSetNextLoad points at a file that exists and matches.
+        let nroPath: string = BURIALNX_NRO_PATH;
+        try {
+                const argv = (Switch as any).argv as readonly string[] | undefined;
+                if (Array.isArray(argv) && argv.length > 0 && typeof argv[0] === 'string' && /\.nro$/i.test(argv[0])) {
+                        nroPath = argv[0];
+                }
+        } catch { /* argv unavailable — keep hardcoded default */ }
         let app: any;
         try { app = new SwitchAny.Application(nroPath); }
         catch (e1) {
@@ -600,28 +588,30 @@ function chainToLibrary(): void {
         log(`_exit: chainToLibrary app.launch(${nroPath}) [no --game]`);
         allowExit = true;
         app.launch(nroPath);
-        // launch() is `never` — if it returns, the chain failed.
-        throw new Error('chainToLibrary: app.launch returned without exiting');
 }
 
-function quitApp(mode: QuitMode) {
-        log(`_exit: quitApp(${mode}), forwarderTargetId=${forwarderTargetId || 'null'}, isBakedForwarder=${isBakedForwarder}`);
+/** Quit BurialNX. No parameters: the exit behavior FLAG (see its lifecycle
+ *  above) is the single source of truth —
+ *    'shutdown' (library session, forwarder-launched game) → full close,
+ *    'restart'  (library-launched game)                    → chainToLibrary.
+ *  The flag is consumed here: a failed chain falls back to a full close and
+ *  no later path in this process can trigger a second restart. */
+function quitApp() {
+        const behavior = exitBehavior;
+        exitBehavior = 'shutdown';
+        log(`_exit: quitApp(${behavior}), forwarderTargetId=${forwarderTargetId || 'null'}, isBakedForwarder=${isBakedForwarder}`);
         // Return all memory and shut everything down: stop the game
         // (audio + frame loop + image buffers) and run a final GC pass.
         try { teardownGame(); } catch (e) { log(`_exit: teardown threw: ${e instanceof Error ? e.message : String(e)}`); }
-        const wasForwarder = forwarderTargetId !== null;
-        // Capture whether this was a baked-in forwarder BEFORE clearing
-        // forwarderTargetId. Baked-in forwarders never set envSetNextLoad,
-        // so there is NO re-chain to detect — we skip writing the flag.
-        const wasBakedForwarder = isBakedForwarder;
         forwarderTargetId = null;
         isBakedForwarder = false;
         phase = 'library';
         exitNoticeArmed = false;
         plusHoldStart = 0;
-        if (mode === 'return-to-library') {
+        if (behavior === 'restart') {
                 // Library-launched game exit: chain to burialnx.nro (no --game)
-                // → library grid shows. This OVERWRITES any stale next-load.
+                // → the library grid shows in a FRESH process that starts with
+                // exitBehavior = 'shutdown' (quitting there is a clean exit).
                 try {
                         chainToLibrary();
                 } catch (e) {
@@ -631,20 +621,8 @@ function quitApp(mode: QuitMode) {
                 }
                 return;
         }
-        // mode === 'shutdown' — the user wants to leave BurialNX entirely.
-        // For BAKED-IN forwarders: NO envSetNextLoad was set, so there is
-        // NO re-chain to detect. Skip writing the flag (it would cause a
-        // false "re-launch" on the next forwarder launch within 30s).
-        // For LEGACY argv forwarders: write the flag so the next boot can
-        // detect a stale re-chain (if hbloader didn't clear envSetNextLoad).
-        if (wasBakedForwarder) {
-                clearForwarderExitFlag();
-        } else {
-                writeForwarderExitFlag();
-        }
-        // Try calling Switch.exit(). If hbloader cleared the next-load after
-        // chain-loading us, this returns to hbmenu. If not, the stale
-        // next-load re-chains and the re-launch detection catches it.
+        // 'shutdown' — the user wants to leave BurialNX entirely: a plain
+        // Switch.exit() back to hbmenu.
         //
         // CRITICAL: Switch.exit() is DEFERRED to the next tick via setTimeout.
         // quitApp() is called from inside the frame() rAF callback — calling
@@ -653,7 +631,7 @@ function quitApp(mode: QuitMode) {
         // before Switch.exit finishes, accessing retired state). Deferring
         // lets the current frame return cleanly, then the exit runs on a
         // fresh tick with no frame on the stack.
-        log(`_exit: calling Switch.exit() [wasForwarder=${wasForwarder}]`);
+        log('_exit: calling Switch.exit()');
         if (realExit) {
                 allowExit = true;
                 // CRITICAL: The Atmosphere crash reports (3 separate crashes, all
@@ -1020,12 +998,14 @@ function log(line: string) {
         try { Switch.appendFileSync(hostLogPath, `${line}\n`); } catch { /* optional diagnostics */ }
 }
 // nx.js writes its own log to a fixed path. Copy a snapshot instead of moving
-// or truncating that file, which the runtime may still have open.
+// or truncating that file, which the runtime may still have open. The snapshot
+// goes to ONE file (overwritten each time) — the earlier timestamped names
+// (nxjs-debug-<Date.now()>.log) accumulated a new file per scene change.
 function snapshotRuntimeLog() {
         if (!__DEBUG__) return;
         try {
                 const bytes = Switch.readFileSync('sdmc:/switch/nxjs-debug.log');
-                if (bytes) Switch.writeFileSync(`${logsPath}/nxjs-debug-${Date.now()}.log`, bytes);
+                if (bytes) Switch.writeFileSync(`${logsPath}/nxjs-debug-last.log`, bytes);
         } catch { /* native log may not exist */ }
 }
 function panel(lines: string[], full = false) {
@@ -1063,14 +1043,14 @@ function renderPauseMenu(): void {
                 const entry = languageEntries.find((e) => e.code === activeLanguageCode);
                 return entry?.name || activeLanguageCode;
         }
-        // The last menu item (pause-menu "quit") is labeled differently
-        // depending on how the game was launched:
-        //   - Forwarder launch (forwarderTargetId set): the user wants to
-        //     LEAVE BurialNX entirely → "Quit BurialNX" (a real exit).
-        //   - Library launch (forwarderTargetId null): the user came from
-        //     the library grid → "Return to library" (relaunch burialnx.nro
+        // The last menu item (pause-menu "quit") is labeled from the exit
+        // behavior flag armed at launch (see the exitBehavior lifecycle):
+        //   - 'shutdown' (forwarder-launched game): the user wants to LEAVE
+        //     BurialNX entirely → "Quit BurialNX" (a real exit).
+        //   - 'restart' (library-launched game): the user came from the
+        //     library grid → "Return to library" (relaunch burialnx.nro
         //     without --game so the grid shows again).
-        const quitLabel = forwarderTargetId ? 'Quit BurialNX' : 'Return to library';
+        const quitLabel = exitBehavior === 'restart' ? 'Return to library' : 'Quit BurialNX';
         const labels: Record<string, string> = {
                 continue: 'Resume', save: 'Save', load: 'Load',
                 keymap: 'Edit joycon key bindings',
@@ -2398,6 +2378,17 @@ function renderRenameKb() {
 async function launch() {
         phase = 'loading';
         gameStopped = false; // reset for new game launch
+        // Arm this session's exit behavior (see the exitBehavior lifecycle):
+        // a game launched FROM THE LIBRARY returns to the library on exit
+        // ('restart' — quitApp chain-loads burialnx and the grid shows in a
+        // fresh process); a game launched via a FORWARDER (baked-in or legacy
+        // argv — forwarderTargetId is set at boot for those) fully closes
+        // BurialNX on exit ('shutdown'). Set at the point of no return, so a
+        // canceled save-choice or options screen never arms the restart
+        // without a game actually loading. Every app load boots with
+        // 'shutdown' and only this line can change it.
+        exitBehavior = forwarderTargetId ? 'shutdown' : 'restart';
+        log(`_exit: game launch (${forwarderTargetId ? 'forwarder' : 'library'}) — exit behavior: ${exitBehavior}`);
         // Reset the progress bar for a fresh launch. The title is the game's
         // display name when known (so the bar shows "The Coffin of Andy and
         // Leyley" instead of just "BurialNX"), falling back to the loader name.
@@ -2996,6 +2987,69 @@ function libraryNavigateRow(cursor: number, total: number, cols: number, directi
 let frameLoggedFirst = false;
 function frame(now: number) {
         try {
+                // === Sleep/wake recovery ============================================
+                // Detect a system sleep→wake by a large wall-clock gap between
+                // consecutive frames (rAF does not fire during sleep, so any
+                // >3 s gap means the console slept and woke). nx.js v1.0.0-beta.7
+                // has NO GPU surface recovery after wake — the EGL/Skia surface
+                // holds stale syncpts, and the next heavy GPU present (a game
+                // launch's font atlas + texture uploads) crashes with 0x95D
+                // (LibnxBinder BadValue — stale binder fence on eglSwapBuffers).
+                //
+                // TWO different recovery strategies, by phase:
+                //
+                // 1. GAME RUNNING (phase 'game', or a game-phase notice such as
+                //    the pause menu or the quit dialog): CONTINUE IN PLACE. The
+                //    game's own update loop already has a wake guard (the
+                //    SceneManager.update wrapper: >2 s performance.now() gap →
+                //    reset the accumulator + clear the input state), so the
+                //    game resumes exactly where it was. The user explicitly
+                //    wants to CONTINUE from the current spot, not restart from
+                //    a checkpoint. The game's normal per-frame present is the
+                //    SAME light buffer swap that already survives wake
+                //    empirically (the user's own crash report shows the library
+                //    render and gameplay survive; only a fresh game LAUNCH with
+                //    its heavy font-atlas/texture-upload GPU work crashes with
+                //    0x95D). A chain-reload here would KILL the process while
+                //    the game JS state is live — hbloader's trampoline then
+                //    aborts (Instruction Abort in hbl, Result 2168-0001) —
+                //    which is exactly the crash the user reported for v0.1.13.
+                //    So: do nothing; let the game's guard handle the resume.
+                //
+                // 2. NO GAME RUNNING (library, picker, options, error, loading
+                //    of a NEW game, etc.): chain-reload BEFORE any heavy GPU
+                //    work runs. This is the 0x95D protection: a game LAUNCH
+                //    right after wake does heavy GPU init against stale
+                //    syncpts and crashes. The restart gives a fresh process
+                //    with a fresh GPU surface before the user can launch.
+                //    chainToLibrary() sets envSetNextLoad + stops the event
+                //    loop WITHOUT touching the GPU (nx.js source/ns.cc), so it
+                //    is safe to call against the stale GPU state. The present
+                //    in the same iteration renders the light library grid
+                //    (survives wake), then the loader reloads burialnx.
+                const wallNow = Date.now();
+                if (lastFrameWall && wallNow - lastFrameWall > WAKE_GAP_MS) {
+                        const gameLive = phase === 'game' || (phase === 'notice' && !!(runtime as any).SceneManager?._scene);
+                        if (gameLive) {
+                                // Live game: continue in place. The game's
+                                // SceneManager.update wrapper (>2 s gap guard)
+                                // resets the timing accumulator and input
+                                // state; the game resumes from the current
+                                // spot. No process restart — no progress lost.
+                                log(`_wake: sleep/wake detected (gap=${wallNow - lastFrameWall}ms, phase=${phase}), live game — continuing in place`);
+                        } else {
+                                log(`_wake: sleep/wake detected (gap=${wallNow - lastFrameWall}ms, phase=${phase}), no live game — restarting for fresh GPU surface`);
+                                try {
+                                        chainToLibrary();
+                                } catch (e) {
+                                        log(`_wake: chainToLibrary failed: ${e instanceof Error ? e.message : String(e)} — falling back to Switch.exit()`);
+                                        try { removeBeforeUnloadListener(); } catch { /* best-effort */ }
+                                        try { (Switch as any).exit?.(); } catch { /* best-effort */ }
+                                }
+                                return;
+                        }
+                }
+                lastFrameWall = wallNow;
                 if (!frameLoggedFirst) { frameLoggedFirst = true; }
                 marqueeOffset += 2; // scroll long names in library tiles
                 const buttons = navigator.getGamepads?.()?.[0]?.buttons || null;
@@ -3031,7 +3085,7 @@ function frame(now: number) {
                                         if (isAction) {
                                                 if (actionIdx === 0) { browser = new FolderBrowser(Switch, 'game', 'sdmc:/switch/burialnx'); pickerPurpose = 'add-game'; waitForRelease = true; phase = 'picker'; }
                                                 else if (actionIdx === 1) openKeymapEditor('global');
-                                                else if (actionIdx === 2) { quitApp('shutdown'); }
+                                                else if (actionIdx === 2) { quitApp(); }
                                         } else if (entry) {
                                                 loadEntryIntoState(entry);
                                                 startOrChooseSaves();
@@ -3570,12 +3624,14 @@ function frame(now: number) {
                                 if (host) { menu.dismiss(); phase = 'game'; }
                                 else { phase = currentEntry ? 'game-options' : 'library'; waitForRelease = true; }
                         } else if (!waitForRelease && exitNoticeArmed && buttons?.[1]?.pressed && !previousButtons[1]) {
-                                // A: confirm quit/return-to-library. The mode
-                                // (and the dialog label) were chosen when the
-                                // notice was armed — see the Plus handler and
-                                // the pause-menu 'quit' action.
+                                // A: confirm quit/return-to-library. The exit
+                                // behavior flag (see the exitBehavior
+                                // lifecycle) decides what quitApp() does; the
+                                // dialog label was chosen when the notice was
+                                // armed — see the Plus handler and the
+                                // pause-menu 'quit' action.
                                 exitNoticeArmed = false;
-                                try { quitApp(pendingExitMode); }
+                                try { quitApp(); }
                                 catch (error) {
                                         log(`quitApp threw: ${error instanceof Error ? error.message : String(error)}`);
                                         allowExit = true;
@@ -3583,20 +3639,20 @@ function frame(now: number) {
                                 }
                         }
                 } else if (phase === 'error') {
-                        panel(['BurialNX — game could not start', message, __DEBUG__ ? `Details: ${hostLogPath}` : 'Try the debug build for details.', forwarderTargetId ? 'Press B to exit BurialNX.' : 'Press B to return to the library.'], true);
+                        panel(['BurialNX — game could not start', message, __DEBUG__ ? `Details: ${hostLogPath}` : 'Try the debug build for details.', exitBehavior === 'restart' ? 'Press B to return to the library.' : 'Press B to exit BurialNX.'], true);
                         if (waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) waitForRelease = false;
                         else if (!waitForRelease && buttons?.[0]?.pressed && !previousButtons[0]) {
                                 waitForRelease = true;
                                 // A failed launch leaves half-installed game state behind. Exit
-                                // the app fully (teardown + Switch.exit) so the next launch is
-                                // a guaranteed clean cold boot. For a forwarder-launched game
-                                // this is a full shutdown (quitApp('shutdown')); for a
-                                // library-launched game it returns to the library grid so the
-                                // user can fix things and try again. Horizon OS reserves the
-                                // process memory and reclaims it on exit, which is the only
+                                // the app (teardown + exit) so the next launch is a guaranteed
+                                // clean cold boot. The exit behavior flag armed at launch
+                                // decides the target: a forwarder-launched game fully shuts
+                                // down; a library-launched game returns to the library grid so
+                                // the user can fix things and try again. Horizon OS reserves
+                                // the process memory and reclaims it on exit, which is the only
                                 // reliably clean reset; an in-process session reboot proved
                                 // unstable on hardware (froze on the "Loading…" splash).
-                                quitApp(forwarderTargetId ? 'shutdown' : 'return-to-library');
+                                quitApp();
                         }
                 } else if (phase === 'loading' || phase === 'forwarder-building') renderLoading();
                 else {
@@ -3691,14 +3747,13 @@ function frame(now: number) {
                         }
                         if (action === 'quit') {
                                 // Pause-menu "Quit" (hold Minus, last item on page 1).
-                                // For a forwarder-launched game (forwarderTargetId set):
-                                //   full shutdown — the user launched via a standalone
-                                //   shortcut and expects to leave BurialNX entirely.
-                                // For a library-launched game (forwarderTargetId null):
-                                //   "return to library" — relaunch burialnx.nro without
-                                //   --game so the library grid shows.
-                                const mode: QuitMode = forwarderTargetId ? 'shutdown' : 'return-to-library';
-                                try { quitApp(mode); }
+                                // The exit behavior flag armed at launch decides:
+                                //   forwarder-launched game ('shutdown') — the user launched
+                                //   via a standalone shortcut and expects to leave BurialNX
+                                //   entirely;
+                                //   library-launched game ('restart') — relaunch burialnx.nro
+                                //   without --game so the library grid shows.
+                                try { quitApp(); }
                                 catch (error) {
                                         log(`quitApp threw: ${error instanceof Error ? error.message : String(error)}`);
                                         allowExit = true;
@@ -3737,18 +3792,18 @@ function frame(now: number) {
                 // and the quit dialog fires on hold). If + is unbound,
                 // single press shows the dialog immediately.
                 //
-                // The label and exit mode depend on context:
-                //   - Library grid (+ tile or + button): "Quit BurialNX?" / shutdown
-                //   - Forwarder-launched game (forwarderTargetId set): "Quit BurialNX?" / shutdown
-                //   - Library-launched game (forwarderTargetId null): "Return to library?" / return-to-library
+                // The label comes from the exit behavior flag (see the
+                // exitBehavior lifecycle), which is the single source of truth
+                // for what the confirmation does:
+                //   - Library grid (no game running): "Quit BurialNX?" / shutdown
+                //   - Forwarder-launched game: "Quit BurialNX?" / shutdown
+                //   - Library-launched game: "Return to library?" / restart
                 const plusDown = down(9);
                 const plusBlocked = phase === 'notice' || phase === 'rename-kb' || phase === 'add-game-name' || phase === 'rename-choice' || phase === 'forwarder-building' || phase === 'loading';
                 if (plusDown && !plusBlocked) {
-                        // Determine the exit mode and dialog label for this
-                        // context. A game is running when `host` is set.
-                        const inGame = !!host;
-                        const plusQuitMode: QuitMode = (inGame && !forwarderTargetId) ? 'return-to-library' : 'shutdown';
-                        const plusQuitLabel = plusQuitMode === 'return-to-library' ? 'Return to library?' : 'Quit BurialNX?';
+                        // quitApp() reads the flag at confirm time; the label
+                        // is derived from the same flag so it can never lie.
+                        const plusQuitLabel = exitBehavior === 'restart' ? 'Return to library?' : 'Quit BurialNX?';
                         // Check if + (button 9) has a binding in the active keymap.
                         const activeKeymap = (currentEntry?.keymap) || globalKeymap;
                         const plusBound = activeKeymap.buttons[9] !== 'none';
@@ -3757,7 +3812,6 @@ function frame(now: number) {
                                 if (plusHoldStart === 0) plusHoldStart = now;
                                 else if (now - plusHoldStart >= 500) {
                                         exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
-                                        pendingExitMode = plusQuitMode;
                                         message = plusQuitLabel;
                                         waitForRelease = true; phase = 'notice';
                                         plusHoldStart = 0;
@@ -3766,7 +3820,6 @@ function frame(now: number) {
                                 // + is unbound → single press shows the dialog.
                                 if (edge(9)) {
                                         exitArmed = true; exitArmedAt = Date.now(); exitNoticeArmed = true;
-                                        pendingExitMode = plusQuitMode;
                                         message = plusQuitLabel;
                                         waitForRelease = true; phase = 'notice';
                                 }
@@ -3997,46 +4050,12 @@ if (!forwarderTargetId) {
         } catch (error) { log(`_fwd: argv parse failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
-// === Stale-next-load re-launch detection ===============================
-// When the user quits a LEGACY argv forwarder-launched game, quitApp('shutdown')
-// writes the FORWARDER_EXIT_FLAG and then calls Switch.exit(). IF the
-// forwarder's envSetNextLoad is still set (hbloader does not clear it
-// after chain-loading), hbloader re-chains to burialnx.nro --game id →
-// the game would restart in a loop.
-//
-// To break the loop, we detect the re-launch here: if the exit flag was
-// written within RE_LAUNCH_WINDOW_MS, this boot is a stale re-chain
-// (not a fresh forwarder launch). We clear the flag and clear
-// forwarderTargetId so the auto-launch trigger does NOT re-launch the
-// game — the library grid shows instead.
-//
-// IMPORTANT: this check is ONLY for LEGACY argv forwarders. BAKED-IN
-// forwarders (isBakedForwarder === true) never set envSetNextLoad, so
-// there is NO re-chain to detect. Skipping the check for them is critical:
-// otherwise, the .fwd-exit-flag from a previous exit (written by any
-// quitApp('shutdown') call within 30s) would clear forwarderTargetId and
-// show the library instead of the game — exactly the bug where the
-// forwarder "launches the library like the main app".
-try {
-        const relaunch = checkForwarderRelaunch();
-        if (isBakedForwarder) {
-                // Baked-in forwarder: NO envSetNextLoad was set, so there is
-                // NO re-chain to detect. Clear any stale flag from a previous
-                // session and proceed with the baked-in game auto-launch.
-                clearForwarderExitFlag();
-        } else if (relaunch.recent) {
-                log(`_fwd: stale next-load re-launch detected (age=${relaunch.ageMs}ms) — showing library, NOT re-launching game`);
-                clearForwarderExitFlag();
-                // CRITICAL: clear forwarderTargetId so the auto-launch trigger
-                // below does NOT re-launch the game. The library grid shows
-                // instead. We do NOT call chainToLibrary() here (that would
-                // set a new stale next-load → library→library loop).
-                forwarderTargetId = null;
-        } else {
-                // Fresh launch — clear any stale flag from a previous session.
-                clearForwarderExitFlag();
-        }
-} catch (error) { log(`_fwd: re-launch detection failed: ${error instanceof Error ? error.message : String(error)}`); }
+// No boot-time exit detection: the exit behavior flag is in-memory only and
+// every load starts from the clean 'shutdown' default (see the exitBehavior
+// lifecycle near the top of the exit section). The only boot-time cleanup is
+// removing the obsolete .fwd-exit-flag marker file that versions 0.1.6–0.1.8
+// left on the SD card — nothing reads it anymore.
+removeLegacyExitFlagFile();
 
 if (__DEBUG__) log('Startup ready');
 requestAnimationFrame(frame);

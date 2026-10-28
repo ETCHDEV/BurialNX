@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g. v0.2.0)'
+        description: 'Version tag (e.g. v0.1.5)'
         required: true
-        default: 'v0.2.0'
+        default: 'v0.1.5'
       create_release:
         description: 'Create a GitHub Release with the .nro files'
         type: boolean
@@ -48,20 +48,14 @@ jobs:
       - name: Build debug NRO
         run: npm run build -- --debug
 
-      # 7. Переименовать для ясности
-      - name: Rename artifacts
-        run: |
-          cp burialnx.nro BurialNX-${{ inputs.version }}.nro
-          cp burialnx-debug.nro BurialNX-${{ inputs.version }}-debug.nro
-
       # 8. Загрузить артефакты (доступны для скачивания в Actions)
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: BurialNX-${{ inputs.version }}
           path: |
-            BurialNX-${{ inputs.version }}.nro
-            BurialNX-${{ inputs.version }}-debug.nro
+            burialnx.nro
+            burialnx-debug.nro
           retention-days: 30
 
       # 9. Создать GitHub Release (если выбрано)
@@ -75,16 +69,16 @@ jobs:
             ## BurialNX ${{ inputs.version }}
 
             ### Installation
-            1. Copy `BurialNX-${{ inputs.version }}.nro` to `sdmc:/switch/burialnx/`
+            1. Copy `burialnx.nro` to `sdmc:/switch/burialnx/`
             2. Launch from hbmenu
 
             ### Debug build
-            `BurialNX-${{ inputs.version }}-debug.nro` — includes extra logging
+            `burialnx-debug.nro` — includes extra logging
             and diagnostic menu items. Logs are written to
             `sdmc:/switch/burialnx/LOGS/`
           files: |
-            BurialNX-${{ inputs.version }}.nro
-            BurialNX-${{ inputs.version }}-debug.nro
+            burialnx.nro
+            burialnx-debug.nro
           draft: false
           prerelease: false
         env:
