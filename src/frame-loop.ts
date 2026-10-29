@@ -43,16 +43,41 @@ import { moveGame, removeGame } from './game-library';
 import { scanLanguageFiles, type LanguageScanFs, type LanguageEntry } from './game-compat';
 import { gameSaveFolders } from './settings';
 import { fail } from './error-handling';
-import { quitApp, chainToLibrary, teardownGame } from './game-lifecycle';
-import { removeBeforeUnloadListener } from './error-handling';
+import { quitApp } from './game-lifecycle';
 import { launch } from './game-launch';
 import { importSteamSaves } from './saves';
 import { setButton, setButtonWithLabel, displayToButtonIndex } from './keymap';
 import { FolderBrowser } from './folders';
+import { handleWake, isLiveGameRunning } from './sleep-recovery';
 
 declare const __DEBUG__: boolean;
 
-const WAKE_GAP_MS = 3000;
+// === Sleep/wake detection threshold ===================================
+// nx.js v1.0.0-beta.7 does NOT expose applet lifecycle hooks (no
+// appletGetMessage, no AppletHook — only appletGetAppletType /
+// appletGetOperationMode / appletIlluminance, none of which signal
+// sleep/wake). The ONLY reliable wake signal is the gap between
+// consecutive requestAnimationFrame callbacks: rAF is tied to the display
+// vsync, which stops when the console sleeps. So a gap between two
+// consecutive frame() calls that is MUCH larger than a normal vsync
+// interval (~16.67 ms at 60 fps) means the process was suspended.
+//
+// Normal operation NEVER produces a gap this large:
+//   - Normal rAF interval: ~16.67 ms (60 fps)
+//   - Heaviest single-frame stall (synchronous SD read, big JSON.parse,
+//     full GC mark-compact): typically < 200 ms, at most ~300 ms
+//   - 1000 ms = ~60 missed vsync intervals — only happens when the
+//     process is suspended (sleep mode).
+//
+// 1000 ms is the sweet spot: it is ~3x above the worst-case normal stall
+// (so no false positives mid-gameplay) and below the minimum real sleep
+// gap (entering sleep takes ~200–500 ms of screen-dim/audio-fade, the
+// process is then suspended, and waking takes ~500 ms–1 s of screen-on
+// before rAF resumes — so even an "instant" sleep+wake has a total gap
+// of ~1–2 s, which 1000 ms catches). The previous 3000 ms threshold
+// missed brief sleeps (total gap < 3 s), which is why quick wake-ups
+// sometimes crashed instead of triggering the recovery.
+const WAKE_GAP_MS = 1000;
 const GAME_OPTIONS_BASE_COUNT = 14;
 
 export function frame(now: number) {
@@ -60,62 +85,84 @@ export function frame(now: number) {
                 // === Sleep/wake recovery ============================================
                 // Detect a system sleep→wake by a large wall-clock gap between
                 // consecutive frames (rAF does not fire during sleep, so any
-                // >3 s gap means the console slept and woke). nx.js v1.0.0-beta.7
-                // has NO GPU surface recovery after wake — the EGL/Skia surface
-                // holds stale syncpts, and the next heavy GPU present (a game
-                // launch's font atlas + texture uploads) crashes with 0x95D
-                // (LibnxBinder BadValue — stale binder fence on eglSwapBuffers).
+                // >1 s gap means the console slept and woke — see the
+                // WAKE_GAP_MS comment above for why 1000 ms is the precise
+                // threshold). nx.js v1.0.0-beta.7 has NO GPU surface recovery
+                // after wake — the EGL/Skia surface holds stale syncpts, and
+                // any heavy GPU present crashes with 0x95D (LibnxBinder
+                // BadValue).
                 //
-                // TWO different recovery strategies, by phase:
+                // All previous in-process recovery strategies (continue-in-place
+                // for live games, the SceneManager.update wake guard, etc.) proved
+                // unstable on hardware — the game either froze on the next scene
+                // transition or fell into the nx.js error screen. They have been
+                // REMOVED. The single strategy now is handled by sleep-recovery.ts:
                 //
-                // 1. GAME RUNNING (phase 'game', or a game-phase notice such as
-                //    the pause menu or the quit dialog): CONTINUE IN PLACE. The
-                //    game's own update loop already has a wake guard (the
-                //    SceneManager.update wrapper: >2 s performance.now() gap →
-                //    reset the accumulator + clear the input state), so the
-                //    game resumes exactly where it was. The user explicitly
-                //    wants to CONTINUE from the current spot, not restart from
-                //    a checkpoint. The game's normal per-frame present is the
-                //    SAME light buffer swap that already survives wake
-                //    empirically (the user's own crash report shows the library
-                //    render and gameplay survive; only a fresh game LAUNCH with
-                //    its heavy font-atlas/texture-upload GPU work crashes with
-                //    0x95D). A chain-reload here would KILL the process while
-                //    the game JS state is live — hbloader's trampoline then
-                //    aborts (Instruction Abort in hbl, Result 2168-0001) —
-                //    which is exactly the crash the user reported for v0.1.13.
-                //    So: do nothing; let the game's guard handle the resume.
+                //   1. If a game is live, save it to a HIDDEN autosave file
+                //      (.sleep-autosave.rpgsave, bypassing StorageManager entirely
+                //      so the game's save/load UI never sees it), write a marker
+                //      file with {gameId, savedAt, bgm, bgs}, and teardown the game.
+                //   2. Whether or not a game is live, chain-launch the SAME NRO
+                //      (argv[0]) into a FRESH process — fresh GPU surface, no
+                //      stale syncpts. The chain does NOT touch the GPU.
+                //   3. The fresh process reads the marker at boot and auto-loads
+                //      the hidden save, so the player resumes exactly where they
+                //      were. If no game was live, the fresh process just boots to
+                //      the library (or the forwarder's auto-launch) as normal.
                 //
-                // 2. NO GAME RUNNING (library, picker, options, error, loading
-                //    of a NEW game, etc.): chain-reload BEFORE any heavy GPU
-                //    work runs. This is the 0x95D protection: a game LAUNCH
-                //    right after wake does heavy GPU init against stale
-                //    syncpts and crashes. The restart gives a fresh process
-                //    with a fresh GPU surface before the user can launch.
-                //    chainToLibrary() sets envSetNextLoad + stops the event
-                //    loop WITHOUT touching the GPU (nx.js source/ns.cc), so it
-                //    is safe to call against the stale GPU state. The present
-                //    in the same iteration renders the light library grid
-                //    (survives wake), then the loader reloads burialnx.
+                // See src/sleep-recovery.ts for the full rationale and the
+                // save/marker/teardown/chain sequence.
                 const wallNow = Date.now();
                 if (S.lastFrameWall && wallNow - S.lastFrameWall > WAKE_GAP_MS) {
-                        const gameLive = S.phase === 'game' || (S.phase === 'notice' && !!(S.runtime as any).SceneManager?._scene);
-                        if (gameLive) {
-                                // Live game: continue in place. The game's
-                                // SceneManager.update wrapper (>2 s gap guard)
-                                // resets the timing accumulator and input
-                                // state; the game resumes from the current
-                                // spot. No process restart — no progress lost.
-                                log(`_wake: sleep/wake detected (gap=${wallNow - S.lastFrameWall}ms, phase=${S.phase}), live game — continuing in place`);
-                        } else {
-                                log(`_wake: sleep/wake detected (gap=${wallNow - S.lastFrameWall}ms, phase=${S.phase}), no live game — restarting for fresh GPU surface`);
-                                try {
-                                        chainToLibrary();
-                                } catch (e) {
-                                        log(`_wake: chainToLibrary failed: ${e instanceof Error ? e.message : String(e)} — falling back to Switch.exit()`);
-                                        try { removeBeforeUnloadListener(); } catch { /* best-effort */ }
-                                        try { (Switch as any).exit?.(); } catch { /* best-effort */ }
+                        // GUARD 1: do NOT trigger the wake handler during phases that
+                        // legitimately have long synchronous stalls (> 1 s) as part of
+                        // normal operation — specifically the game LAUNCH phases
+                        // ('loading' = script eval + asset reads, 'forwarder-building'
+                        // = multi-MiB NRO write). A large pixi.js or rpg_core.js eval
+                        // can take > 1 s of synchronous CPU on the Switch, during which
+                        // rAF does not fire. Without this guard, that gap would be
+                        // misread as a sleep→wake, handleWake would chain-reload the
+                        // NRO mid-launch, and the loader would enter an INFINITE
+                        // reload loop (each fresh launch hits the same > 1 s script
+                        // eval → reload → script eval → reload …).
+                        //
+                        // GUARD 2: during the game phase, only fire if Scene_Map is
+                        // the active scene (real gameplay). Scene_Title / Scene_Load /
+                        // Scene_Save do SYNCHRONOUS SD-card reads (the save-slot list
+                        // reads every slot's header to render the load menu — with 20
+                        // slots on a slow SD card that easily exceeds 1 s). Without
+                        // this guard, opening the in-game Load menu or pressing
+                        // Continue on the title screen would trigger a false wake →
+                        // teardown + chain-reload → the app appears to "crash/restart"
+                        // every time the user tries to load a save. isLiveGameRunning()
+                        // checks for Scene_Map (including during the pause-menu
+                        // 'notice' phase, where the underlying scene is still
+                        // Scene_Map), so real gameplay is still protected.
+                        //
+                        // S.lastFrameWall is always updated below so the gap doesn't
+                        // accumulate and fire later. If the console ACTUALLY sleeps
+                        // during a guarded phase, it continues with a potentially
+                        // stale GPU surface — a rare edge case that is far less bad
+                        // than the false-positive reload alternatives.
+                        const launching = S.phase === 'loading' || S.phase === 'forwarder-building';
+                        if (launching) {
+                                // Silently absorb the gap — synchronous script eval or
+                                // NRO write, not a sleep.
+                        } else if (S.phase === 'game' || S.phase === 'notice') {
+                                // Game phase: only fire for Scene_Map (real gameplay).
+                                // Menu scenes (title/load/save) have sync SD reads that
+                                // cause false-positive gaps — skip them.
+                                if (isLiveGameRunning()) {
+                                        log(`_wake: sleep/wake detected (gap=${wallNow - S.lastFrameWall}ms, phase=${S.phase}, scene=Scene_Map)`);
+                                        handleWake(true);
+                                        return;
                                 }
+                                // else: game-phase menu (title/load/save) — false positive, skip
+                        } else {
+                                // Non-game UI (library, options, picker, etc.) — no
+                                // saveable game, just refresh the GPU surface.
+                                log(`_wake: sleep/wake detected (gap=${wallNow - S.lastFrameWall}ms, phase=${S.phase}) — refreshing GPU surface`);
+                                handleWake(false);
                                 return;
                         }
                 }

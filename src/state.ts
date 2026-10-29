@@ -108,6 +108,26 @@ export interface AppState {
         forwarderForceMod: boolean;
         isBakedForwarder: boolean;
 
+        // === Sleep-mode autosave recovery (see src/sleep-recovery.ts) ===
+        // When the console wakes from Sleep Mode, nx.js v1.0.0-beta.7 cannot
+        // recover the GPU surface — any heavy GPU work crashes with 0x95D. The
+        // recovery flow: detect the wake (frame gap), save the live game to a
+        // HIDDEN slot (above the game's normal max-savefiles range so the
+        // save/load UI never shows it), write a marker file, teardown the game,
+        // and chain-launch a FRESH process (fresh GPU surface). The fresh
+        // process reads the marker at boot and auto-loads the hidden slot so
+        // the player resumes exactly where they were.
+        sleepAutoloadPending: boolean;   // true = autoload the hidden save after boot
+        sleepAutoloadGameId: string | null; // the game id the marker requested (sanity check)
+        sleepAutoloadArmed: boolean;     // set true once the autoload hook is installed in launch()
+        // BGM/BGS captured directly from AudioManager at save time (via
+        // AudioManager.saveBgm/saveBgs) and passed through the marker file.
+        // More reliable than $gameSystem._bgm (which some games/plugins don't
+        // populate): this is exactly what was playing through the speakers
+        // when the console slept, captured at the AudioManager level.
+        sleepAutoloadBgm: any;           // null = none; otherwise {name, volume, pitch, pos}
+        sleepAutoloadBgs: any;           // null = none; otherwise {name, volume, pitch, pos}
+
         // === Frame loop bookkeeping ===
         frameLoggedFirst: boolean;
 }
@@ -191,6 +211,12 @@ export function createState(debug: boolean): AppState {
                 forwarderTargetId: null,
                 forwarderForceMod: false,
                 isBakedForwarder: false,
+
+                sleepAutoloadPending: false,
+                sleepAutoloadGameId: null,
+                sleepAutoloadArmed: false,
+                sleepAutoloadBgm: null,
+                sleepAutoloadBgs: null,
 
                 frameLoggedFirst: false,
         };

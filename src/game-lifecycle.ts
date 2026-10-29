@@ -29,8 +29,14 @@ declare const __DEBUG__: boolean;
 
 // Captured at module load so the quit path can defer the native exit via
 // setTimeout and still call the real Switch.exit (not a property stub).
+// Uses globalThis.Switch (not the bare `Switch` identifier) so this module
+// is safe to import in environments where Switch is not defined (the Node
+// test harness bundles several src/ modules that transitively reach this
+// line). globalThis.Switch is undefined in those envs -> realExit = null,
+// no ReferenceError.
+const __SwitchGlobal: any = (globalThis as any).Switch;
 export const realExit: ((() => void) | null) =
-	typeof (Switch as any).exit === 'function' ? (Switch as any).exit.bind(Switch) : null;
+	typeof __SwitchGlobal?.exit === 'function' ? __SwitchGlobal.exit.bind(__SwitchGlobal) : null;
 
 /** Completely stop the running game and release everything it holds: game
  *  audio, the requestAnimationFrame loop, decoded image/bitmap pixel

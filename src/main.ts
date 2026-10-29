@@ -45,6 +45,7 @@ import { suggestGameName, finishAddGame, startForwarderBuild } from './add-game'
 import { mergedKeymap, openKeymapEditor, saveEditingKeymap, applyPreset, handleKeymapTouch } from './keymap-editor';
 import { frame } from './frame-loop';
 import { installLocalStorageShim } from './localstorage-shim';
+import { consumeSleepMarker, installSleepAutoload } from './sleep-recovery';
 // Shared mutable state object — every field that used to be a `let` at the
 // top of this file now lives on `S` (see src/state.ts). Functions moved into
 // other modules (render-*, frame-loop, game-launch, game-lifecycle, etc.)
@@ -145,16 +146,22 @@ if (__DEBUG__) log('Reading SD card folders');
 // works in forwarder NROs which have saveData=0 (localStorage unavailable).
 // The code of the language pack currently loaded into the running game, or ''
 // when only the default English data is in use. Drives the pause-menu label.
-// Wall-clock timestamp of the last frame() call. Used to detect system
-// sleep/wake: rAF does not fire during sleep, so a >3 s gap between
-// consecutive frame() calls means the console slept and woke. nx.js
-// v1.0.0-beta.7 has NO GPU surface recovery after wake (no AppletHook, no
-// EGL/Skia re-init) — the GPU syncpts are stale, and the next heavy GPU
-// present (game launch's font atlas + texture uploads) crashes with
-// 0x95D (LibnxBinder BadValue — stale binder fence on eglSwapBuffers).
-// The light library render survives wake, so we detect it and chain-reload
-// into a FRESH process (fresh GPU surface) before any heavy GPU work.
-const WAKE_GAP_MS = 3000;
+// Wall-clock timestamp of the last frame() call. Used by the frame loop to
+// detect system sleep/wake: rAF is tied to display vsync, which stops when
+// the console sleeps, so a >1 s gap between consecutive frame() calls means
+// the console slept and woke. (nx.js v1.0.0-beta.7 exposes NO applet
+// lifecycle hooks — appletGetMessage/AppletHook are not bound, and devkitPro
+// is not available in this environment to build a native applet-hook
+// extension — so the rAF gap is the only reliable wake signal; see the
+// WAKE_GAP_MS comment in frame-loop.ts for why 1000 ms is the threshold.)
+// The recovery is handled entirely by src/sleep-recovery.ts: save the live
+// game to a HIDDEN FILE (bypasses StorageManager entirely so the game's
+// save/load UI never sees it), write a marker, teardown, and chain-launch a
+// FRESH process (fresh GPU surface — nx.js has NO in-process GPU surface
+// recovery after wake, and all earlier in-process attempts to resume the
+// game crashed). The fresh process reads the marker here at boot
+// (see consumeSleepMarker below)
+// and auto-loads the hidden slot so the player resumes where they were.
 // S.gameStopped is initialized in src/state.ts (createState). The flag is
 // set to true by teardownGame() so the SceneManager.updateMain wrapper
 // returns early after the game is retired.
@@ -424,6 +431,26 @@ if (!S.forwarderTargetId) {
         } catch (error) { log(`_fwd: argv parse failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
+// === Sleep-mode autoload marker (consume early) =======================
+// On wake from Sleep Mode, the PREVIOUS process (before chain-launching
+// this fresh one) wrote a marker file recording {gameId, savedAt, bgm, bgs}
+// after saving the live game to a HIDDEN file — see src/sleep-recovery.ts.
+// If the marker is fresh (< 2 min), we record the requested gameId + audio
+// on S so the launch flow below can auto-launch that game and, after
+// startGame(), install the hook that loads the hidden save file. The marker
+// is ALWAYS consumed (deleted) here whether fresh or stale, so a single
+// wake cannot re-trigger on every subsequent boot.
+try {
+        const marker = consumeSleepMarker();
+        if (marker) {
+                S.sleepAutoloadGameId = marker.gameId;
+                S.sleepAutoloadPending = true;
+                S.sleepAutoloadBgm = marker.bgm;
+                S.sleepAutoloadBgs = marker.bgs;
+                log(`_sleep: autoload requested: gameId=${marker.gameId}, bgm=${marker.bgm?.name || 'none'}, bgs=${marker.bgs?.name || 'none'}`);
+        }
+} catch (error) { log(`_sleep: marker consume failed: ${error instanceof Error ? error.message : String(error)}`); }
+
 // No boot-time exit detection: the exit behavior flag is in-memory only and
 // every load starts from the clean 'shutdown' default (see the exitBehavior
 // lifecycle near the top of the exit section). The only boot-time cleanup is
@@ -469,4 +496,65 @@ if (S.forwarderTargetId) {
                         log(`_fwd: no library entry matches id "${S.forwarderTargetId}"; falling back to library UI`);
                 }
         } catch (error) { log(`_fwd: auto-launch failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+// === Sleep-mode autoload (library-launched game case) =================
+// A sleep marker was consumed above. Two cases:
+//
+//  (a) BAKED-IN FORWARDER + sleep marker: the forwarder auto-launch
+//      block above already starts the correct game. We only need to
+//      sanity-check that the marker's gameId matches the baked-in id
+//      (a mismatch means the marker is stale or for a different game —
+//      discard the autoload slot so launch() doesn't try to load a
+//      save that doesn't belong to this game). On match, leave the
+//      slot set so launch() arms the autoload hook after startGame().
+//
+//  (b) NO FORWARDER (library-launched game that was running when the
+//      console slept): auto-launch the recorded game here, exactly as
+//      the forwarder block above does but keyed on sleepAutoloadGameId
+//      instead of forwarderTargetId. launch() then arms the autoload
+//      hook and the player resumes at their saved position.
+//
+// If the marker's gameId doesn't resolve to a library entry (game was
+// deleted between sleep and wake), the autoload is silently discarded
+// and the library grid shows as normal — the hidden .rpgsave file is
+// still on the SD card in the game's old save folder, but there's no
+// game to load it into.
+if (S.sleepAutoloadGameId && S.forwarderTargetId) {
+        // Case (a): forwarder + marker. Verify match.
+        if (S.sleepAutoloadGameId !== S.forwarderTargetId) {
+                log(`_sleep: marker gameId "${S.sleepAutoloadGameId}" != forwarder id "${S.forwarderTargetId}" — discarding autoload`);
+                S.sleepAutoloadGameId = null;
+                S.sleepAutoloadPending = false;
+                S.sleepAutoloadBgm = null;
+                S.sleepAutoloadBgs = null;
+        }
+        // else: match — forwarder block above started the game; launch()
+        // will read S.sleepAutoloadPending and arm the autoload hook.
+} else if (S.sleepAutoloadGameId && !S.forwarderTargetId) {
+        // Case (b): library-launched game. Auto-launch it.
+        try {
+                const entry = S.library.games.find((g) => g.id === S.sleepAutoloadGameId);
+                if (entry) {
+                        log(`_sleep: auto-launching "${entry.name}" for sleep autoload (id=${entry.id})`);
+                        loadEntryIntoState(entry);
+                        resetLoading(entry.name, 'Resuming after sleep…');
+                        setTimeout(() => {
+                                try { startOrChooseSaves(); }
+                                catch (error) { fail(error); }
+                        }, 0);
+                } else {
+                        log(`_sleep: no library entry matches sleep gameId "${S.sleepAutoloadGameId}" — discarding autoload`);
+                        S.sleepAutoloadGameId = null;
+                        S.sleepAutoloadPending = false;
+                        S.sleepAutoloadBgm = null;
+                        S.sleepAutoloadBgs = null;
+                }
+        } catch (error) {
+                log(`_sleep: library autoload failed: ${error instanceof Error ? error.message : String(error)} — discarding autoload`);
+                S.sleepAutoloadGameId = null;
+                S.sleepAutoloadPending = false;
+                S.sleepAutoloadBgm = null;
+                S.sleepAutoloadBgs = null;
+        }
 }

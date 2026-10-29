@@ -37,6 +37,7 @@ import { fail, failRequest } from './error-handling';
 import { getGameLanguage, validSaveLocation } from './selection';
 import { mergedKeymap } from './keymap-editor';
 import { hud } from './render-overlay';
+import { installSleepAutoload } from './sleep-recovery';
 
 declare const __DEBUG__: boolean;
 
@@ -265,13 +266,17 @@ export async function launch() {
                                 // Also skip during the Plus(+) quit-confirmation notice
                                 // so the game doesn't render over the dialog panel.
                                 if (S.gameStopped || (S.phase === 'notice' && S.exitNoticeArmed)) { this.requestUpdate(); return; }
-                                const now = performance.now();
-                                if (S.lastFrame && now - S.lastFrame > 2000) {
-                                        this._accumulator = 0;
-                                        if (this._getTimeInMsWithoutMobileSafari) this._currentTime = this._getTimeInMsWithoutMobileSafari();
-                                        S.runtime.Input?.clear?.(); S.runtime.TouchInput?.clear?.();
-                                }
-                                S.lastFrame = now;
+                                // NOTE: an earlier version of this wrapper had a ">2 s
+                                // performance.now() gap" guard that reset the accumulator
+                                // and cleared input state — an attempt to let the game
+                                // resume in place after Sleep Mode. It was part of the
+                                // "continue in place" wake-recovery strategy that proved
+                                // unstable on hardware and has been REMOVED. Sleep/wake
+                                // is now handled entirely by src/sleep-recovery.ts: the
+                                // frame loop detects the >3 s gap, saves the live game to
+                                // a hidden slot, tears down, and chain-launches a FRESH
+                                // process which reloads the save. The game never sees a
+                                // post-sleep frame in the same process.
                                 if (S.menu.blocksInput) {
                                         this._accumulator = 0;
                                         if (this._getTimeInMsWithoutMobileSafari) this._currentTime = this._getTimeInMsWithoutMobileSafari();
@@ -288,6 +293,18 @@ export async function launch() {
                 S.phase = 'game';
                 const startup = startGame(S.runtime);
                 log(`Game started: ${startup}`);
+                // If this launch is a sleep-mode autoload (the boot consumed a
+                // fresh sleep marker for this game), install the one-shot hook
+                // that intercepts the FIRST scene transition out of Scene_Boot
+                // and replaces it with: read the hidden save file →
+                // DataManager.createGameObjects + extractSaveContents →
+                // $gamePlayer.requestMapReload() → goto(Scene_Map). The player
+                // resumes exactly where they were when the console slept, in a
+                // clean process with a healthy GPU surface. See sleep-recovery.ts.
+                if (S.sleepAutoloadPending) {
+                        try { installSleepAutoload(); }
+                        catch (error) { log(`_sleep: installSleepAutoload threw: ${error instanceof Error ? error.message : String(error)}`); }
+                }
                 // Record last-played timestamp.
                 if (S.currentEntry) {
                         try { S.library = markPlayed((Switch as any) as unknown as LibraryAccess, S.library, S.currentEntry.id); } catch { /* non-fatal */ }
