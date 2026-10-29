@@ -50,6 +50,12 @@
 
 import { S } from './state';
 import { log } from './log';
+// Imported so the detector's save/load-scene context check uses the SAME
+// instanceof test the wake dispatcher (frame-loop.ts → handleWakeFromSaveLoad)
+// uses — the two never disagree on what counts as a save/load scene. There is
+// no import cycle: sleep-recovery imports {state, log, game-lifecycle,
+// error-handling, forwarder}, none of which import sleep-detect.
+import { isInSaveLoadScene } from './sleep-recovery';
 
 // === Native bridge ====================================================
 // Switch.appletConsumeSleepWake() returns true exactly once per real
@@ -97,6 +103,22 @@ export const STEADY_GAP_MS = 200;
 export const HICCUP_GAP_MS = 600;
 export const WAKE_GAP_MS = 1000;
 export const STEADY_FRAMES_TO_ARM = 60;
+// SAVE/LOAD SCENE OVERRIDE threshold. Scene_Save / Scene_Load do a
+// synchronous slot-list refresh at scene START (read + LZString decompress +
+// JsonEx.parse every slot header) that produces a single multi-second gap —
+// 1–4 s for 20 slots on the Switch, depending on save size + SD speed. That
+// gap must NOT trigger a wake (it would reload the game every time the user
+// opens the save/load menu). A real sleep, however, produces a gap of MANY
+// seconds (the console is suspended — wall-clock time literally stops
+// between the last pre-sleep frame and the first post-wake frame, plus the
+// OS resume + screen-on time). 6 s is safely above any realistic refresh
+// gap while still catching any deliberate sleep (the user turns the console
+// off then on — the total suspend alone is seconds). Used as a safety net
+// for the case where the detector is DISARMED (the user slept within the
+// ~1 s re-arming window after the refresh, or the refresh + entry-disarm
+// left it disarmed) — the armed heuristic (gap > WAKE_GAP_MS) catches
+// quicker sleeps once the scene has settled.
+export const SAVELOAD_WAKE_GAP_MS = 6000;
 
 // Phases in which sleep detection is meaningful (the detector may arm).
 // 'loading' and 'forwarder-building' are EXCLUDED: they are the heavy-sync
@@ -114,6 +136,11 @@ const ARMABLE_PHASES = new Set<string>([
 const NO_RELOAD_PHASES = new Set<string>(['forwarder-building']);
 
 let __lastPhase = '';
+// Tracks the previous frame's save/load-scene state so a transition INTO (or
+// OUT of) a save/load scene is detected and the arming is reset — see the
+// entry-disarm in detectWakeThisFrame for why the refresh gap must not
+// false-trigger.
+let __lastInSaveLoad = false;
 
 /** Reset the steady-frame arming state. Called on any phase transition so a
  *  fresh phase must re-prove steady frames before the heuristic detector
@@ -182,7 +209,55 @@ export function detectWakeThisFrame(wallNow: number): boolean {
 	if (!prev) return false; // first frame ever — no gap to measure
 	const gap = wallNow - prev;
 
-	// Update steady-frame arming state for this frame.
+	// Save/load-scene context (and transition detection). Read once per
+	// frame; isInSaveLoadScene is the SAME instanceof check the wake
+	// dispatcher uses, so the detector and dispatcher never disagree.
+	const inSaveLoad = isInSaveLoadScene();
+	if (inSaveLoad !== __lastInSaveLoad) {
+		__lastInSaveLoad = inSaveLoad;
+		// Reset arming on BOTH entry and exit so the new context must
+		// re-prove steady frames. The entry reset is the critical one:
+		// Scene_Save / Scene_Load do a SYNCHRONOUS slot-list refresh
+		// at scene START (read + LZString decompress + JsonEx.parse
+		// every slot header) that produces a 1–4 s gap — while the
+		// detector is still ARMED from the preceding gameplay. Without
+		// this reset, that refresh gap would false-trigger the wake
+		// handler EVERY TIME the user opens the save/load menu (the
+		// reported "chain-reload on Continue" regression).
+		resetWakeArming();
+		if (inSaveLoad) log(`_wake: entered save/load scene — arming reset (slot-list refresh gap will not false-trigger)`);
+	}
+
+	// === WAKE CHECK (BEFORE the arming update below) ====================
+	// CRITICAL: this check runs BEFORE the arming update, so S.wakeArmed
+	// here reflects the PREVIOUS frame's state (steady frames proven
+	// BEFORE this gap). The original code ran the arming update FIRST,
+	// which disarmed on the very large sleep gap, then `if (!armed)
+	// return false` discarded the wake — so on the stock runtime (no
+	// native appletConsumeSleepWake) a real sleep was NEVER detected,
+	// in gameplay OR in save/load. Checking BEFORE the disarm fixes it.
+	//
+	// Two detection paths:
+	//   (a) ARMED + gap > WAKE_GAP_MS: a real sleep during proven-steady
+	//       rendering (gameplay, OR save/load after the refresh settled
+	//       and re-armed). The standard heuristic, now actually working.
+	//   (b) SAVE/LOAD scene + gap > SAVELOAD_WAKE_GAP_MS: a real sleep
+	//       during a save/load menu EVEN IF DISARMED — e.g. the user
+	//       slept within the ~1 s re-arming window after the refresh,
+	//       or the entry-reset + refresh left it disarmed. The 6 s
+	//       threshold is safely above the refresh gap (1–4 s) so it
+	//       never false-triggers on the refresh, but catches any
+	//       deliberate sleep (suspend alone is seconds).
+	if ((S.wakeArmed && gap > WAKE_GAP_MS) || (inSaveLoad && gap > SAVELOAD_WAKE_GAP_MS)) {
+		log(`_wake: heuristic sleep→wake (gap=${gap}ms, phase=${phase}, armed=${S.wakeArmed}, saveLoad=${inSaveLoad})`);
+		resetWakeArming();
+		return true;
+	}
+
+	// === Arming update (AFTER the wake check) ==========================
+	// Updates arming state for THIS frame so the NEXT frame's wake check
+	// sees it. A large gap that wasn't a wake (the wake check above
+	// already returned for real wakes) is a load/hiccup stall → disarm.
 	if (!ARMABLE_PHASES.has(phase)) {
 		// Loading / forwarder-building / boot — never arm, always reset.
 		if (S.wakeSteadyFrames !== 0) S.wakeSteadyFrames = 0;
@@ -194,24 +269,16 @@ export function detectWakeThisFrame(wallNow: number): boolean {
 			S.wakeArmed = true;
 		}
 	} else {
-		// A hiccup (STEADY_GAP_MS..HICCUP_GAP_MS) or a larger gap — this is a
-		// load/boot stall signature. Disarm and reset the steady run so the
-		// detector cannot fire until the game has re-proven steady frames
-		// (i.e. the load has finished). This is the core of the false-
-		// positive fix: a >1 s map-load stall happens here, disarms the
-		// detector, and the gap below is NOT treated as a wake.
+		// A hiccup (STEADY_GAP_MS..HICCUP_GAP_MS) or a larger gap that was
+		// NOT a wake (the wake check above already returned for wakes).
+		// This is a load/boot/refresh stall signature → disarm so the
+		// detector re-proves steady frames before treating a gap as a
+		// wake. This is the false-positive guard for map-load stalls,
+		// save/load refreshes, etc.
 		S.wakeSteadyFrames = 0;
 		S.wakeArmed = false;
 	}
 
-	// Only consider a heuristic wake when ARMED. A gap >WAKE_GAP_MS while
-	// disarmed is a load/boot stall (handled above by disarming) — ignored.
-	if (!S.wakeArmed) return false;
-	if (gap > WAKE_GAP_MS) {
-		log(`_wake: heuristic sleep→wake (gap=${gap}ms, phase=${phase}, armed=true)`);
-		resetWakeArming();
-		return true;
-	}
 	return false;
 }
 

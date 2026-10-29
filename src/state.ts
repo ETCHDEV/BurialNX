@@ -139,6 +139,22 @@ export interface AppState {
         wakeArmed: boolean;              // true once steady frames >= STEADY_FRAMES_TO_ARM in an armable phase
         wakeNativeEnabled: boolean;      // false once the native probe fails/throws (falls back to heuristic)
 
+        // === Deferred-exit render guard (see src/sleep-recovery.ts) ===
+        // Set true when a wake during a TITLE-screen save/load menu arms a
+        // DEFERRED exit (the forwarder case: quitApp() defers Switch.exit()
+        // via setTimeout to avoid the re-entrancy crash of calling it
+        // synchronously inside frame()). Between the wake frame returning
+        // and the deferred Switch.exit firing, the event loop may dispatch
+        // another rAF — and ANY render on the stale post-wake GPU surface
+        // crashes with 0x95D. While this flag is true, frame() skips ALL
+        // work (rendering, input, scene updates) and just re-arms rAF until
+        // the process actually exits. The library-launched title save/load
+        // path (chainToLibrary) stops the event loop immediately so this
+        // flag is belt-and-braces there; for the forwarder path it is the
+        // decisive guard. Never reset in-process (the process is dying);
+        // the fresh process starts with it false (createState default).
+        exitInProgress: boolean;
+
         // === Frame loop bookkeeping ===
         frameLoggedFirst: boolean;
 }
@@ -232,6 +248,8 @@ export function createState(debug: boolean): AppState {
                 wakeSteadyFrames: 0,
                 wakeArmed: false,
                 wakeNativeEnabled: true,
+
+                exitInProgress: false,
 
                 frameLoggedFirst: false,
         };

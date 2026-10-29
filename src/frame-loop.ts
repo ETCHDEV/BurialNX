@@ -48,7 +48,7 @@ import { launch } from './game-launch';
 import { importSteamSaves } from './saves';
 import { setButton, setButtonWithLabel, displayToButtonIndex } from './keymap';
 import { FolderBrowser } from './folders';
-import { handleWake, isLiveGameRunning } from './sleep-recovery';
+import { handleWake, isLiveGameRunning, isInSaveLoadScene, handleWakeFromSaveLoad } from './sleep-recovery';
 import { detectWakeThisFrame } from './sleep-detect';
 
 declare const __DEBUG__: boolean;
@@ -71,6 +71,21 @@ const GAME_OPTIONS_BASE_COUNT = 14;
 
 export function frame(now: number) {
         try {
+                // === Deferred-exit render guard =====================================
+                // A previous frame armed a DEFERRED exit (the sleep-wake
+                // title-save/load path for a forwarder, which defers
+                // Switch.exit() via setTimeout to avoid the re-entrancy
+                // crash of calling it synchronously inside frame()). Between
+                // that frame returning and the deferred exit firing, the
+                // event loop may dispatch another rAF — and ANY render on the
+                // stale post-wake GPU surface crashes with 0x95D. While this
+                // flag is true, skip ALL work (rendering, input, scene
+                // updates) and just re-arm rAF until the process exits.
+                // See handleWakeTitleSaveLoadExit() in sleep-recovery.ts.
+                if (S.exitInProgress) {
+                        requestAnimationFrame(frame);
+                        return;
+                }
                 // === Sleep/wake recovery ============================================
                 // Detect a system sleep→wake via sleep-detect.ts (native applet hook
                 // when the patched runtime is present, else a steady-frame-armed
@@ -99,12 +114,33 @@ export function frame(now: number) {
                         // detected during a game-phase menu is IGNORED — the same
                         // accepted edge case as before. Only real gameplay (Scene_Map)
                         // and the non-game UI phases trigger a reload.
+                        //
+                        // EXCEPTION (the save/load fix): a wake during a save/load MENU
+                        // (Scene_Save / Scene_Load) is NOT ignored — the stale post-wake
+                        // GPU surface crashes the game on the menu's next render (the
+                        // reported bug: "при выходе из сна игра крашится"). We dispatch
+                        // to handleWakeFromSaveLoad(), which:
+                        //   • IN-GAME save/load (opened from the pause menu over
+                        //     Scene_Map, $gameMap._mapId > 0): saves the UNDERLYING game
+                        //     state (makeSaveContents serializes the paused game, NOT the
+                        //     menu UI) to the hidden sleep-autosave file, teardown, and
+                        //     chain-reload self. The fresh process auto-loads the save →
+                        //     the player resumes in Scene_Map (the save/load menu is
+                        //     gone). "сохранять нужно без них … и перезагружать игру с
+                        //     автозагрузкой этого сохранения".
+                        //   • TITLE save/load (Scene_Load from Scene_Title, no live game):
+                        //     saves nothing, exits to the library / quits the forwarder
+                        //     (the "+ and confirm yes" flow).
                         if (S.phase === 'game' || S.phase === 'notice') {
                                 if (isLiveGameRunning()) {
                                         handleWake(true);
                                         return;
                                 }
-                                // Game-phase menu (title/boot/load/save) — ignore the wake.
+                                if (isInSaveLoadScene()) {
+                                        handleWakeFromSaveLoad();
+                                        return;
+                                }
+                                // Game-phase menu (title/boot) — ignore the wake.
                                 log(`_wake: wake during game non-Scene_Map (phase=${S.phase}) — ignored (stale-GPU risk accepted, light scene)`);
                         } else {
                                 // Non-game UI (library, options, picker, …) — no saveable

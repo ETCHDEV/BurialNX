@@ -73,8 +73,8 @@
 
 import { S } from './state';
 import { log } from './log';
-import { teardownGame } from './game-lifecycle';
-import { removeBeforeUnloadListener } from './error-handling';
+import { teardownGame, quitApp, realExit } from './game-lifecycle';
+import { removeBeforeUnloadListener, removeAllSessionListeners } from './error-handling';
 import { BURIALNX_NRO_PATH, BURIALNX_DEBUG_NRO_PATH } from './forwarder';
 
 // The sleep autosave is written to a SEPARATE HIDDEN FILE, NOT to one of the
@@ -322,6 +322,146 @@ export function isLiveGameRunning(): boolean {
         if (S.phase === 'game') return inSceneMap;
         if (S.phase === 'notice') return inSceneMap;
         return false;
+}
+
+/** Detect whether the active scene is the in-game save/load menu
+ *  (Scene_Save or Scene_Load). Uses the same instanceof check as
+ *  save-load-keymap.ts's overrideKeymapForSaveLoadScene so the two modules
+ *  agree on what counts as a "save/load scene".
+ *
+ *  This is the gate for the wake handler's save/load-specific path
+ *  (see handleWakeFromSaveLoad). When the console sleeps while a save/load
+ *  menu is on screen, the previous "ignore the wake" behavior left the
+ *  stale post-wake GPU surface live and the next render crashed the game.
+ *  Now a wake during a save/load scene is handled explicitly: either save
+ *  the underlying state + reload with autoload (in-game save/load), or
+ *  exit to the library / quit the forwarder (title-screen save/load).
+ *
+ *  Returns true ONLY when SceneManager._scene is an instance of the game's
+ *  Scene_Save or Scene_Load. Returns false for Scene_Map, Scene_Title,
+ *  Scene_Boot, and any scene a custom engine doesn't register under those
+ *  two constructors. */
+export function isInSaveLoadScene(): boolean {
+        const runtime = S.runtime as any;
+        const sm = runtime?.SceneManager;
+        const scene = sm?._scene;
+        if (!scene) return false;
+        const Scene_Save = runtime?.Scene_Save;
+        const Scene_Load = runtime?.Scene_Load;
+        if (Scene_Save && scene instanceof Scene_Save) return true;
+        if (Scene_Load && scene instanceof Scene_Load) return true;
+        return false;
+}
+
+/** Detect whether a live, saveable game is in progress UNDERNEATH the
+ *  current scene — i.e. a map has been loaded via New Game or Load, so
+ *  $gameMap / $gamePlayer / $gameSystem / $gameSwitches / … are all
+ *  populated with real play state.
+ *
+ *  WHY $gameMap._mapId: RPG Maker MV's DataManager.createGameObjects() runs
+ *  at Scene_Boot and constructs a fresh `new Game_Map()`, whose constructor
+ *  sets `this._mapId = 0`. Game_Map.setup(mapId) — called only on New Game
+ *  or Load — sets `_mapId` to the real map. So:
+ *    • On the title screen (and during Scene_Load opened FROM the title,
+ *      before a slot is picked): $gameMap._mapId === 0 → no live game.
+ *    • In-game (Scene_Map running, or Scene_Save/Scene_Load opened from the
+ *      pause menu over Scene_Map): $gameMap._mapId > 0 → live game.
+ *
+ *  This is the distinction the user drew between "save/load screen" (in-game,
+ *  save the underlying state + reload) and "title screen in save/load"
+ *  (title's Load menu, no game to save — just exit). makeSaveContents only
+ *  produces a meaningful save when a live game is underneath; calling it on
+ *  the title screen would serialize an empty/default state.
+ *
+ *  Returns true when $gameMap exists and has a numeric _mapId > 0. */
+export function hasLiveGameUnderneath(): boolean {
+        const runtime = S.runtime as any;
+        const gm = runtime?.$gameMap;
+        if (!gm) return false;
+        const mapId = gm._mapId;
+        return typeof mapId === 'number' && mapId > 0;
+}
+
+/** Wake handler for the TITLE-screen save/load case (Scene_Load opened from
+ *  Scene_Title, no live game underneath). Per the user's spec: do NOT save
+ *  anything — there's no game state to preserve — and just exit to the
+ *  library (library-launched game) or quit the NRO to hbmenu (forwarder).
+ *  This is exactly what the "+" quit dialog's "yes" does, i.e. quitApp().
+ *
+ *  GPU-SAFETY: the wake left the EGL/Skia surface stale. quitApp()'s
+ *  'restart' branch calls chainToLibrary(), which arms envSetNextLoad +
+ *  STOPS the event loop (no GPU touch) → the process exits cleanly and the
+ *  fresh burialnx.nro boots to the library grid. quitApp()'s 'shutdown'
+ *  branch (forwarder) DEFERS Switch.exit() via setTimeout(0) to avoid the
+ *  re-entrancy crash of calling it synchronously inside frame() — which
+ *  opens a window where rAF could fire and render on the stale surface.
+ *  We set S.exitInProgress=true BEFORE quitApp() so frame() skips ALL
+ *  rendering during that window (see the guard at the top of frame() in
+ *  frame-loop.ts). The flag is never reset in-process (the process is
+ *  dying); the fresh process starts with it false.
+ *
+ *  A stale hidden sleep-autosave file (from an earlier wake whose autoload
+ *  failed) is best-effort deleted here so it can't surprise a later boot. */
+export function handleWakeTitleSaveLoadExit(): void {
+        log(`_sleep: wake during title save/load (no live game underneath) — exit to library/hbmenu (no save)`);
+        // Best-effort: clean up a stale hidden sleep save so it doesn't
+        // linger and trigger a surprise autoload on a later library boot.
+        try { deleteSleepSave(); } catch { /* best-effort */ }
+        // Arm the deferred-exit render guard so frame() skips ALL rendering
+        // (the stale post-wake GPU surface would crash on any present).
+        // For 'restart' (chainToLibrary stops the event loop) this is
+        // belt-and-braces; for 'shutdown' (forwarder, deferred Switch.exit)
+        // it is the decisive guard against the rAF window.
+        S.exitInProgress = true;
+        try {
+                // quitApp() reads S.exitBehavior:
+                //   'restart'  (library-launched game) → chainToLibrary() →
+                //              fresh burialnx.nro boots to the library grid.
+                //   'shutdown' (forwarder) → deferred Switch.exit() → NRO
+                //              exits to hbmenu.
+                // This is the "+ and confirm yes" flow the user specified.
+                quitApp();
+        } catch (e) {
+                log(`_sleep: quitApp threw: ${e instanceof Error ? e.message : String(e)} — fallback to direct Switch.exit()`);
+                // quitApp failed before arming the chain/exit. Clear the
+                // guard (we're not in the deferred path anymore) and exit
+                // directly, removing listeners first to avoid recursion.
+                S.exitInProgress = false;
+                try { removeBeforeUnloadListener(); } catch { /* best-effort */ }
+                try { removeAllSessionListeners(); } catch { /* best-effort */ }
+                try {
+                        if (realExit) { S.allowExit = true; realExit(); }
+                        else { log('_sleep: realExit unavailable — cannot exit'); }
+                } catch (e2) { log(`_sleep: fallback Switch.exit threw: ${e2 instanceof Error ? e2.message : String(e2)}`); }
+        }
+}
+
+/** Wake dispatcher for a wake detected while a save/load menu
+ *  (Scene_Save / Scene_Load) is on screen. Decides based on whether a live
+ *  game is in progress underneath:
+ *
+ *    LIVE GAME UNDERNEATH (in-game save/load opened from the pause menu over
+ *    Scene_Map): save the underlying game state and reload with autoload.
+ *    The save/load menu is NOT part of DataManager.makeSaveContents (that
+ *    serializes $gameSystem/$gameMap/$gamePlayer/… — the paused game state,
+ *    not the menu UI), so saveGameForSleep produces exactly "the state
+ *    without the save/load screen". handleWake(true) does the full sequence:
+ *    capture audio → save hidden file → write marker → teardown →
+ *    chain-reload self. The fresh process auto-loads the hidden save and
+ *    lands the player in Scene_Map (the save/load menu is gone). This is
+ *    the user's requirement: "сохранять нужно без них … и перезагружать
+ *    игру с автозагрузкой этого сохранения".
+ *
+ *    NO LIVE GAME UNDERNEATH (Scene_Load opened from Scene_Title, no map
+ *    loaded yet): nothing to save. Exit to the library / quit the forwarder
+ *    via handleWakeTitleSaveLoadExit() (the "+ and confirm yes" flow). */
+export function handleWakeFromSaveLoad(): void {
+        if (hasLiveGameUnderneath()) {
+                log(`_sleep: wake during in-game save/load (live game underneath, $gameMap._mapId>0) — save underlying state + reload with autoload`);
+                handleWake(true);
+        } else {
+                handleWakeTitleSaveLoadExit();
+        }
 }
 
 /** The game id to record in the sleep marker. Uses the current library
