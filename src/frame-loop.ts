@@ -34,7 +34,7 @@ import { libraryTileCount, libraryNavigateRow } from './library-nav';
 import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection } from './selection';
 import { getAllPickKeys, findNearestKey } from './keymap-layout';
 import { openKeymapEditor, applyPreset, saveEditingKeymap, handleKeymapTouch, mergedKeymap } from './keymap-editor';
-import { menuButtonIndicesFor, faceButtonLetter } from './keymap';
+import { menuButtonIndicesFor, faceButtonLetter, displayToButtonIndex } from './keymap';
 import { suggestGameName, finishAddGame, startForwarderBuild } from './add-game';
 import { saveUserCoverLogged, deriveDefaultCover, coverPathFor } from './cover';
 import { invalidateCoverCache } from './cover-cache';
@@ -47,7 +47,7 @@ import { quitApp, chainToLibrary, teardownGame } from './game-lifecycle';
 import { removeBeforeUnloadListener } from './error-handling';
 import { launch } from './game-launch';
 import { importSteamSaves } from './saves';
-import { setButton, setButtonWithLabel } from './keymap';
+import { setButton, setButtonWithLabel, displayToButtonIndex } from './keymap';
 import { FolderBrowser } from './folders';
 
 declare const __DEBUG__: boolean;
@@ -365,7 +365,7 @@ export function frame(now: number) {
                                                 const def = getAllPickKeys()[S.keymapPickCursor];
                                                 if (def && def.label) {
                                                         if (S.keymapCursor < 16) {
-                                                                S.editingKeymap = setButtonWithLabel(S.editingKeymap, S.keymapCursor, def.vkey, def.label, def.keyCode);
+                                                                S.editingKeymap = setButtonWithLabel(S.editingKeymap, displayToButtonIndex(S.keymapCursor), def.vkey, def.label, def.keyCode);
                                                         } else {
                                                                 // Stick direction binding
                                                                 const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
@@ -391,7 +391,7 @@ export function frame(now: number) {
                                         // X: clear binding (set to none)
                                         if (edge(3)) {
                                                 if (S.keymapCursor < 16) {
-                                                        S.editingKeymap = setButton(S.editingKeymap, S.keymapCursor, 'none');
+                                                        S.editingKeymap = setButton(S.editingKeymap, displayToButtonIndex(S.keymapCursor), 'none');
                                                 } else {
                                                         const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
                                                         const dir = stickDirs[S.keymapCursor - 16];
@@ -932,4 +932,4 @@ export function frame(now: number) {
 // (esbuild would tree-shake this anyway, but the explicit helper makes
 // the intent clear: the frame loop reads them at call time when the user
 // actually binds a key in the keyboard picker).
-import { setButton, setButtonWithLabel } from './keymap';
+import { setButton, setButtonWithLabel, displayToButtonIndex } from './keymap';

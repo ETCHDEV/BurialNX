@@ -18,7 +18,7 @@
 // Does NOT mutate S.
 
 import { S } from './state';
-import { BUTTON_NAMES, menuButtonIndicesFor, faceButtonLetter, type VirtualKey } from './keymap';
+import { BUTTON_NAMES, displayToButtonIndex, menuButtonIndicesFor, faceButtonLetter, type VirtualKey } from './keymap';
 import { mergedKeymap } from './keymap-editor';
 import { KEYMAP_COLORS, KEYBOARD_LAYOUT, KEYCODE_TO_VKEY, getAllPickKeys } from './keymap-layout';
 import { KEYMAP_GRID_COLS, KEYMAP_CELL_W, KEYMAP_CELL_H, KEYMAP_KB_SCALE, keymapButtonCellRect, keymapKbOrigin, drawBackButton } from './keymap-geometry';
@@ -82,8 +82,9 @@ function renderButtonGrid(targetLabel: string) {
                         displayLabel = binding ? binding.label : 'none';
                         color = KEYMAP_COLORS[displayLabel as VirtualKey] || '#6e7681';
                 } else {
-                        const key = S.editingKeymap.buttons[i];
-                        displayLabel = S.editingKeymap.labels?.[i] || key;
+                        const btnIdx = displayToButtonIndex(i);
+                        const key = S.editingKeymap.buttons[btnIdx];
+                        displayLabel = S.editingKeymap.labels?.[btnIdx] || key;
                         color = KEYMAP_COLORS[key] || '#6e7681';
                 }
                 S.ctx.fillStyle = selected ? '#3a3f5c' : '#252840';
@@ -94,12 +95,12 @@ function renderButtonGrid(targetLabel: string) {
                 S.ctx.lineWidth = selected ? 3 : 1;
                 S.ctx.strokeRect(x + 1, y + 1, cellW - 2, cellH - 2);
                 S.ctx.fillStyle = '#f4f3ef'; S.ctx.textAlign = 'left';
-                const name = isStick ? stickNames[i - 16] : BUTTON_NAMES[i];
+                const name = isStick ? stickNames[i - 16] : BUTTON_NAMES[displayToButtonIndex(i)];
                 S.ctx.fillText(name, x + 16, y + 24);
                 S.ctx.fillStyle = color; S.ctx.textAlign = 'center';
                 S.ctx.fillText(displayLabel, x + cellW / 2, y + cellH / 2 + 16);
                 S.ctx.fillStyle = '#6e7681'; S.ctx.textAlign = 'left';
-                S.ctx.fillText(`#${i}`, x + 12, y + cellH - 8);
+                S.ctx.fillText(`#${displayToButtonIndex(i)}`, x + 12, y + cellH - 8);
         }
         // Footer
         S.ctx.fillStyle = '#9aa0b4'; S.ctx.textAlign = 'left';
@@ -109,15 +110,16 @@ function renderButtonGrid(targetLabel: string) {
 function renderKeyboardPicker(targetLabel: string) {
         const isStick = S.keymapCursor >= 16;
         const stickNames = ['L↑', 'L↓', 'L←', 'L→', 'R↑', 'R↓', 'R←', 'R→'];
-        const btn = isStick ? stickNames[S.keymapCursor - 16] : BUTTON_NAMES[S.keymapCursor];
+        const btn = isStick ? stickNames[S.keymapCursor - 16] : BUTTON_NAMES[displayToButtonIndex(S.keymapCursor)];
         const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
         let curLabel: string;
         if (isStick) {
                 const dir = stickDirs[S.keymapCursor - 16];
                 curLabel = S.editingKeymap.sticks?.[dir]?.label || 'none';
         } else {
-                const curKey = S.editingKeymap.buttons[S.keymapCursor];
-                curLabel = S.editingKeymap.labels?.[S.keymapCursor] || curKey;
+                const btnIdx = displayToButtonIndex(S.keymapCursor);
+                const curKey = S.editingKeymap.buttons[btnIdx];
+                curLabel = S.editingKeymap.labels?.[btnIdx] || curKey;
         }
         // Header
         S.ctx.fillStyle = '#f4f3ef'; S.ctx.textAlign = 'left';

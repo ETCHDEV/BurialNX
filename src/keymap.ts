@@ -25,13 +25,32 @@ export type VirtualKey =
         | 'menu' | 'pageup' | 'pagedown'
         | 'up' | 'down' | 'left' | 'right' | 'none';
 
-/** Logical names for the 16 standard Web Gamepad button indices. */
+/** Logical names for the 16 standard Web Gamepad button indices.
+ *  The index follows the Web Gamepad API standard mapping:
+ *    0 = South (Nintendo B), 1 = East (Nintendo A),
+ *    2 = North (Nintendo X), 3 = West (Nintendo Y). */
 export const BUTTON_NAMES: readonly string[] = Object.freeze([
-        'A (B / South)', 'B (A / East)', 'X (Y / North)', 'Y (X / West)',
+        'B / South', 'A / East', 'X', 'Y',
         'L (LB)', 'R (RB)', 'ZL (LT)', 'ZR (RT)',
         'Minus (-)', 'Plus (+)', 'L Stick', 'R Stick',
         'D-Up', 'D-Down', 'D-Left', 'D-Right',
 ]);
+
+/** Display order for the 16 buttons in the keymap editor grid.
+ *  Position 0 = button index 1 (East / Nintendo A) — shown FIRST.
+ *  Position 1 = button index 0 (South / Nintendo B) — shown SECOND.
+ *  Positions 2..15 = unchanged. This way the user sees "A" first, "B"
+ *  second in the grid, matching the physical Switch layout (A = right). */
+export const BUTTON_DISPLAY_ORDER: readonly number[] = Object.freeze([
+        1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+]);
+
+/** Convert a grid display position (0..15) to the real button index.
+ *  For stick directions (16..23) returns the position as-is. */
+export function displayToButtonIndex(displayPos: number): number {
+        if (displayPos < 16) return BUTTON_DISPLAY_ORDER[displayPos] ?? displayPos;
+        return displayPos;
+}
 
 export const VIRTUAL_KEYS: readonly VirtualKey[] = Object.freeze([
         'none', 'ok', 'cancel', 'shift', 'control', 'tab', 'escape', 'menu', 'pageup', 'pagedown',

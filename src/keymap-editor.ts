@@ -19,7 +19,7 @@
 
 import { S } from './state';
 import { log } from './log';
-import { PRESETS, applyKeyMap, saveKeyMap, setButtonWithLabel, type KeyMap, type VirtualKey } from './keymap';
+import { PRESETS, applyKeyMap, saveKeyMap, setButtonWithLabel, displayToButtonIndex, type KeyMap, type VirtualKey } from './keymap';
 import { getAllPickKeys, KEYBOARD_LAYOUT } from './keymap-layout';
 import { keymapBackButtonRect, keymapKeyRect, keymapButtonCellRect, pointInRect } from './keymap-geometry';
 import { rememberLibrary } from './selection';
@@ -195,7 +195,7 @@ export function handleKeymapTouch(px: number, py: number): void {
                                 const def = getAllPickKeys()[i];
                                 if (def && def.label) {
                                         if (S.keymapCursor < 16) {
-                                                S.editingKeymap = setButtonWithLabel(S.editingKeymap, S.keymapCursor, def.vkey, def.label, def.keyCode);
+                                                S.editingKeymap = setButtonWithLabel(S.editingKeymap, displayToButtonIndex(S.keymapCursor), def.vkey, def.label, def.keyCode);
                                         } else {
                                                 const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
                                                 const dir = stickDirs[S.keymapCursor - 16];
