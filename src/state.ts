@@ -128,6 +128,17 @@ export interface AppState {
         sleepAutoloadBgm: any;           // null = none; otherwise {name, volume, pitch, pos}
         sleepAutoloadBgs: any;           // null = none; otherwise {name, volume, pitch, pos}
 
+        // === Sleep / wake detection (see src/sleep-detect.ts) ===
+        // The wake detector has two layers: a deterministic NATIVE signal
+        // (Switch.appletConsumeSleepWake, exposed by the patched nx.js
+        // runtime — patches/nxjs-applet-sleep.patch) and a HEURISTIC
+        // steady-frame gap fallback for the stock runtime. The fields below
+        // drive the heuristic arming state; the native layer is stateless
+        // (it polls + clears a native flag each frame).
+        wakeSteadyFrames: number;        // consecutive steady-frame count (resets on hiccup/phase change)
+        wakeArmed: boolean;              // true once steady frames >= STEADY_FRAMES_TO_ARM in an armable phase
+        wakeNativeEnabled: boolean;      // false once the native probe fails/throws (falls back to heuristic)
+
         // === Frame loop bookkeeping ===
         frameLoggedFirst: boolean;
 }
@@ -217,6 +228,10 @@ export function createState(debug: boolean): AppState {
                 sleepAutoloadArmed: false,
                 sleepAutoloadBgm: null,
                 sleepAutoloadBgs: null,
+
+                wakeSteadyFrames: 0,
+                wakeArmed: false,
+                wakeNativeEnabled: true,
 
                 frameLoggedFirst: false,
         };
