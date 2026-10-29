@@ -3,6 +3,15 @@ import { writeFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+// Polyfill: Node.js < 21 doesn't have a global `navigator` object (it was
+// added in Node 21). The CI runs on Node 20, and several source modules
+// (stick-bindings.ts, save-load-keymap.ts, frame-loop.ts) access
+// `navigator.getGamepads()` at runtime. Without this polyfill, those
+// accesses throw ReferenceError on Node 20 and 4 tests fail in CI.
+if (typeof globalThis.navigator === 'undefined') {
+  globalThis.navigator = {};
+}
+
 // Write test bundles into a temp dir INSIDE the project root so Node's
 // ESM loader can still resolve `esbuild` from the project's node_modules.
 const tmpDir = join(process.cwd(), '.test-tmp');
