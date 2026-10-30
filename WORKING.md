@@ -23,6 +23,84 @@ flowchart TD
 ## Code map
 
 - `src/main.ts` connects startup, the options menu, logging, and error handling.
+  At startup it also selects the Switch user once (by touching `localStorage`,
+  whose lazy getter in nx.js mounts save data and shows the system profile
+  selector when no user is preselected) and logs the granted V8 heap size in
+  debug builds. `teardownGame()` fully retires a running game — audio stopped,
+  the game's rAF loop permanently retired, image
+  caches cleared, the game's fonts removed and pending timers cancelled, and
+  a full GC pass — and is used by the quit path, so a stopped game cannot
+  keep running, play sound, or hold native memory.
+  Retiring the frame loop is a two-layer defense: (1) the pending rAF
+  callback is the game's ORIGINAL bound `SceneManager.update`, which
+  property stubs cannot reach, so `beginGameSession()` also wraps
+  `requestAnimationFrame` to track every frame id the game schedules and
+  `endGameSession()` cancels them all before deleting globals (nx.js's rAF
+  is a plain cancellable callback queue); (2) a frame already dequeued for
+  the current vsync batch still runs the bound update after the teardown,
+  so the teardown stubs EVERY manager method update's try/catch can reach
+  (`update`, `updateMain`, `requestUpdate`, `renderScene`, `tickStart`,
+  `tickEnd`, `updateInputData`, `updateScene`, `changeScene`,
+  `catchException`, `stop`, `terminate`) — its own try/catch then swallows
+  the first `… is not defined` error and the stubbed `catchException` ends
+  the chain for good. Without this, the dequeued update's `tickStart()` →
+  `Graphics.tickStart()` and `catchException` → `Graphics.printError()`
+  threw escaping `ReferenceError`s into nx.js, which terminates the whole
+  process for any uncaught rAF exception (the hardware crash: "Graphics is
+  not defined" frozen on a "Loading…" splash, killing the process between
+  teardown and `Switch.exit()` instead of letting it exit cleanly).
+  Because the game runs in the loader's realm, `beginGameSession()` snapshots
+`globalThis` at launch and `endGameSession()` restores it at teardown:
+game-created globals are deleted and host-replaced values (document, fetch,
+Image, …) return to the native originals, which is what actually frees the
+retained native audio/font/pixel memory. The session
+`error`/`unhandledrejection` listeners also call `preventDefault()` on the
+dispatched events: nx.js kills the process with a frozen "Press + to exit"
+screen for ANY uncaught exception or unhandled rejection unless the event
+is canceled, and the loader shows its own recoverable error screen instead.
+There is no in-process session reboot: returning to the library means
+quitting the app (`quitApp('return-to-library')` → `teardownGame()` →
+`chainToLibrary()` → `app.launch(burialnx.nro)` without `--game`) and
+relaunching it from hbmenu, which is a guaranteed clean cold boot — Horizon
+OS reserves the process memory and reclaims it on exit, the only reliably
+clean reset on this OS. An in-process reboot (re-running the app bundle from
+`romfs:/main.js` in a fresh function scope) was implemented and hardened
+across several iterations but proved unstable on hardware: it froze on the
+"Loading…" splash with `FAILURE: ReferenceError: Graphics is not defined`
+(a late game frame referencing the deleted `Graphics` global escaped into
+nx.js, which terminates the whole process for any uncaught rAF exception).
+The full teardown (audio, frame loop, caches, realm restore, GC) is still
+performed before `Switch.exit()` on the quit path, so no stopped game can
+keep running or hold memory while the process dies. The error screen's
+B button uses the same quit path. `renderRenameKb()` draws the rename input
+field: it re-reads `vk.value`/`vk.cursorIndex` every frame (so the preview
+tracks typing even without `change` events), anchors the field above the
+keyboard's real on-screen rectangle (`vk.boundingRect` from `show()`), and
+falls back to a fixed top band without geometry.
+- `quitApp(mode)` now takes a `QuitMode` (`'shutdown'` | `'return-to-library'`)
+  and chooses the path by context:
+  - **Library grid Quit / `+` confirmation, forwarder-launched game exit,
+    error screen B** → `'shutdown'`: calls `Switch.exit()` and returns to
+    hbmenu. For LEGACY argv forwarders (chain-load approach), a `.fwd-exit-flag`
+    file is written so the next boot can detect a stale-next-load re-chain
+    (if hbloader didn't clear `envSetNextLoad`). For BAKED-IN forwarders,
+    no flag is written (no `envSetNextLoad` was set). Labels: "Quit BurialNX" /
+    "Quit BurialNX?".
+  - **Library-launched game exit (pause-menu "Quit", `+` confirmation)** →
+    `'return-to-library'`: `chainToLibrary()` chain-loads `burialnx.nro`
+    without `--game` → the library grid shows. Labels: "Return to library" /
+    "Return to library?".
+- **Baked-in forwarder (no chain-loading)**: the forwarder IS a copy of
+  `burialnx.nro` with two placeholders patched in the romfs's main.js:
+  `__FORWARDER_GAME_ID__` (64 `'0'` chars → game id) and
+  `__FORWARDER_MOD_FORCED__` (`"MODFORCED_0"` → `"MODFORCED_1"` if mod is on).
+  At runtime, burialnx checks these constants. If the game id is NOT all
+  zeros, this IS a forwarder → set `forwarderTargetId` and auto-launch the
+  game. NO chain-loading, NO `envSetNextLoad` → quitting is a clean
+  `Switch.exit()` → hbmenu. This replaces the old chain-load approach
+  (`forwarder-template/romfs/main.ts` called `app.launch(burialnx.nro,
+  '--game', id)` which set `envSetNextLoad` — persistent on some hbloaders,
+  causing re-chain loops).
 - `src/runtime-plan.ts` selects the game's normal load handler or, if absent,
   starts its boot scene when no scene is already active or queued.
 - `src/folders.ts` and `src/settings.ts` handle SD selection and remembered paths.
@@ -39,16 +117,90 @@ flowchart TD
   request, and script interfaces needed by the game. nx.js supplies the
   actual canvas, audio, image decoding, and timers. The resource fetch bridge
   rejects external and native filesystem URLs; this is not a script sandbox.
+  The Image wrapper and resource fetch are installed around the native
+  originals, and the game-session teardown restores those natives, so every
+  launch installs fresh wrappers and returning to the library plus starting
+  another game never stacks wrappers on top of each other.
 - `src/game-compat.ts` contains the game and engine adapters described below.
+  Screen touch events are forwarded to `document` through a single process-wide
+  listener set that resolves the current `document` at event time, so a second
+  launch keeps touch input working with its fresh document. It also strips the
+  top-level `'use strict'` directive from every script (see below) and patches
+  `WebAudio._createNodes` to override `createPanner` (nx.js does not implement
+  it).
+- `src/node-compat.ts` installs the Node.js / NW.js globals that RPG Maker MV
+  games packaged as NW.js desktop apps expect (`require`, `process`, `Buffer`,
+  `module`, `exports`, `global`, `__dirname`, `__filename`, `nw`). Without them
+  a game that calls `require` from a plugin dies with `ReferenceError: require
+  is not defined` at the title screen. `nw.dll` itself is an x86 Windows DLL
+  and cannot run on the Switch's ARM64 CPU, so the fix is to polyfill the
+  globals NW.js would have provided, not to load nw.dll. `require('fs')` is
+  wired to nx.js's synchronous SD-card I/O (`Switch.readFileSync`/`writeFileSync`
+  /`statSync`/...) with a per-game writable overlay at
+  `sdmc:/switch/burialnx/nwfs/<game-id>/` so game/mod scripts can read and
+  write files via the familiar Node API without ever modifying the game's own
+  directory (writes go to the overlay; reads check the overlay first, then the
+  real path under the app root). `require('path')`, `require('events')`,
+  `require('buffer').Buffer` are real implementations; `require('os'/`crypto'/
+  `child_process`/`http`/...)` return safe no-op stubs; unknown bare modules
+  return a callable proxy that never throws on chained property access.
+  Relative `require('./local')` loads and caches a local module from the app
+  root or `www/`. `process.mainModule.filename` points at
+  `<appRoot>/www/index.html` so `path.dirname()` = `<appRoot>/www` and
+  `../patch/` = `<appRoot>/patch` (matching the Windows/NW.js layout). The
+  layer is installed in `launch()` after `createBrowserHost` and before any
+  game script loads, so it is tracked by the game-session snapshot and torn
+  down on quit. This is a compatibility shim, not a security sandbox — game/mod
+  scripts already run with native privileges (see SECURITY.md); the overlay
+  only keeps the game dir pristine.
 - `src/indexed-png.ts` handles an indexed PNG color issue only if a runtime
   probe shows that the correction is needed.
 - `src/repeated-pattern.ts` batches tiny repeating textures into bounded
   tiles, reducing the number of native draw calls while preserving their pixels.
 - `src/menu.ts` contains menu input state; debug-only choices are excluded from
-  the release build.
+  the release build. The pause menu has three pages: page 1 (main actions),
+  page 2 (Another…: saves, import, display, FPS, mouse speed, mod, language,
+  Experimental…), and page 3 (Experimental…: every FPS-optimization toggle).
+- The Experimental page (page 3) exposes the runtime FPS patches documented in
+  `docs/doc/fps-optimizations.md` as on/off toggles, plus the Frame skip slider
+  and the Message render cycler. Each toggle maps to an `S.<field>` boolean
+  (`skipFadeBlur`, `skipFadeFill`, `windowLayerSkip`, `windowBitmapReuse`,
+  `textureGcIdle`, `dirtyRenderSkip`, `presentCache`, `canvasNodeSkip`). The
+  toggles are **per-game**: stored on each game's `library.json` entry under
+  `experimental` (see `ExperimentalSettings` in `src/game-library.ts`), applied
+  to the live state in `loadEntryIntoState` (`src/selection.ts`), and written
+  back through `setExperimentalSettings` when flipped in the pause menu
+  (`src/frame-loop.ts`). All default off — a game with no saved set behaves as
+  stock RPG Maker MV. The patched functions in `src/game-compat.ts` and
+  `src/browser-host.ts` read the `S.*` flags at call time, so a toggle takes
+  effect immediately (no restart).
 - `src/saves.ts` supports separate SD or explicitly selected game-folder
   storage, retains recovery copies on interrupted writes, and imports Steam
   files only into an empty separate destination.
+- `src/forwarder.ts` builds per-game forwarder NROs at runtime using the
+  BAKED-IN approach: the forwarder IS a copy of `burialnx.nro` with two
+  placeholders patched in the romfs's main.js (`__FORWARDER_GAME_ID__` 64-'0'
+  → game id; `__FORWARDER_MOD_FORCED__` "MODFORCED_0" → "MODFORCED_1" if mod
+  is on). No chain-loading, no `envSetNextLoad`. The module is pure JS (no
+  Switch access at module top level): it decodes the NRO0/ASET layout,
+  patches the placeholders in place (same byte length, no romfs rebuild),
+  patches the NACP title/author/id, re-encodes a 256×256 JPEG icon from
+  the game cover via `OffscreenCanvas.convertToBlob`, and rebuilds the
+  asset section (only when the icon changes).
+- `main.ts` now also checks the baked-in `__FORWARDER_GAME_ID__` constant
+  at startup — if it is NOT all zeros, this IS a forwarder NRO → set
+  `forwarderTargetId` and auto-launch the game. A legacy argv fallback
+  (`--game <id>`) is kept for old forwarders built before this change.
+  The launch flow reports per-stage progress to a centered progress bar
+  (`renderLoading`) instead of the old top-left text panel. The new
+  `forwarder-building` phase drives `buildForwarder()` with the same
+  progress bar, and ignores the Plus button so a multi-MiB NRO write is
+  never interrupted mid-write. At startup, `main.ts` also checks for a
+  stale `.fwd-exit-flag` file (written by `quitApp('shutdown')` before
+  `Switch.exit()` for LEGACY argv forwarders only): if the flag is recent
+  and this is NOT a baked-in forwarder, `forwarderTargetId` is cleared so
+  the library grid shows instead of the game restarting in a loop.
+
 
 ## Why compatibility code is needed
 
@@ -64,6 +216,23 @@ understand and test each difference:
   safety measure until that scene can be reliably supported on Switch.
 - The game's own language table and fonts are read from the selected game.
   In-memory asset decoding and hashed-path lookup support its file layout.
+  In addition, the loader scans the game's `languages/` folder (and one level
+  above `www/`) for `.cld` language packs. A `.cld` is a `LANGDATA`-prefixed
+  JSON blob with translation tables (`sysLabel`, `sysMenus`, `labelLUT`,
+  `linesLUT`), an embedded base64 font (`fontFile` + `fontFace` + `fontSize`),
+  and translated images (`imgFiles`: hashed asset path → base64 PNG). When a
+  pack is found it is loaded INSTEAD of the default English data embedded in
+  `data/9c7050ae76645487`; the embedded font is registered as a `FontFace`
+  and `Window_Base.standardFontFace`/`standardFontSize` (and the Yanfly
+  `Param.DefaultFont`/`Param.FontSize`, `Graphics.fontFace`, and
+  `Bitmap.prototype.fontFace`/`fontSize`) are overridden to the pack's values;
+  and the asset reader is wrapped so `imgFiles` paths return the decoded
+  replacement images instead of reading the originals from the SD card. The
+  choice is persisted per-game under `localStorage` key
+  `burialnx-lang:<game-root>` and can be cycled from the pause menu
+  (hold Minus → "Another..." → Language). Russian (`ru.cld`) is the primary
+  target and is preferred when no saved choice exists; the default English
+  data is always the fallback when no `.cld` is readable.
 - Switch buttons map to RPG Maker input. Audio panning and asynchronous audio
   decoding are adapted to the nx.js APIs.
 - Local save keys preserve the earlier loader's shared or path-specific

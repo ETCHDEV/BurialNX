@@ -1,0 +1,85 @@
+name: Build NRO
+
+# Ручной запуск: на странице репозитория → Actions → "Build NRO" → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.5)'
+        required: true
+        default: 'v0.1.5'
+      create_release:
+        description: 'Create a GitHub Release with the .nro files'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # GITHUB_TOKEN по умолчанию read-only — для создания релизов
+    # нужны права на запись в репозиторий.
+    permissions:
+      contents: write
+
+    steps:
+      # 1. Checkout кода
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Установить Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3. Установить зависимости
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      # 4. Запустить тесты
+      - name: Run tests
+        run: npm test
+
+      # 5. Собрать release .nro
+      - name: Build release NRO
+        run: npm run build
+
+      # 6. Собрать debug .nro
+      - name: Build debug NRO
+        run: npm run build -- --debug
+
+      # 8. Загрузить артефакты (доступны для скачивания в Actions)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BurialNX-${{ inputs.version }}
+          path: |
+            burialnx.nro
+            burialnx-debug.nro
+          retention-days: 30
+
+      # 9. Создать GitHub Release (если выбрано)
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: BurialNX ${{ inputs.version }}
+          body: |
+            ## BurialNX ${{ inputs.version }}
+
+            ### Installation
+            1. Copy `burialnx.nro` to `sdmc:/switch/burialnx/`
+            2. Launch from hbmenu
+
+            ### Debug build
+            `burialnx-debug.nro` — includes extra logging
+            and diagnostic menu items. Logs are written to
+            `sdmc:/switch/burialnx/LOGS/`
+          files: |
+            burialnx.nro
+            burialnx-debug.nro
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
