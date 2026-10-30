@@ -11,7 +11,7 @@ import { overrideKeymapForSaveLoadScene, isSaveLoadKeymapActive } from './save-l
 import { pollButtonBindings } from './stick-bindings';
 import { pollMouseInput, renderMouseCursor, hasMouseMovementBinding } from './mouse-input';
 import { libraryTileCount, libraryNavigateRow } from './library-nav';
-import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection } from './selection';
+import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection, setExperimentalSettings } from './selection';
 import { getAllPickKeys, findNearestKey } from './keymap-layout';
 import { openKeymapEditor, applyPreset, saveEditingKeymap, handleKeymapTouch, mergedKeymap } from './keymap-editor';
 import { menuButtonIndicesFor, faceButtonLetter, displayToButtonIndex } from './keymap';
@@ -30,6 +30,7 @@ import { setButton, setButtonWithLabel, displayToButtonIndex } from './keymap';
 import { FolderBrowser } from './folders';
 import { handleWake, isLiveGameRunning, isInSaveLoadScene, handleWakeFromSaveLoad } from './sleep-recovery';
 import { detectWakeThisFrame } from './sleep-detect';
+import { cycleMessageRender } from './partial-render';
 
 declare const __DEBUG__: boolean;
 
@@ -656,6 +657,33 @@ export function frame(now: number) {
                         if (S.menu.frameSkipDelta !== 0) {
                                 S.frameSkip = Math.max(0, Math.min(10, S.frameSkip + S.menu.frameSkipDelta));
                                 try { (Switch as any).writeFileSync('sdmc:/switch/burialnx/frame-skip-settings.json', JSON.stringify({ frameSkip: S.frameSkip })); } catch { /* best-effort */ }
+                                try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                        }
+                        // Message-render mode (pause menu → Another…): cycle full / blink-skip.
+                        //   full       = render every frame (safest)
+                        //   blink-skip = skip render on stable messages, refresh blink (default; ≈ +27 FPS)
+                        if (S.menu.messageRenderDelta !== 0) {
+                                S.messageRender = cycleMessageRender(S.messageRender, S.menu.messageRenderDelta);
+                                try { (Switch as any).writeFileSync('sdmc:/switch/burialnx/message-render-settings.json', JSON.stringify({ messageRender: S.messageRender })); } catch { /* best-effort */ }
+                                try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                        }
+                        // Experimental toggle (pause menu → Another… → Experimental): flip the named
+                        // S boolean and persist it to THIS GAME's library entry (per-game settings).
+                        // Takes effect immediately — the patched functions in game-compat.ts /
+                        // browser-host.ts read the S flags at call time.
+                        if (S.menu.toggleExperimental) {
+                                const field = S.menu.toggleExperimental as keyof typeof S;
+                                (S as any)[field] = !(S as any)[field];
+                                if (S.selectedGame) {
+                                        try {
+                                                setExperimentalSettings(S.selectedGame, {
+                                                        skipFadeBlur: S.skipFadeBlur, skipFadeFill: S.skipFadeFill,
+                                                        windowLayerSkip: S.windowLayerSkip, windowBitmapReuse: S.windowBitmapReuse,
+                                                        textureGcIdle: S.textureGcIdle, dirtyRenderSkip: S.dirtyRenderSkip,
+                                                        presentCache: S.presentCache, canvasNodeSkip: S.canvasNodeSkip,
+                                                });
+                                        } catch (error) { log(`Could not save experimental settings: ${error instanceof Error ? error.message : String(error)}`); }
+                                }
                                 try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                         }
                         S.host?.present();

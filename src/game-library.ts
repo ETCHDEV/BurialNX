@@ -1,6 +1,27 @@
 import { parseSelection, safeSdPath, type GameSelection, type SaveLocation } from './settings';
 import { parseKeyMap, type KeyMap } from './keymap';
 
+/** Persisted per-game FPS-experimental toggle set. Stored on the library entry so each
+ *  game keeps its own settings (see docs/doc/fps-optimizations.md). All default false —
+ *  the user opts each one in per game. */
+export interface ExperimentalSettings {
+        skipFadeBlur?: boolean;
+        skipFadeFill?: boolean;
+        windowLayerSkip?: boolean;
+        windowBitmapReuse?: boolean;
+        textureGcIdle?: boolean;
+        dirtyRenderSkip?: boolean;
+        presentCache?: boolean;
+        canvasNodeSkip?: boolean;
+}
+
+/** Names of the experimental toggle fields, in the order they appear on the pause menu's
+ *  Experimental page. Used by the frame loop to flip the named S field and persist. */
+export const EXPERIMENTAL_FIELDS = [
+        'skipFadeBlur', 'skipFadeFill', 'windowLayerSkip', 'windowBitmapReuse',
+        'textureGcIdle', 'dirtyRenderSkip', 'presentCache', 'canvasNodeSkip',
+] as const;
+
 /** Persisted description of one added game: id, name, root, saves, cover, keymap, language. */
 export interface LibraryEntry {
         id: string;
@@ -17,6 +38,8 @@ export interface LibraryEntry {
         lastPlayed?: number;
         /** Per-game language preference: a .cld code (e.g. 'ru') or '' for English. */
         language?: string;
+        /** Per-game FPS-experimental toggles. When absent all are off (defaults). */
+        experimental?: ExperimentalSettings;
 }
 
 export interface LibraryFile {
@@ -65,6 +88,14 @@ export function parseLibrary(text: string): LibraryFile {
                 if (keymap !== undefined) entry.keymap = keymap;
                 if (typeof raw.lastPlayed === 'number' && Number.isFinite(raw.lastPlayed) && raw.lastPlayed > 0) entry.lastPlayed = raw.lastPlayed;
                 if (typeof raw.language === 'string') entry.language = raw.language;
+                if (raw.experimental !== undefined && raw.experimental !== null && typeof raw.experimental === 'object') {
+                        const exp: ExperimentalSettings = {};
+                        for (const key of EXPERIMENTAL_FIELDS) {
+                                const v = (raw.experimental as any)[key];
+                                if (typeof v === 'boolean') (exp as any)[key] = v;
+                        }
+                        entry.experimental = exp;
+                }
                 games.push(entry);
         }
         const file: LibraryFile = { version: 1, games };

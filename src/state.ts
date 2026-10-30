@@ -1,4 +1,5 @@
 import { DEFAULT_KEYMAP, type KeyMap, type VirtualKey } from './keymap';
+import type { MessageRenderMode } from './partial-render';
 import { FolderBrowser } from './folders';
 import { PauseMenu } from './menu';
 import type { MapPrefetcher } from './map-prefetch';
@@ -115,6 +116,50 @@ export interface AppState {
          *  scene, skip N frames between renders (extra throttle for low-intensity movement).
          *  Adjusted in the pause menu under "Another…" → "Frame skip". Default 0. */
         frameSkip: number;
+        /** Message-render mode — how the renderer handles frames where the ONLY visible
+         *  change is the message/choice window (cursor blink, finished typewriter):
+         *  - 'full'       = render every frame (original behavior, safest).
+         *  - 'blink-skip' = skip render on stable-message frames except every Nth
+         *                   (default; big FPS win during dialogue, cursor still blinks).
+         *  Adjusted in the pause menu under "Another…" → "Message render". Default 'blink-skip'. */
+        messageRender: MessageRenderMode;
+        /** -1 / 0 / +1 — set by Left/Right while the messageRender item is selected; consumed by the frame loop. */
+        messageRenderDelta: number;
+        /** Skip the blur in SceneManager.snapForBackground (patch T1). ON = the menu/save/load
+         *  background is a crisp snapshot (faster transition); OFF = stock 2-pass box blur
+         *  (smoother darkening, but ~18 full-screen blends per transition). Per-game, toggle
+         *  in the pause menu under "Another…" → "Experimental" → "Skip fade blur". Default OFF. */
+        skipFadeBlur: boolean;
+        /** Skip ScreenSprite's 100× fillRect when its alpha is 0 (patch T2). ON = PIXI skips
+         *  the giant no-op fill every frame (faster); OFF = stock (always fill, slightly
+         *  smoother fade-in first frame). Per-game, toggle in the pause menu under "Another…"
+         *  → "Experimental" → "Skip fade fill". Default OFF. */
+        skipFadeFill: boolean;
+        /** Patch WL: skip WindowLayer's temp-canvas dance when no windows are visible. ON =
+         *  skip ~3.2M pixel ops/frame per WindowLayer with no open menus (faster); OFF =
+         *  stock (always run the temp-canvas clear+clip+drawImage). Default OFF. */
+        windowLayerSkip: boolean;
+        /** Patch WR: reuse the window frame/cursor Bitmap instead of allocating a new
+         *  OffscreenCanvas on every _refreshFrame/_refreshCursor. ON = reuse (avoids canvas
+         *  churn that collapses FPS 60→18); OFF = stock (new Bitmap every refresh). Default OFF. */
+        windowBitmapReuse: boolean;
+        /** Patch E: raise textureGC.maxIdle from 1 to 600 (keep textures hot 10s). No-op on
+         *  CanvasRenderer; only matters if WebGL is ever enabled. ON = 600 (hot); OFF =
+         *  stock 1 (aggressive GC). Default OFF. */
+        textureGcIdle: boolean;
+        /** Patch G: the dirty-flag render-skip + accumulator cap in SceneManager.updateMain.
+         *  ON = skip renderScene when nothing changed + cap accumulator to 2 updates/tick
+         *  (the biggest single FPS win on static scenes); OFF = stock (render every frame,
+         *  accumulator can spiral). Default OFF. */
+        dirtyRenderSkip: boolean;
+        /** Patch C: cache the present() destination rect (game canvas → screen). ON =
+         *  recompute only on resize/fit-toggle (faster); OFF = recompute every present()
+         *  (stock). Default OFF. */
+        presentCache: boolean;
+        /** Patch CanvasNode: skip the same-value canvas.width/height assignment (which clears
+         *  the surface per spec). ON = skip when unchanged (faster); OFF = stock (always
+         *  assign, always clear). Default OFF. */
+        canvasNodeSkip: boolean;
 }
 
 /** Construct the singleton state object shared across every loader module. */
@@ -216,6 +261,16 @@ export function createState(debug: boolean): AppState {
                 mouseVisible: false,
                 mouseSpeed: 5,
                 frameSkip: 0,
+                messageRender: 'blink-skip',
+                messageRenderDelta: 0,
+                skipFadeBlur: false,
+                skipFadeFill: false,
+                windowLayerSkip: false,
+                windowBitmapReuse: false,
+                textureGcIdle: false,
+                dirtyRenderSkip: false,
+                presentCache: false,
+                canvasNodeSkip: false,
         };
 }
 

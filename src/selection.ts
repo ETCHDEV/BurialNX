@@ -1,7 +1,7 @@
 import { S } from './state';
 import { log } from './log';
 import { safeGameSaveFolder, safeSaveFolder, hasSteamSaveData } from './saves';
-import { libraryIdFromRoot, loadLibrary, upsertGame, toSelection, entryFromSelection, type LibraryEntry, type LibraryAccess } from './game-library';
+import { libraryIdFromRoot, loadLibrary, upsertGame, toSelection, entryFromSelection, type LibraryEntry, type LibraryAccess, type ExperimentalSettings } from './game-library';
 import { parseSelection, startupSelection, type GameSelection, type SaveLocation } from './settings';
 import { invalidateCoverCache } from './cover-cache';
 import { LIBRARY_PAGE_SIZE } from './render-library';
@@ -47,6 +47,24 @@ export function setGameLanguage(gameRoot: string, code: string): void {
         }
 }
 
+/** Read the per-game experimental-toggle set from the library entry. Returns an empty
+ *  object (all off) if the game has no saved experimental settings. */
+export function getExperimentalSettings(gameRoot: string): ExperimentalSettings {
+        const entry = S.library.games.find((g) => g.root === gameRoot || g.id === libraryIdFromRoot(gameRoot));
+        return entry?.experimental ?? {};
+}
+
+/** Write the per-game experimental-toggle set to the library file on the SD card. The
+ *  whole set is replaced (no merge) — the caller passes the new desired state. */
+export function setExperimentalSettings(gameRoot: string, exp: ExperimentalSettings): void {
+        const id = libraryIdFromRoot(gameRoot);
+        const entry = S.library.games.find((g) => g.id === id);
+        if (entry) {
+                const updated: LibraryEntry = { ...entry, experimental: exp };
+                if (rememberLibrary(updated)) { S.currentEntry = updated; log(`Experimental settings saved for ${id}`); }
+        }
+}
+
 export function currentSelection(saves: SaveLocation | undefined = S.saveLocation): GameSelection {
         if (!S.selectedGame) throw new Error('No game selected');
         return { root: S.selectedGame, sharedSaves: S.sharedSaves, mod: S.selectedMod || null, ...(saves ? { saves } : {}) };
@@ -61,6 +79,17 @@ export function loadEntryIntoState(entry: LibraryEntry) {
         if (S.saveLocation && !validSaveLocation(S.saveLocation, entry.root, S.selectedMod || null)) S.saveLocation = undefined;
         S.saved = toSelection(entry);
         S.currentEntry = entry;
+        // Apply this game's saved per-game experimental FPS toggles to the live S flags.
+        // (Defaults: all off when the entry has no saved experimental set.)
+        const exp = entry.experimental ?? {};
+        S.skipFadeBlur = !!exp.skipFadeBlur;
+        S.skipFadeFill = !!exp.skipFadeFill;
+        S.windowLayerSkip = !!exp.windowLayerSkip;
+        S.windowBitmapReuse = !!exp.windowBitmapReuse;
+        S.textureGcIdle = !!exp.textureGcIdle;
+        S.dirtyRenderSkip = !!exp.dirtyRenderSkip;
+        S.presentCache = !!exp.presentCache;
+        S.canvasNodeSkip = !!exp.canvasNodeSkip;
 }
 
 export function startOrChooseSaves() {

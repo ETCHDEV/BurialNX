@@ -158,7 +158,22 @@ falls back to a fixed top band without geometry.
 - `src/repeated-pattern.ts` batches tiny repeating textures into bounded
   tiles, reducing the number of native draw calls while preserving their pixels.
 - `src/menu.ts` contains menu input state; debug-only choices are excluded from
-  the release build.
+  the release build. The pause menu has three pages: page 1 (main actions),
+  page 2 (Another…: saves, import, display, FPS, mouse speed, mod, language,
+  Experimental…), and page 3 (Experimental…: every FPS-optimization toggle).
+- The Experimental page (page 3) exposes the runtime FPS patches documented in
+  `docs/doc/fps-optimizations.md` as on/off toggles, plus the Frame skip slider
+  and the Message render cycler. Each toggle maps to an `S.<field>` boolean
+  (`skipFadeBlur`, `skipFadeFill`, `windowLayerSkip`, `windowBitmapReuse`,
+  `textureGcIdle`, `dirtyRenderSkip`, `presentCache`, `canvasNodeSkip`). The
+  toggles are **per-game**: stored on each game's `library.json` entry under
+  `experimental` (see `ExperimentalSettings` in `src/game-library.ts`), applied
+  to the live state in `loadEntryIntoState` (`src/selection.ts`), and written
+  back through `setExperimentalSettings` when flipped in the pause menu
+  (`src/frame-loop.ts`). All default off — a game with no saved set behaves as
+  stock RPG Maker MV. The patched functions in `src/game-compat.ts` and
+  `src/browser-host.ts` read the `S.*` flags at call time, so a toggle takes
+  effect immediately (no restart).
 - `src/saves.ts` supports separate SD or explicitly selected game-folder
   storage, retains recovery copies on interrupted writes, and imports Steam
   files only into an empty separate destination.

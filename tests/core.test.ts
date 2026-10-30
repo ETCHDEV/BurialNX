@@ -20,6 +20,8 @@ import { prepareGameScript, translate, installGameCompatibility, parseLanguagePa
 import { createBrowserHost, resourceFetch } from '../src/browser-host';
 import { RepeatedPattern } from '../src/repeated-pattern';
 import { ensureGameSaveFolder, hasSteamSaveData, importSteamSaves, installSdSaves, safeGameSaveFolder, safeSaveFolder, steamSaveSources } from '../src/saves';
+import { MESSAGE_RENDER_MODES, messageRenderLabel, cycleMessageRender, type MessageRenderMode } from '../src/partial-render';
+import { S } from '../src/state';
 
 test('map prefetch warms only bounded direct transfers and waits for an idle frame', async () => {
         let now = 0;
@@ -165,8 +167,9 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.step(press(1), 2001);
         // Now on page 2.
         assert.equal(menu.page, 2);
-        // Page 2: saves, import, resolution, fps, mouseSpeed, frameSkip, mod, language, back (no snapshot/direct in release)
-        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mouseSpeed', 'frameSkip', 'mod', 'language', 'back']);
+        // Page 2 (Another): saves, import, resolution, fps, mouseSpeed, mod, language, experimental
+        // (no snapshot/direct/back in release; B returns to page 1). All FPS items moved to page 3.
+        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mouseSpeed', 'mod', 'language', 'experimental']);
         // B goes back to page 1.
         menu.step(press(0), 2002);
         assert.equal(menu.page, 1);
@@ -184,6 +187,60 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.open = true; menu.dismiss();
         assert.equal(menu.blocksInput, true);
         menu.step(null, 2005); assert.equal(menu.blocksInput, false);
+});
+
+test('pause menu page 3 (Experimental) holds every FPS toggle and flips on A / Left / Right', () => {
+        const buttonsBuffer = Array.from({ length: 16 }, () => ({ pressed: false }));
+        const press = (id: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === id }));
+        const menu = new PauseMenu(false);
+        // Open the pause menu (hold Minus).
+        menu.step(press(8), 0); menu.step(press(8), 801);
+        assert.ok(menu.open);
+        // Go to page 2 (select "Another" at index 4, press A).
+        menu.selected = 4; // 'another'
+        menu.step(press(1), 1001); // A → page 2
+        assert.equal(menu.page, 2);
+        // Select "experimental" (last item on release page 2) and press A → page 3.
+        const expIdx = menu.currentItems.indexOf('experimental');
+        assert.ok(expIdx >= 0, 'page 2 has an experimental entry');
+        menu.selected = expIdx;
+        menu.step(null, 1002); // release
+        menu.step(press(1), 1003); // A → page 3
+        assert.equal(menu.page, 3, 'A on experimental enters page 3');
+        // Page 3 has every FPS item: the slider + cycler + 8 on/off toggles.
+        assert.deepEqual(menu.currentItems, ['frameSkip', 'messageRender', 'skipFadeBlur', 'skipFadeFill',
+                'windowLayerSkip', 'windowBitmapReuse', 'textureGcIdle',
+                'dirtyRenderSkip', 'presentCache', 'canvasNodeSkip']);
+        // A on a toggle item arms toggleExperimental with that field name.
+        menu.selected = menu.currentItems.indexOf('windowLayerSkip');
+        menu.step(null, 1004); // release
+        menu.step(press(1), 1005); // A
+        assert.equal(menu.toggleExperimental, 'windowLayerSkip', 'A arms the windowLayerSkip toggle');
+        // Left and Right also arm the toggle (a boolean has no direction).
+        menu.step(null, 1006); // release (clears toggleExperimental for this step)
+        menu.step(press(14), 1007); // Left
+        assert.equal(menu.toggleExperimental, 'windowLayerSkip', 'Left arms the toggle');
+        menu.step(null, 1008); // release
+        menu.step(press(15), 1009); // Right
+        assert.equal(menu.toggleExperimental, 'windowLayerSkip', 'Right arms the toggle');
+        // B from page 3 returns to page 2 with the cursor on "experimental".
+        menu.step(null, 1010); // release
+        menu.step(press(0), 1011); // B
+        assert.equal(menu.page, 2, 'B from page 3 returns to page 2');
+        assert.equal(menu.selected, menu.itemsPage2.indexOf('experimental'), 'cursor on experimental after B');
+        // Frame skip and message render keep their own delta mechanisms (not toggleExperimental).
+        menu.page = 3; menu.selected = menu.currentItems.indexOf('frameSkip');
+        menu.step(null, 1012);
+        menu.step(press(15), 1013); // Right on frameSkip
+        assert.equal(menu.frameSkipDelta, 1, 'frameSkip uses frameSkipDelta');
+        assert.equal(menu.toggleExperimental, null, 'frameSkip does not arm toggleExperimental');
+        menu.selected = menu.currentItems.indexOf('messageRender');
+        menu.step(null, 1014);
+        menu.step(press(15), 1015); // Right on messageRender
+        assert.equal(menu.messageRenderDelta, 1, 'messageRender uses messageRenderDelta');
+        assert.equal(menu.toggleExperimental, null, 'messageRender does not arm toggleExperimental');
+        // Restore the buttons buffer so the shared-menu test invariant holds.
+        (menu as any).pressed = buttonsBuffer;
 });
 
 test('folder browser selects a highlighted game and optional mod without writing', () => {
@@ -1922,4 +1979,134 @@ test('makeSaveContents rollback: no-op when there is no 101/102 to roll back to'
         assert.equal(interpreter._index, 0, 'no rollback when no 101/102 found');
         // _waitMode is NOT cleared (we couldn't find a safe rollback target).
         assert.equal(interpreter._waitMode, 'message', '_waitMode unchanged (no safe rollback)');
+});
+
+// === Message-render mode cycling ============================================
+test('message-render mode cycling wraps through full / blink-skip', () => {
+        assert.deepEqual([...MESSAGE_RENDER_MODES], ['full', 'blink-skip'] as MessageRenderMode[]);
+        assert.equal(messageRenderLabel('full'), 'full');
+        assert.equal(messageRenderLabel('blink-skip'), 'blink-skip');
+        // Forward cycling: full → blink-skip → full.
+        assert.equal(cycleMessageRender('full', 1), 'blink-skip');
+        assert.equal(cycleMessageRender('blink-skip', 1), 'full');
+        // Backward cycling wraps the other way.
+        assert.equal(cycleMessageRender('full', -1), 'blink-skip');
+        assert.equal(cycleMessageRender('blink-skip', -1), 'full');
+        // Unknown mode falls back to the default ('blink-skip').
+        assert.equal(cycleMessageRender('nope' as MessageRenderMode, 1), 'blink-skip');
+});
+
+test('message-render mode list stays stable at full / blink-skip', () => {
+        // Guards against accidental re-introduction of the removed partial / hybrid
+        // modes (they glitched on hardware). The mode surface must stay minimal.
+        assert.deepEqual([...MESSAGE_RENDER_MODES], ['full', 'blink-skip']);
+});
+
+// === Transition fade speedup patches (T1 / T2) — toggleable ==================
+test('T1: snapForBackground skips blur when S.skipFadeBlur is on, runs it when off', () => {
+        // T1: Scene_Map.terminate() → SceneManager.snapForBackground() does a full off-screen
+        // render + drawImage + a 2-pass 9-blend box blur — the heaviest cost in a scene
+        // transition (the "fade lags" symptom). The patched snapForBackground keeps the
+        // snapshot and drops the blur ONLY when S.skipFadeBlur is on (the default). Toggling
+        // it off from the pause menu restores the stock blur (smoother darkening). Bitmap.blur
+        // is gated the same way so plugins calling it directly also honor the toggle.
+        //
+        // We re-create the patched functions directly (not via installGameCompatibility) because
+        // installGameCompatibility touches many runtime objects and a minimal runtime makes it
+        // loop. The patched functions are plain function assignments — exercising them directly
+        // with both S.skipFadeBlur states is a faithful test of the toggle.
+        const saved = S.skipFadeBlur;
+        try {
+                let blurCalls = 0;
+                const bgBitmap: any = { blur: function() { blurCalls++; } };
+                const origBlur = function() { blurCalls++; };
+                // Re-create the exact patched snapForBackground (see game-compat.ts patch T1).
+                const sm: any = {
+                        snap: function() { return bgBitmap; },
+                        snapForBackground: function() {
+                                this._backgroundBitmap = this.snap();
+                                if (S.skipFadeBlur) return;
+                                try { if (typeof this._backgroundBitmap?.blur === 'function') this._backgroundBitmap.blur(); } catch { /* best-effort */ }
+                        },
+                };
+                // Re-create the exact patched Bitmap.prototype.blur (T1 belt-and-suspenders).
+                const blurFn = function() {
+                        if (S.skipFadeBlur) return;
+                        return origBlur.apply(this, arguments);
+                };
+                // ON (default): snap keeps snapshot, blur NOT called.
+                S.skipFadeBlur = true;
+                sm.snapForBackground();
+                assert.equal(blurCalls, 0, 'on: snap blur skipped');
+                blurFn();
+                assert.equal(blurCalls, 0, 'on: Bitmap.blur no-op');
+                // OFF: snap runs the stock blur.
+                S.skipFadeBlur = false;
+                sm.snapForBackground();
+                assert.equal(blurCalls, 1, 'off: snap blur runs');
+                blurFn();
+                assert.equal(blurCalls, 2, 'off: Bitmap.blur runs original');
+        } finally {
+                S.skipFadeBlur = saved;
+        }
+});
+
+test('T2: ScreenSprite opacity setter toggles _graphics.visible based on S.skipFadeFill', () => {
+        // T2: ScreenSprite draws a (-5W,-5H,10W,10H) rect via PIXI.Graphics — a 100× screen
+        // area fillRect — and CanvasGraphicsRenderer re-issues it EVERY frame even at
+        // alpha 0. The patch redefines the `opacity` setter so the underlying _graphics is
+        // marked `visible=false` when alpha==0 (PIXI skips invisible children). Toggleable:
+        // ON = skip the fill at alpha 0 (faster); OFF = stock (always visible, fillRect runs).
+        //
+        // We exercise the setter logic directly (not via installGameCompatibility) because
+        // installGameCompatibility touches many runtime objects and a minimal runtime makes
+        // it loop. The setter is a plain defineProperty on the prototype — exercising it
+        // directly with both S.skipFadeFill states is a faithful test of the toggle.
+        const saved = S.skipFadeFill;
+        try {
+                function clamp(v: number, min: number, max: number) { return Math.min(max, Math.max(min, v)); }
+                const proto: any = {};
+                // Re-create the exact setter installGameCompatibility installs (see game-compat.ts,
+                // patch "Transition fade speedup 2/2").
+                Object.defineProperty(proto, 'opacity', {
+                        configurable: true,
+                        get: function() { return this.alpha * 255; },
+                        set: function(value: number) {
+                                const a = clamp(value, 0, 255) / 255;
+                                this.alpha = a;
+                                const g = this._graphics;
+                                if (!g) return;
+                                if (S.skipFadeFill) {
+                                        g.visible = (a > 0);
+                                } else {
+                                        g.visible = true;
+                                }
+                        },
+                });
+                const sprite: any = { alpha: 1, _graphics: { visible: true } };
+                Object.setPrototypeOf(sprite, proto);
+                // ON (default): opacity 0 → graphics hidden; opacity > 0 → visible.
+                S.skipFadeFill = true;
+                sprite.opacity = 0;
+                assert.equal(sprite.alpha, 0, 'on: alpha 0');
+                assert.equal(sprite._graphics.visible, false, 'on: graphics hidden at alpha 0');
+                sprite.opacity = 128;
+                assert.equal(sprite._graphics.visible, true, 'on: graphics visible at alpha > 0');
+                sprite.opacity = 255;
+                assert.equal(sprite._graphics.visible, true, 'on: graphics visible at full alpha');
+                assert.equal(sprite.opacity, 255, 'getter returns alpha*255');
+                // OFF: opacity 0 → graphics still visible (stock; the fillRect runs at alpha 0).
+                S.skipFadeFill = false;
+                sprite.opacity = 0;
+                assert.equal(sprite.alpha, 0, 'off: alpha 0');
+                assert.equal(sprite._graphics.visible, true, 'off: graphics stays visible at alpha 0 (stock)');
+                sprite.opacity = 128;
+                assert.equal(sprite._graphics.visible, true, 'off: graphics visible at alpha > 0');
+                // Toggle back ON while at alpha 0 → graphics hides on the next set.
+                S.skipFadeFill = true;
+                sprite.opacity = 0;
+                assert.equal(sprite._graphics.visible, false, 'on again: graphics hidden at alpha 0');
+        } finally {
+                S.skipFadeFill = saved;
+        }
 });

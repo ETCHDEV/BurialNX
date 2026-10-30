@@ -122,6 +122,21 @@ try {
         }
 } catch { /* defaults to 0 */ }
 
+// Load the persisted message-render mode (pause menu → Another… → "Message render").
+// Default 'blink-skip' — skip render on stable-message frames and refresh the cursor
+// blink periodically; the main fix for the "only the message flickers, FPS ~20" symptom.
+try {
+        const raw = Switch.readFileSync('sdmc:/switch/burialnx/message-render-settings.json');
+        if (raw) {
+                const value = JSON.parse(new TextDecoder().decode(raw));
+                if (value?.messageRender === 'full' || value?.messageRender === 'blink-skip') S.messageRender = value.messageRender;
+        }
+} catch { /* defaults to 'blink-skip' */ }
+
+// (Per-game experimental FPS toggles are loaded from the library entry in
+// loadEntryIntoState — see src/selection.ts — not here. They are stored as the
+// `experimental` field on each game's library entry and default to all-off.)
+
 try {
         if (S.library.lastPlayed) {
                 const idx = S.library.games.findIndex((g) => g.id === S.library.lastPlayed);

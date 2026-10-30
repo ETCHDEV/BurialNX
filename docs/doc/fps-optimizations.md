@@ -4,21 +4,64 @@ This document describes every FPS optimization patch applied to BurialNX, what i
 
 All patches are **runtime-only** — they modify the game's runtime objects (PIXI, SceneManager, Window, WindowLayer) after the game scripts load. **No game asset or script file is modified.**
 
+## Per-game storage
+
+The experimental toggles are stored **per game**, on each game's entry in
+`sdmc:/switch/burialnx/library.json` under an `experimental` object, e.g.:
+
+```json
+{
+  "id": "g1a2b3c", "name": "My Game", "root": "sdmc:/games/mygame",
+  "sharedSaves": false,
+  "experimental": {
+    "skipFadeBlur": true,
+    "dirtyRenderSkip": true,
+    "windowBitmapReuse": true
+  }
+}
+```
+
+This mirrors how per-game language and keymap are already stored, so:
+
+- Each game keeps its own experimental set. Settings you turn on for one game
+  don't leak into another.
+- The toggles are applied to the live state when a game is selected
+  (`loadEntryIntoState` in `src/selection.ts` reads `entry.experimental` and
+  writes the eight `S.*` flags).
+- Flipping a toggle in the pause menu (Another → Experimental → item, A or
+  Left/Right) writes the new set back to that game's library entry via
+  `setExperimentalSettings` (`src/selection.ts`). No separate JSON file.
+- Defaults: all eight toggles **off**. A game with no `experimental` field
+  (e.g. one added before this feature) behaves exactly as stock RPG Maker MV.
+
 ---
 
 ## Patch index
 
-| ID | Name | File | Effect | Risk | Revert difficulty |
-|----|------|------|--------|------|-------------------|
-| B | Canvas2D Proxy → explicit wrapper | `browser-host.ts` | Removes per-call Proxy-trap overhead on every Canvas2D draw | Low | Easy |
-| C | Cached `present()` destination | `browser-host.ts` | Caches viewport rect; clears only letterbox bands | Low | Easy |
-| — | CanvasNode width/height skip | `browser-host.ts` | Skips resize-clear when size unchanged | Low | Easy |
-| F | Zero-allocation button scan | `frame-loop.ts` | `anyPressed()` instead of `Array.from().some()` | Low | Easy |
-| WL | WindowLayer skip when no windows | `game-compat.ts` | Skips temp-canvas dance when no visible windows | Low | Easy |
-| WR | Window `_refreshFrame`/`_refreshCursor` Bitmap reuse | `game-compat.ts` | Reuses Bitmap instead of allocating new canvas | Low | Easy |
-| E | textureGC maxIdle 1→600 | `game-compat.ts` | Keeps textures hot (no-op on CanvasRenderer) | Low | Easy |
-| G | Frame-skip cap + dirty-flag render-skip | `game-compat.ts` | Caps accumulator; skips render on static scenes | Medium | Medium |
-| FS | Frame skip slider (0-10) | `menu.ts`, `state.ts`, `render-overlay.ts`, `main.ts`, `frame-loop.ts`, `game-compat.ts` | User-adjustable extra throttle | Low | Easy |
+Every patch in the table below is **runtime-toggleable** from the pause menu
+(hold Minus → "Another..." → "Experimental..."), **per-game** (stored on the
+game's `library.json` entry under `experimental`, so each game keeps its own
+set), and takes effect immediately (no restart). **All default OFF** — you opt
+each one in per game. Turn any one on if that game's FPS needs it; turn it off
+if a game looks worse with it on. The two patches marked "always on" (B, F)
+are per-call micro-optimizations with no behavioral difference — toggling them
+would add a flag-check on the hot path, which defeats their purpose, so they
+stay on.
+
+| ID | Name | File | Effect | Toggle item | Risk | Revert |
+|----|------|------|--------|-------------|------|--------|
+| B | Canvas2D Proxy → explicit wrapper | `browser-host.ts` | Removes per-call Proxy-trap overhead on every Canvas2D draw | (always on) | Low | Easy |
+| C | Cached `present()` destination | `browser-host.ts` | Caches viewport rect; clears only letterbox bands | Present cache | Low | Easy |
+| — | CanvasNode width/height skip | `browser-host.ts` | Skips resize-clear when size unchanged | CanvasNode skip | Low | Easy |
+| F | Zero-allocation button scan | `frame-loop.ts` | `anyPressed()` instead of `Array.from().some()` | (always on) | Low | Easy |
+| WL | WindowLayer skip when no windows | `game-compat.ts` | Skips temp-canvas dance when no visible windows | WindowLayer skip | Low | Easy |
+| WR | Window `_refreshFrame`/`_refreshCursor` Bitmap reuse | `game-compat.ts` | Reuses Bitmap instead of allocating new canvas | Window Bitmap reuse | Low | Easy |
+| E | textureGC maxIdle 1→600 | `game-compat.ts` | Keeps textures hot (no-op on CanvasRenderer) | Texture GC idle | Low | Easy |
+| G | Frame-skip cap + dirty-flag render-skip | `game-compat.ts` | Caps accumulator; skips render on static scenes | Dirty render-skip | Medium | Medium |
+| FS | Frame skip slider (0-10) | `game-compat.ts` etc. | User-adjustable extra throttle | Frame skip (slider) | Low | Easy |
+| MR | Message-render mode (full / blink-skip) | `game-compat.ts` etc. | Skip the message-only blink frames | Message render (cycler) | Low | Easy |
+| T1 | Skip the blur in `snapForBackground` (transition fade) | `game-compat.ts` | Drops the 18 full-screen blend passes per scene transition | Skip fade blur | Low | Easy |
+| T2 | ScreenSprite: hide the 100× fillRect at alpha 0 | `game-compat.ts` | Skips ~4 giant `fillRect` calls/frame when no fade is active | Skip fade fill | Low | Easy |
 
 ---
 
@@ -215,18 +258,58 @@ To keep dirty-flag but disable the accumulator cap:
 
 ## Partial redraw — NOT APPLIED (experimental, reverted)
 
-A partial-redraw approach was attempted twice and reverted both times:
+A partial-redraw approach was attempted three times and reverted every time
+(see git history). It was re-tried as the `partial` and `hybrid` modes of the
+Message render setting and **removed again** because both glitched on hardware.
+Only `full` and `blink-skip` ship now; the blink-skip mode achieves a similar
+~+27 FPS win far more safely (it does zero work on skip frames rather than a
+partial redraw). The full history and the reasons each attempt failed are
+preserved below for anyone who wants to retry.
 
 **Approach:** Cache a background snapshot (render scene with `_windowLayer.visible = false`, copy canvas to an OffscreenCanvas). When only the message/choice window is active (background stable), restore the snapshot via `drawImage` and render only the window layer on top — skipping the expensive tilemap + sprite traversal.
 
 **Why it failed:**
 1. **First attempt:** `drawImage(snapshot, 0, 0)` threw "Image or Canvas expected" — the game canvas is a BurialNX `CanvasNode` wrapper, not a native nx.js canvas, and `nx_get_canvas` didn't recognize it. Fixed by unwrapping via `surface()`.
 2. **Second attempt:** Windows rendered at position (0,0) and menus stopped updating. Root cause: `WindowLayer.renderCanvas` uses a temp canvas with `clip()` and offset, and bypassing the full `CanvasRenderer.render` setup (which resets `setTransform`/`globalAlpha`/`globalCompositeOperation` and does `clearBeforeRender`) left the context in a state where window positions were wrong.
-3. **Third attempt (with full context setup + try/catch fallback):** Still didn't produce the expected FPS improvement and showed no `partial` counter growth — the dirty detection for message/choice activity wasn't triggering partial mode reliably.
+3. **Third attempt (with full context setup + try/catch fallback + dirty-rect restore):** Still glitched on hardware — the cached background went stale on some plugin-driven window/scene transitions the dirty detection didn't cover, producing visible tearing and ghosting. Reverted in favor of blink-skip, which is simpler and glitch-free.
 
-**Status:** Reverted. The dirty-flag render-skip (patch G) achieves a similar effect more safely — on a static scene it skips render entirely (0ms), which is even cheaper than partial redraw (which still does 1 drawImage + window layer render).
+**Status:** Reverted. The dirty-flag render-skip (patch G) plus blink-skip (patch MR) achieve the same FPS goal more safely — on a static scene patch G skips render entirely (0ms), and during a stable-message blink-skip does 0 work on N-1 of N frames.
 
-**If you want to retry partial redraw:** The key insight is that `WindowLayer.renderCanvas` expects the renderer context to be in the exact state that `CanvasRenderer.render` leaves it (after `setTransform(1,0,0,1,0,0)`, `globalAlpha = 1`, `globalCompositeOperation = 'source-over'`, and `clearBeforeRender`). Any partial path must replicate this setup exactly, AND must handle the fact that `WindowLayer.renderCanvas` internally swaps `renderer.context` to its temp canvas and back. The cleanest approach may be to call the original `renderScene` but temporarily hide the tilemap + spriteset (set `scene._spriteset.visible = false`), rather than bypassing `renderScene` entirely.
+**If you want to retry partial redraw:** The key insight is that `WindowLayer.renderCanvas` expects the renderer context to be in the exact state that `CanvasRenderer.render` leaves it (after `setTransform(1,0,0,1,0,0)`, `globalAlpha = 1`, `globalCompositeOperation = 'source-over'`, and `clearBeforeRender`). Any partial path must replicate this setup exactly, AND must handle the fact that `WindowLayer.renderCanvas` internally swaps `renderer.context` to its temp canvas and back. The cleanest approach may be to call the original `renderScene` but temporarily hide the tilemap + spriteset (set `scene._spriteset.visible = false`), rather than bypassing `renderScene` entirely. You must also invalidate the cache on EVERY scene/window/child-count change, not just the ones the current dirty list tracks — plugin-driven transitions were the failure mode.
+
+---
+
+## T1 — Skip the blur in `snapForBackground` (transition fade)
+
+**File:** `src/game-compat.ts`, `installGameCompatibility` → `SceneManager.snapForBackground` + `Bitmap.prototype.blur`
+
+**What it does:** On every map transfer, `Scene_Map.terminate()` calls `SceneManager.snapForBackground()` to capture the outgoing frame as the dimmed background behind `Scene_Menu` / `Scene_Save` / `Scene_Load`. Stock does `this._backgroundBitmap = this.snap(); this._backgroundBitmap.blur();` — a full off-screen render of the scene + drawImage, AND `Bitmap.prototype.blur()` (a 2-pass box blur). Each blur pass does: 1 edge-padded temp-canvas copy + 9 full-screen `drawImage` blends with `globalCompositeOperation = 'lighter'` → **18 full-screen blend passes per transition**. At 1600×1000 (the resolution the target game sets via Community_Basic) that is ~29 million pixel ops done SYNCHRONOUSLY in the `terminate()` frame — the single biggest reason a scene-to-scene fade "lags".
+
+The patch:
+- `SceneManager.snapForBackground` → keeps the snapshot, drops the `blur()` call. The background is the captured frame, just unblurred (a tiny cosmetic change — the menu/save/load background is a crisp snapshot instead of a soft-blurred one).
+- `Bitmap.prototype.blur` → fast-pathed to a no-op, so any plugin that calls `bitmap.blur()` directly also stops paying the cost. The method is kept present (not deleted) so `typeof bitmap.blur === 'function'` checks still pass.
+
+**Measured effect:** Removes the heaviest single-frame cost in a scene transition — the fade frame stops stuttering.
+
+**Risk:** Low. The blur is purely cosmetic (a darkened background behind a menu). Gameplay is unaffected. If a game uses `Bitmap.blur()` for an in-game visual effect (very rare — it is not used anywhere in `rpg_core`/`rpg_managers`/`rpg_sprites`/`rpg_objects`/`rpg_windows`), that effect becomes a crisp image instead of a blurred one.
+
+**Revert:** In `game-compat.ts`, remove the two blocks guarded by `__bnxNoBlurSnap` and `__bnxBlurSkip`. Stock `snapForBackground` and `blur` run unmodified.
+
+---
+
+## T2 — ScreenSprite: hide the 100× fillRect at alpha 0
+
+**File:** `src/game-compat.ts`, `installGameCompatibility` → `ScreenSprite.prototype.opacity` setter
+
+**What it does:** `ScreenSprite` (rpg_core.js) draws the full-screen fade via a `PIXI.Graphics` rectangle of `(-5W, -5H, 10W, 10H)` — a rect **100× the screen area** — and `CanvasGraphicsRenderer.render` re-issues `context.fillRect(-5W,-5H,10W,10H)` for it EVERY frame, even when the sprite's alpha is 0 (no fade is active). Each `Scene_Map` has several ScreenSprites (`_flashSprite`, `_fadeSprite`, `_blackScreen`, plus `_screenFlashSprite` on the battle side), so that is ~4× a giant `fillRect` per frame for nothing. At 1600×1000 the stock rect is 16 million pixels × 4 = ~64M wasted pixel-fills per second at 60 fps.
+
+The patch redefines the `opacity` setter on `ScreenSprite.prototype` so that when `alpha == 0` the underlying `_graphics` is marked `visible = false` → PIXI skips rendering invisible containers entirely. When `alpha > 0` (the fade is actually animating) `_graphics.visible` is set back to `true` and the fade renders normally.
+
+**Measured effect:** Eliminates ~4 giant no-op `fillRect` calls per frame when no fade / flash is active (the common case — most frames are NOT mid-fade). Per-frame saving scales with resolution (biggest gain on this game's 1600×1000).
+
+**Risk:** Low. The fade and flash still render correctly (alpha > 0 → visible). The only difference is that at exactly alpha 0 the graphics is skipped — which is the correct optimization (drawing a fully-transparent rect is a no-op visually).
+
+**Revert:** In `game-compat.ts`, remove the block guarded by `__bnxAlphaSkip`. The stock `opacity` setter (which only sets `this.alpha`) runs unmodified.
 
 ---
 

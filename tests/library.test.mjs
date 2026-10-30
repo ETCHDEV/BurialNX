@@ -42,6 +42,64 @@ test('parseLibrary rejects duplicate ids and unsafe roots', async () => {
   assert.throws(() => lib.parseLibrary(JSON.stringify({ version: 2, games: [] })), /Unsupported library version/);
 });
 
+test('parseLibrary accepts and validates per-game experimental FPS toggles', async () => {
+  const lib = await loadLibraryModule();
+  // A valid per-game experimental set round-trips through parseLibrary.
+  const valid = {
+    version: 1,
+    games: [{
+      id: 'g1', name: 'A', root: 'sdmc:/games/a', sharedSaves: false,
+      experimental: {
+        skipFadeBlur: true, skipFadeFill: false, windowLayerSkip: true,
+        windowBitmapReuse: true, textureGcIdle: false, dirtyRenderSkip: true,
+        presentCache: false, canvasNodeSkip: true,
+      },
+    }],
+  };
+  const parsed = lib.parseLibrary(JSON.stringify(valid));
+  const exp = parsed.games[0].experimental;
+  assert.ok(exp, 'parsed experimental is present');
+  assert.equal(exp.skipFadeBlur, true, 'skipFadeBlur round-trips');
+  assert.equal(exp.skipFadeFill, false, 'skipFadeFill round-trips');
+  assert.equal(exp.dirtyRenderSkip, true, 'dirtyRenderSkip round-trips');
+  assert.equal(exp.presentCache, false, 'presentCache round-trips');
+  assert.equal(exp.canvasNodeSkip, true, 'canvasNodeSkip round-trips');
+  // Unknown keys in the experimental object are ignored (forward-compat).
+  const withUnknown = {
+    version: 1,
+    games: [{
+      id: 'g1', name: 'A', root: 'sdmc:/games/a', sharedSaves: false,
+      experimental: { skipFadeBlur: true, notARealToggle: true, dirtyRenderSkip: 'yes' },
+    }],
+  };
+  const parsed2 = lib.parseLibrary(JSON.stringify(withUnknown));
+  const exp2 = parsed2.games[0].experimental;
+  assert.equal(exp2.skipFadeBlur, true, 'known boolean kept');
+  assert.equal(exp2.notARealToggle, undefined, 'unknown key dropped');
+  assert.equal(exp2.dirtyRenderSkip, undefined, 'non-boolean value dropped');
+  // A null experimental is allowed (treated as "no experimental set").
+  const nullExp = { version: 1, games: [{ id: 'g1', name: 'A', root: 'sdmc:/games/a', sharedSaves: false, experimental: null }] };
+  const parsed3 = lib.parseLibrary(JSON.stringify(nullExp));
+  assert.equal(parsed3.games[0].experimental, undefined, 'null experimental → undefined');
+  // A non-object experimental is ignored (no throw).
+  const badExp = { version: 1, games: [{ id: 'g1', name: 'A', root: 'sdmc:/games/a', sharedSaves: false, experimental: 'on' }] };
+  const parsed4 = lib.parseLibrary(JSON.stringify(badExp));
+  assert.equal(parsed4.games[0].experimental, undefined, 'non-object experimental → undefined');
+});
+
+test('upsertGame preserves a per-game experimental set and persists it through library.json', async () => {
+  const lib = await loadLibraryModule();
+  const fs = memoryFs();
+  const entry = { id: 'g1', name: 'A', root: 'sdmc:/games/a', sharedSaves: false, experimental: { skipFadeBlur: true, dirtyRenderSkip: true } };
+  let file = lib.upsertGame(fs, { version: 1, games: [] }, entry);
+  // Reload from the in-memory fs to confirm the experimental set round-trips.
+  const reloaded = lib.loadLibrary(fs);
+  assert.equal(reloaded.games.length, 1);
+  assert.equal(reloaded.games[0].experimental?.skipFadeBlur, true, 'skipFadeBlur persisted');
+  assert.equal(reloaded.games[0].experimental?.dirtyRenderSkip, true, 'dirtyRenderSkip persisted');
+  assert.equal(reloaded.games[0].experimental?.skipFadeFill, undefined, 'unset toggle stays absent');
+});
+
 test('parseLibrary accepts and validates per-game keymap', async () => {
   const lib = await loadLibraryModule();
   const kmMod = await loadKeymapModule();

@@ -2,6 +2,7 @@ import { S } from './state';
 import { roundedRectPath } from './canvas-utils';
 import { menuButtonIndicesFor, faceButtonLetter } from './keymap';
 import { mergedKeymap } from './keymap-editor';
+import { messageRenderLabel, MESSAGE_RENDER_MODES } from './partial-render';
 
 declare const __DEBUG__: boolean;
 
@@ -43,7 +44,7 @@ export function renderPauseMenu(): void {
         const labels: Record<string, string> = {
                 continue: 'Resume', save: 'Save', load: 'Load',
                 keymap: 'Edit joycon key bindings',
-                another: 'Another...', back: 'Back',
+                another: 'Another...', experimental: 'Experimental...', back: 'Back',
                 quit: quitLabel,
                 saves: 'Choose save location', import: 'Import Steam saves',
                 resolution: `Display: ${S.fit ? 'fit' : 'native'}`,
@@ -57,7 +58,9 @@ export function renderPauseMenu(): void {
         const letters = menuLetters();
         const topBar = `BurialNX  |  Up/Down: select  ${letters.confirm}: choose  ${letters.cancel}: back/close`
                 + (S.menu.fps ? `  |  ${S.fps.toFixed(1)} FPS` : '');
-        const maxItems = __DEBUG__ ? 11 : 9;
+        // Panel sized to the largest page (page 3 Experimental has 10 items; page 2 has
+        // up to 10 in debug; page 1 has 6). Keeps the panel a consistent height across pages.
+        const maxItems = 10;
         const itemH = 26;
         const topH = 30;
         const padding = 12;
@@ -86,17 +89,35 @@ export function renderPauseMenu(): void {
         S.ctx.fillStyle = '#3a3f4b';
         S.ctx.fillRect(panelX + padding, panelY + padding + topH, panelW - padding * 2, 1);
         S.ctx.font = '22px sans-serif';
+        // Indicator X: aligned to the longest label on this page (including the "> " selection
+        // prefix), so every bar/tag starts at the same x — no label overlaps its indicator.
+        const labelFor: Record<string, string> = {
+                mouseSpeed: 'Mouse speed', frameSkip: 'Frame skip', messageRender: 'Message render',
+                skipFadeBlur: 'Skip fade blur', skipFadeFill: 'Skip fade fill',
+                windowLayerSkip: 'WindowLayer skip', windowBitmapReuse: 'Window Bitmap reuse',
+                textureGcIdle: 'Texture GC idle', dirtyRenderSkip: 'Dirty render-skip',
+                presentCache: 'Present cache', canvasNodeSkip: 'CanvasNode skip',
+        };
+        let maxLabelW = 0;
+        for (let i = 0; i < items.length; i++) {
+                const key = items[i] as string;
+                const label = labelFor[key] || labels[key] || key;
+                // Measure with the "> " prefix (the widest case when selected).
+                const w = S.ctx.measureText('> ' + label).width;
+                if (w > maxLabelW) maxLabelW = w;
+        }
+        const indicatorX = panelX + padding + Math.ceil(maxLabelW) + 16;
+        const indicatorW = 180;
         for (let i = 0; i < items.length; i++) {
                 const isSel = i === S.menu.selected;
                 const y = itemsAreaStart + itemsOffset + (i + 1) * itemH;
                 S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
                 const prefix = isSel ? '> ' : '  ';
                 if (items[i] === 'mouseSpeed') {
-                        // Slider: label + horizontal bar (filled proportionally to mouseSpeed/10) + numeric.
                         S.ctx.fillText(prefix + 'Mouse speed', panelX + padding, y);
-                        const barX = panelX + padding + 190;
+                        const barX = indicatorX;
                         const barY = y - 16;
-                        const barW = 180;
+                        const barW = indicatorW;
                         const barH = 14;
                         const filled = Math.round((barW * S.mouseSpeed) / 10);
                         S.ctx.fillStyle = '#3a3f4b';
@@ -109,11 +130,10 @@ export function renderPauseMenu(): void {
                         S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
                         S.ctx.fillText(`${S.mouseSpeed}/10`, barX + barW + 12, y);
                 } else if (items[i] === 'frameSkip') {
-                        // Slider: 0..10 — how many frames to skip between renders on a stable scene.
                         S.ctx.fillText(prefix + 'Frame skip', panelX + padding, y);
-                        const barX = panelX + padding + 190;
+                        const barX = indicatorX;
                         const barY = y - 16;
-                        const barW = 180;
+                        const barW = indicatorW;
                         const barH = 14;
                         const filled = Math.round((barW * S.frameSkip) / 10);
                         S.ctx.fillStyle = '#3a3f4b';
@@ -125,6 +145,53 @@ export function renderPauseMenu(): void {
                         S.ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
                         S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
                         S.ctx.fillText(`${S.frameSkip}/10`, barX + barW + 12, y);
+                } else if (items[i] === 'messageRender') {
+                        S.ctx.fillText(prefix + 'Message render', panelX + padding, y);
+                        const tagX = indicatorX;
+                        const tagY = y - 16;
+                        const tagW = indicatorW;
+                        const tagH = 14;
+                        const modeColors: Record<string, string> = { full: '#9aa0b4', 'blink-skip': '#39d0d8' };
+                        const idx = MESSAGE_RENDER_MODES.indexOf(S.messageRender);
+                        const filled = Math.round((tagW * (idx + 1)) / MESSAGE_RENDER_MODES.length);
+                        S.ctx.fillStyle = '#3a3f4b';
+                        S.ctx.fillRect(tagX, tagY, tagW, tagH);
+                        S.ctx.fillStyle = modeColors[S.messageRender] || '#39d0d8';
+                        S.ctx.fillRect(tagX, tagY, filled, tagH);
+                        S.ctx.strokeStyle = '#565f8d';
+                        S.ctx.lineWidth = 1;
+                        S.ctx.strokeRect(tagX + 0.5, tagY + 0.5, tagW - 1, tagH - 1);
+                        S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
+                        S.ctx.fillText(messageRenderLabel(S.messageRender), tagX + tagW + 12, y);
+                } else if (items[i] === 'skipFadeBlur' || items[i] === 'skipFadeFill'
+                        || items[i] === 'windowLayerSkip' || items[i] === 'windowBitmapReuse'
+                        || items[i] === 'textureGcIdle' || items[i] === 'dirtyRenderSkip'
+                        || items[i] === 'presentCache' || items[i] === 'canvasNodeSkip') {
+                        // On/off toggle (A or Left/Right flips; persisted per-game by the frame loop).
+                        // See docs/doc/fps-optimizations.md for the patch each one controls.
+                        const label = labelFor[items[i] as string] || (items[i] as string);
+                        const on = !!(S as any)[items[i] as string];
+                        S.ctx.fillText(prefix + label, panelX + padding, y);
+                        const tagX = indicatorX;
+                        const tagY = y - 16;
+                        const tagW = indicatorW;
+                        const tagH = 14;
+                        // Track background (empty when off; the border shows the track).
+                        S.ctx.fillStyle = '#3a3f4b';
+                        S.ctx.fillRect(tagX, tagY, tagW, tagH);
+                        // ON → fully fill the track green; OFF → leave it empty (no partial fill).
+                        if (on) {
+                                S.ctx.fillStyle = '#3fb950';
+                                S.ctx.fillRect(tagX, tagY, tagW, tagH);
+                        }
+                        S.ctx.strokeStyle = '#565f8d';
+                        S.ctx.lineWidth = 1;
+                        S.ctx.strokeRect(tagX + 0.5, tagY + 0.5, tagW - 1, tagH - 1);
+                        // Label centered on the track, colored to contrast with the fill.
+                        S.ctx.fillStyle = on ? '#0d1117' : (isSel ? '#3fb950' : '#c9cdd6');
+                        S.ctx.textAlign = 'center';
+                        S.ctx.fillText(on ? 'on' : 'off', tagX + tagW / 2, y);
+                        S.ctx.textAlign = 'left';
                 } else {
                         S.ctx.fillText(prefix + labels[items[i]], panelX + padding, y);
                 }

@@ -513,9 +513,8 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 const origRenderCanvas = layer.renderCanvas;
                 layer.renderCanvas = function(renderer: any) {
                         if (!this.visible || !this.renderable) return;
-                        // Count visible windows — if none, skip the entire temp-canvas dance
-                        // (clearRect 1600x1000 + clip + drawImage 1600x1000 back). On a map with
-                        // no open menus this is pure waste: ~3.2M pixel ops per WindowLayer/frame.
+                        if (!S.windowLayerSkip) return origRenderCanvas.apply(this, arguments);
+                        // Count visible windows — if none, skip the temp-canvas dance.
                         let visibleWindows = 0;
                         for (let i = 0; i < this.children.length; i++) {
                                 const c = this.children[i];
@@ -767,7 +766,10 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
         const BitmapClass = runtime.Bitmap;
         if (WinProto && BitmapClass && typeof WinProto._refreshFrame === 'function' && !WinProto.__bnxFrameReuse) {
                 WinProto.__bnxFrameReuse = true;
+                const origRefreshFrame = WinProto._refreshFrame;
+                const origRefreshCursor = WinProto._refreshCursor;
                 WinProto._refreshFrame = function() {
+                        if (!S.windowBitmapReuse) return origRefreshFrame.apply(this, arguments);
                         const w = this._width, h = this._height;
                         const sprite = this._windowFrameSprite;
                         const existing = sprite?.bitmap;
@@ -794,6 +796,7 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         }
                 };
                 WinProto._refreshCursor = function() {
+                        if (!S.windowBitmapReuse) return origRefreshCursor.apply(this, arguments);
                         const pad = this._padding;
                         const x = this._cursorRect.x + pad - this.origin.x;
                         const y = this._cursorRect.y + pad - this.origin.y;
@@ -842,22 +845,66 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         origCreateRenderer.apply(this, arguments);
                         const renderer = this._renderer;
                         if (!renderer) return;
-                        if (renderer.textureGC && typeof renderer.textureGC.maxIdle === 'number') {
+                        if (S.textureGcIdle && renderer.textureGC && typeof renderer.textureGC.maxIdle === 'number') {
                                 renderer.textureGC.maxIdle = 600;
                         }
                 };
         }
 
-        // --- SceneManager.updateMain: accumulator cap + dirty-flag render-skip ----
-        // Caps the fixed-timestep accumulator to 2 update steps per rAF tick (stock
-        // allows up to 15, which spirals on a slow frame) and skips renderScene when
-        // nothing on screen changed (PIXI v4 redraws the whole graph every frame).
-        // S.frameSkip (0..10) adds a user-adjustable extra skip on stable scenes.
-        // See docs/doc/fps-optimizations.md for the dirty-source list and revert steps.
+        // --- T1: skip the 18-pass box blur in SceneManager.snapForBackground (toggle S.skipFadeBlur) ---
+        // See docs/doc/fps-optimizations.md for the full rationale. Per-game, default off.
+        const sceneManagerSnap = runtime.SceneManager;
+        const bitmapProto = runtime.Bitmap?.prototype;
+        if (sceneManagerSnap && typeof sceneManagerSnap.snapForBackground === 'function' && !sceneManagerSnap.__bnxNoBlurSnap) {
+                sceneManagerSnap.__bnxNoBlurSnap = true;
+                sceneManagerSnap.snapForBackground = function() {
+                        this._backgroundBitmap = this.snap();
+                        if (S.skipFadeBlur) return;
+                        try { if (typeof this._backgroundBitmap?.blur === 'function') this._backgroundBitmap.blur(); } catch { /* best-effort */ }
+                };
+        }
+        // Also gate Bitmap.prototype.blur so any plugin calling it directly honors the toggle.
+        if (bitmapProto && typeof bitmapProto.blur === 'function' && !bitmapProto.__bnxBlurSkip) {
+                bitmapProto.__bnxBlurSkip = true;
+                const origBlur = bitmapProto.blur;
+                bitmapProto.blur = function() {
+                        if (S.skipFadeBlur) return;
+                        return origBlur.apply(this, arguments);
+                };
+        }
+
+        // --- T2: skip ScreenSprite's 100× fillRect at alpha 0 (toggle S.skipFadeFill) ---
+        // See docs/doc/fps-optimizations.md. Per-game, default off.
+        const screenSpriteProto = runtime.ScreenSprite?.prototype;
+        if (screenSpriteProto && !screenSpriteProto.__bnxAlphaSkip) {
+                screenSpriteProto.__bnxAlphaSkip = true;
+                try {
+                        const proto = screenSpriteProto;
+                        const graphicsKey = '_graphics';
+                        Object.defineProperty(proto, 'opacity', {
+                                configurable: true,
+                                get: function() { return this.alpha * 255; },
+                                set: function(value) {
+                                        const a = value.clamp(0, 255) / 255;
+                                        this.alpha = a;
+                                        const g = this[graphicsKey];
+                                        if (!g) return;
+                                        g.visible = S.skipFadeFill ? (a > 0) : true;
+                                },
+                        });
+                } catch { /* non-configurable property: keep original behavior */ }
+        }
+
+        // --- SceneManager.updateMain: accumulator cap + dirty-flag render-skip + blink-skip (patch G + MR) ---
+        // See docs/doc/fps-optimizations.md. Master toggle: S.dirtyRenderSkip (default off).
+        // When off, the stock updateMain runs (render every frame). S.messageRender picks the
+        // message-frame mode ('full' / 'blink-skip'); S.frameSkip tunes the blink interval.
         const sceneManager = runtime.SceneManager;
         if (sceneManager && typeof sceneManager.updateMain === 'function' && !sceneManager.__bnxFrameskipWrap) {
                 sceneManager.__bnxFrameskipWrap = true;
                 const origUpdateMain = sceneManager.updateMain;
+                // Wall-clock blink interval (ms). Slider: 0 = 100 ms default; 1..10 = 200..1100 ms.
+                const BLINK_MS_DEFAULT = 100;
                 let lastPlayerX = NaN, lastPlayerY = NaN;
                 let lastDispX = NaN, lastDispY = NaN;
                 let lastMsgBusy = false;
@@ -866,8 +913,10 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 let lastSceneRef: any = null;
                 let lastChildrenCount = -1;
                 let lastRenderTime = 0;
+                let lastBlinkRenderTime = 0;
                 let stableSkipCount = 0;
                 sceneManager.updateMain = function() {
+                        if (!S.dirtyRenderSkip) return origUpdateMain.apply(this, arguments);
                         if (runtime.Utils?.isMobileSafari?.()) return origUpdateMain.apply(this, arguments);
                         if (typeof this._deltaTime !== 'number' || this._deltaTime <= 0) return origUpdateMain.apply(this, arguments);
                         if (typeof this._getTimeInMsWithoutMobileSafari !== 'function') return origUpdateMain.apply(this, arguments);
@@ -894,27 +943,60 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         const msgBusy = !!(msg && msg.isBusy && msg.isBusy());
                         const msgWindow = scene?._messageWindow;
                         const msgIndex = msgWindow ? (msgWindow._index ?? 0) + (msgWindow._textState?.index ?? 0) + (msgWindow._waitCount ?? 0) : 0;
-                        const choiceIndex = msg && msg._choiceCallCallback ? (msgWindow?._choiceList?.length || 0) : -1;
+                        // Choice-cursor row index — moving it (Up/Down) renders that frame; a
+                        // stable cursor only blinks, so the blink-only skip covers it too.
+                        const choiceCursor = msgWindow ? (msgWindow._choiceList?.length ? msgWindow.index?.() ?? -1 : -1) : -1;
+                        const choiceActive = msgWindow ? (msgWindow?._choiceList?.length > 0) : false;
                         const timerWorking = !!(runtime.$gameTimer && runtime.$gameTimer._working);
                         const sceneChanged = scene !== lastSceneRef;
-                        const childrenChanged = scene && scene.children && scene.children.length !== lastChildrenCount;
-                        const playerMoved = player && (player._realX !== lastPlayerX || player._realY !== lastPlayerY);
-                        const mapScrolled = map && (map._displayX !== lastDispX || map._displayY !== lastDispY);
+                        const childrenChanged = !!(scene && scene.children && scene.children.length !== lastChildrenCount);
+                        const playerMoved = !!(player && (player._realX !== lastPlayerX || player._realY !== lastPlayerY));
+                        const mapScrolled = !!(map && (map._displayX !== lastDispX || map._displayY !== lastDispY));
                         const transitioning = !scene || !this._sceneStarted || this._nextScene || this._stopped;
-                        const dirty = sceneChanged || childrenChanged || playerMoved || mapScrolled
-                                || msgBusy !== lastMsgBusy || msgBusy
-                                || msgIndex !== lastMsgIndex || choiceIndex !== lastChoiceIndex
+
+                        // split dirty: sceneDirty (background) needs a full render; textChanging /
+                        // choiceMoving (window) must render that frame. blinkOnly = message open,
+                        // background static, content stable → only the cursor blinks → skippable.
+                        const sceneDirty = sceneChanged || childrenChanged || playerMoved || mapScrolled
                                 || timerWorking || animCount > 0 || transitioning;
+                        const textChanging = msgBusy !== lastMsgBusy || msgIndex !== lastMsgIndex;
+                        const choiceMoving = choiceActive && choiceCursor !== lastChoiceIndex;
+                        const contentChanging = textChanging || choiceMoving;
+                        const windowDirty = msgBusy || contentChanging;
+                        const dirty = sceneDirty || windowDirty;
+
+                        const SceneMapCtor = runtime.Scene_Map;
+                        const isMapScene = !!(SceneMapCtor && scene instanceof SceneMapCtor);
+                        const messageOnly = msgBusy && !sceneDirty && isMapScene;
+                        const blinkOnly = messageOnly && !contentChanging;
+
                         lastSceneRef = scene;
                         lastChildrenCount = scene?.children?.length ?? -1;
                         if (player) { lastPlayerX = player._realX; lastPlayerY = player._realY; }
                         if (map) { lastDispX = map._displayX; lastDispY = map._displayY; }
                         lastMsgBusy = msgBusy;
                         lastMsgIndex = msgIndex;
-                        lastChoiceIndex = choiceIndex;
+                        lastChoiceIndex = choiceCursor;
+
                         const fallbackDue = (newTime - lastRenderTime) >= 250;
                         const renderNow = dirty || fallbackDue;
-                        // S.frameSkip: on a stable scene, skip N dirty frames between renders.
+                        const mode = S.messageRender;
+                        const blinkMs = S.frameSkip > 0 ? (S.frameSkip + 1) * 100 : BLINK_MS_DEFAULT;
+
+                        // blink-skip: render at most once per blinkMs on blink-only frames (stable
+                        // cursor tempo regardless of FPS). Typewriter / choice-move frames render
+                        // every frame. 'full' never skips.
+                        if (mode === 'blink-skip' && blinkOnly && !fallbackDue) {
+                                if ((newTime - lastBlinkRenderTime) < blinkMs) {
+                                        this.requestUpdate();
+                                        return;
+                                }
+                                lastBlinkRenderTime = newTime;
+                        } else if (!blinkOnly) {
+                                lastBlinkRenderTime = newTime;
+                        }
+
+                        // Stable non-message scene: skip N dirty frames between renders (slider).
                         if (renderNow && S.frameSkip > 0 && !fallbackDue && !msgBusy && !transitioning) {
                                 stableSkipCount++;
                                 if (stableSkipCount <= S.frameSkip) {

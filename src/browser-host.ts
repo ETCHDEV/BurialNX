@@ -4,6 +4,7 @@ import { ScriptQueue } from './script-queue';
 import { viewport } from './runtime-plan';
 import { fixIndexedPng } from './indexed-png';
 import { RepeatedPattern } from './repeated-pattern';
+import { S } from './state';
 
 type ScriptFilter = (path: string, source: string) => string | null;
 
@@ -82,14 +83,13 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 constructor() { super('CANVAS'); }
                 get width() { return this.w; }
                 set width(value: number) {
-                        // Skip same-value resize: assigning canvas.width clears the surface.
-                        if (value === this.w) return;
+                        if (S.canvasNodeSkip && value === this.w) return;
                         if (this.preserveSize && value === this.w) return;
                         this.w = value; this.revision++; if (this.canvas && !this.direct) this.canvas.width = value;
                 }
                 get height() { return this.h; }
                 set height(value: number) {
-                        if (value === this.h) return;
+                        if (S.canvasNodeSkip && value === this.h) return;
                         if (this.preserveSize && value === this.h) return;
                         this.h = value; this.revision++; if (this.canvas && !this.direct) this.canvas.height = value;
                 }
@@ -278,7 +278,14 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         const gw = gameCanvas.width, gh = gameCanvas.height;
                         const width = fitScreen ? sw : Math.min(sw, gw);
                         const height = fitScreen ? sh : Math.min(sh, gh);
-                        if (sw !== presentCache.sw || sh !== presentCache.sh || gw !== presentCache.gw || gh !== presentCache.gh || width !== presentCache.width || height !== presentCache.height || fitScreen !== presentCache.fit) {
+                        // Cache the dest rect (toggle S.presentCache). When off, the cache is
+                        // bypassed so the rect is recomputed every present() (stock behavior).
+                        const cacheMiss = !S.presentCache
+                                || sw !== presentCache.sw || sh !== presentCache.sh
+                                || gw !== presentCache.gw || gh !== presentCache.gh
+                                || width !== presentCache.width || height !== presentCache.height
+                                || fitScreen !== presentCache.fit;
+                        if (cacheMiss) {
                                 const t = viewport(gw, gh, width, height);
                                 if (!t) { presentCache.valid = false; return; }
                                 t.x += (sw - width) / 2; t.y += (sh - height) / 2;
