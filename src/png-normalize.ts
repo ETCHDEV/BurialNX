@@ -1,19 +1,5 @@
-/**
- * Minimal DEFLATE (RFC 1951) inflater and PNG normalizer.
- *
- * nx.js's native Image decoder crashes on 16-bit RGBA PNGs (bitDepth=16,
- * colorType=6), which is the format Windows uses for high-resolution
- * .exe icon resources. Since there's no built-in zlib on Switch, we
- * implement just enough of DEFLATE to decompress IDAT, unfilter the
- * scanlines, and re-encode as an 8-bit RGBA PNG that nx.js CAN decode.
- *
- * The inflater handles all three block types: stored (BTYPE=00), fixed
- * Huffman (BTYPE=01), and dynamic Huffman (BTYPE=10). It is deliberately
- * compact — correctness over speed — since it only runs once per cover
- * extraction, not per frame.
- */
+/** Minimal DEFLATE (RFC 1951) inflater and PNG normalizer for 8-bit RGBA re-encoding. */
 
-// === Bit reader (LSB-first, per RFC 1951) ===============================
 class BitReader {
         private data: Uint8Array;
         private bytePos = 0;
@@ -35,12 +21,6 @@ class BitReader {
         readByte(): number { this.alignToByte(); if (this.bytePos >= this.data.length) throw new Error('DEFLATE: end of stream'); return this.data[this.bytePos++]; }
 }
 
-// === Canonical Huffman table builder ====================================
-// RFC 1951 section 3.2.2: codes are assigned in order of increasing length,
-// and within the same length, in the order the symbols appear.
-// The key in the lookup Map is (length << 16) | code_value, where code_value
-// is the canonical Huffman code (MSB-first). The decoder builds `code`
-// the same way (shift left + OR new bit), so the values match directly.
 interface HuffmanTable { lookup: Map<number, number>; maxLen: number; }
 function buildHuffman(lengths: number[]): HuffmanTable {
         const maxLen = Math.max(0, ...lengths);
@@ -67,8 +47,6 @@ function decodeSymbol(reader: BitReader, table: HuffmanTable): number {
         throw new Error('DEFLATE: invalid Huffman code');
 }
 
-// === Fixed Huffman tables (RFC 1951 section 3.2.6) ======================
-// Fixed Huffman lengths are constant data (small arrays, cheap).
 const FIXED_LIT_LENGTHS = (() => {
         const a = new Array(288);
         for (let i = 0; i < 144; i++) a[i] = 8;
@@ -78,20 +56,16 @@ const FIXED_LIT_LENGTHS = (() => {
         return a;
 })();
 const FIXED_DIST_LENGTHS = new Array(30).fill(5);
-// Fixed Huffman TABLES are created lazily (not at module scope) to save
-// startup memory. They allocate Maps with 288 and 30 entries each.
 let _fixedLitTable: HuffmanTable | null = null;
 let _fixedDistTable: HuffmanTable | null = null;
 function getFixedLitTable(): HuffmanTable { if (!_fixedLitTable) _fixedLitTable = buildHuffman(FIXED_LIT_LENGTHS); return _fixedLitTable; }
 function getFixedDistTable(): HuffmanTable { if (!_fixedDistTable) _fixedDistTable = buildHuffman(FIXED_DIST_LENGTHS); return _fixedDistTable; }
 
-// === Length and distance code tables (RFC 1951 section 3.2.5) ==========
 const LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LENGTH_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
 const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 
-// === Main inflate function ==============================================
 export function inflate(data: Uint8Array): Uint8Array {
         const reader = new BitReader(data);
         const out: number[] = [];
@@ -100,16 +74,13 @@ export function inflate(data: Uint8Array): Uint8Array {
                 const bfinal = reader.readBits(1);
                 const btype = reader.readBits(2);
                 if (btype === 0) {
-                        // Stored block
                         reader.alignToByte();
                         const len = reader.readByte() | (reader.readByte() << 8);
-                        reader.readByte(); reader.readByte(); // NLEN (ignored)
+                        reader.readByte(); reader.readByte();
                         for (let i = 0; i < len; i++) out.push(reader.readByte());
                 } else if (btype === 1) {
-                        // Fixed Huffman
                         decodeBlock(reader, getFixedLitTable(), getFixedDistTable(), out);
                 } else if (btype === 2) {
-                        // Dynamic Huffman
                         const hlit = reader.readBits(5) + 257;
                         const hdist = reader.readBits(5) + 1;
                         const hclen = reader.readBits(4) + 4;
@@ -138,7 +109,7 @@ function decodeBlock(reader: BitReader, litTable: HuffmanTable, distTable: Huffm
         while (true) {
                 const sym = decodeSymbol(reader, litTable);
                 if (sym < 256) { out.push(sym); continue; }
-                if (sym === 256) return; // end of block
+                if (sym === 256) return;
                 const lenIdx = sym - 257;
                 if (lenIdx >= LENGTH_BASE.length) throw new Error(`DEFLATE: invalid length symbol ${sym}`);
                 const length = LENGTH_BASE[lenIdx] + reader.readBits(LENGTH_EXTRA[lenIdx]);
@@ -150,17 +121,14 @@ function decodeBlock(reader: BitReader, litTable: HuffmanTable, distTable: Huffm
         }
 }
 
-// === PNG filter unfiltering (RFC 2083 section 4.2) ======================
-// Each scanline starts with a filter byte (0=None, 1=Sub, 2=Up, 3=Average,
-// 4=Paeth). bpp = bytes per pixel (e.g., 4 for 8-bit RGBA, 8 for 16-bit RGBA).
+/** Unfilter PNG scanlines (RFC 2083 section 4.2) into a flat byte array. */
 export function unfilterScanlines(data: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
         const rowLen = width * bpp;
         const out = new Uint8Array(height * rowLen);
         let src = 0, dst = 0;
-        const prev = new Uint8Array(rowLen); // previous row (unfiltered)
+        const prev = new Uint8Array(rowLen);
         for (let y = 0; y < height; y++) {
                 const filter = data[src++]; src--;
-                // Actually read the filter byte properly:
                 const f = data[src++];
                 for (let x = 0; x < rowLen; x++) {
                         const cur = data[src++];
@@ -189,18 +157,12 @@ export function unfilterScanlines(data: Uint8Array, width: number, height: numbe
         return out;
 }
 
-// === PNG normalizer: convert any PNG to 8-bit RGBA =====================
-// Parses the PNG chunks, inflates the IDAT, unfilter scanlines, converts
-// to 8-bit RGBA, and re-encodes as a standard 8-bit RGBA PNG that nx.js's
-// native Image decoder can handle. Returns null if the PNG is malformed or
-// uses unsupported features (e.g., interlacing).
+/** Parse a PNG, inflate IDAT, unfilter scanlines, and re-encode as 8-bit RGBA PNG. */
 export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | null {
         const u8 = new Uint8Array(pngBytes);
         if (u8.length < 8) return null;
-        // Verify PNG signature
         const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         for (let i = 0; i < 8; i++) if (u8[i] !== sig[i]) return null;
-        // Walk chunks to find IHDR and IDAT
         let offset = 8;
         let width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;
         const idatChunks: Uint8Array[] = [];
@@ -209,7 +171,7 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
         while (offset < u8.length) {
                 if (offset + 8 > u8.length) return null;
                 const view = new DataView(pngBytes, offset, 8);
-                const len = view.getUint32(0, false); // big-endian
+                const len = view.getUint32(0, false);
                 const type = String.fromCharCode(u8[offset + 4], u8[offset + 5], u8[offset + 6], u8[offset + 7]);
                 if (offset + 8 + len + 4 > u8.length) return null;
                 const data = u8.subarray(offset + 8, offset + 8 + len);
@@ -230,38 +192,32 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                 } else if (type === 'IEND') break;
                 offset += 8 + len + 4;
         }
-        if (interlace !== 0) return null; // interlaced PNGs not supported
-        if (bitDepth === 8 && colorType === 6) return pngBytes; // already 8-bit RGBA
-        if (bitDepth === 8 && colorType === 2) return pngBytes; // already 8-bit RGB
-        // Concatenate IDAT chunks and inflate
+        if (interlace !== 0) return null;
+        if (bitDepth === 8 && colorType === 6) return pngBytes;
+        if (bitDepth === 8 && colorType === 2) return pngBytes;
         let idatLen = 0;
         for (const c of idatChunks) idatLen += c.length;
         const idat = new Uint8Array(idatLen);
         let p = 0;
         for (const c of idatChunks) { idat.set(c, p); p += c.length; }
         if (idat.length < 2) return null;
-        // Skip zlib header (2 bytes: CMF, FLG) and Adler-32 (4 bytes at end)
         let zlibHeader = 2;
-        if ((idat[0] & 0x0f) !== 8) return null; // CM must be 8 (deflate)
+        if ((idat[0] & 0x0f) !== 8) return null;
         if (idat.length < 6) return null;
         const deflateData = idat.subarray(zlibHeader, idat.length - 4);
         let raw: Uint8Array;
         try { raw = inflate(deflateData); } catch (e) { return null; }
-        // Compute bytes per pixel
         const channels = colorType === 2 ? 3 : colorType === 6 ? 4 : colorType === 3 ? 1 : colorType === 4 ? 2 : colorType === 0 ? 1 : 0;
         if (!channels) return null;
         const bytesPerSample = bitDepth === 16 ? 2 : 1;
         const bpp = channels * bytesPerSample;
         if (raw.length < height * (1 + width * bpp)) return null;
-        // Unfilter scanlines
         let pixels: Uint8Array;
         try { pixels = unfilterScanlines(raw, width, height, bpp); } catch (e) { return null; }
-        // Convert to 8-bit RGBA
         const outRow = width * 4;
         const outPixels = new Uint8Array(height * outRow);
         if (bitDepth === 8) {
                 if (colorType === 2) {
-                        // RGB → RGBA
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 3, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -272,10 +228,8 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 6) {
-                        // Already 8-bit RGBA — but we only get here if not returned above
                         outPixels.set(pixels);
                 } else if (colorType === 4) {
-                        // Grayscale + alpha → RGBA
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 2, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -287,7 +241,6 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 0) {
-                        // Grayscale → RGBA
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -299,7 +252,6 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 3 && palette) {
-                        // Indexed → RGBA
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -312,9 +264,7 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                         }
                 }
         } else if (bitDepth === 16) {
-                // 16-bit → 8-bit (take high byte, big-endian)
                 if (colorType === 2) {
-                        // RGB
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 6, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -325,7 +275,6 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 6) {
-                        // RGBA
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 8, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -336,7 +285,6 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 0) {
-                        // Grayscale
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 2, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -348,7 +296,6 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                                 }
                         }
                 } else if (colorType === 4) {
-                        // Grayscale + alpha
                         for (let y = 0; y < height; y++) {
                                 const srcOff = y * width * 4, dstOff = y * outRow;
                                 for (let x = 0; x < width; x++) {
@@ -361,14 +308,9 @@ export function normalizePngTo8bitRgba(pngBytes: ArrayBuffer): ArrayBuffer | nul
                         }
                 }
         }
-        // Re-encode as 8-bit RGBA PNG using the icon-extract encoder
         return encodeRgbaPng(width, height, outPixels);
 }
 
-// === 8-bit RGBA PNG encoder (raw DEFLATE, no compression) ==============
-// Same algorithm as icon-extract.ts's encodePng but simplified for
-// 8-bit RGBA input only. All 32-bit fields are big-endian per PNG spec.
-// CRC32 table created lazily (256 entries = 1KB Uint32Array)
 let _crc32Table: Uint32Array | null = null;
 function getCrc32Table(): Uint32Array {
         if (!_crc32Table) {
@@ -384,52 +326,48 @@ function getCrc32Table(): Uint32Array {
 }
 function crc32(bytes: Uint8Array): number { let c = 0xffffffff; const t = getCrc32Table(); for (let i = 0; i < bytes.length; i++) c = t[(c ^ bytes[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
 
+/** Encode 8-bit RGBA pixels as a PNG with raw (uncompressed) DEFLATE IDAT. */
 function encodeRgbaPng(width: number, height: number, pixels: Uint8Array): ArrayBuffer {
         const PNG_SIG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
         const outRow = width * 4;
-        // IHDR
         const ihdr = new Uint8Array(13);
         const ihdrView = new DataView(ihdr.buffer);
-        ihdrView.setUint32(0, width, false); // big-endian
+        ihdrView.setUint32(0, width, false);
         ihdrView.setUint32(4, height, false);
-        ihdr[8] = 8; // bitDepth
-        ihdr[9] = 6; // colorType = RGBA
+        ihdr[8] = 8;
+        ihdr[9] = 6;
         ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-        // Raw DEFLATE: filter byte (0=None) + pixel data per row
         const rawDeflate = new Uint8Array(height * (1 + outRow));
         for (let y = 0; y < height; y++) {
                 rawDeflate[y * (1 + outRow)] = 0;
                 rawDeflate.set(pixels.subarray(y * outRow, (y + 1) * outRow), y * (1 + outRow) + 1);
         }
-        // zlib stream: 2-byte header + raw DEFLATE blocks + 4-byte Adler-32
         const maxBlock = 65535;
         const numBlocks = Math.max(1, Math.ceil(rawDeflate.length / maxBlock));
         const zlibLen = 2 + numBlocks * 5 + rawDeflate.length + 4;
         const zlibStream = new Uint8Array(zlibLen);
         let p = 0;
-        zlibStream[p++] = 0x78; zlibStream[p++] = 0x01; // zlib header
+        zlibStream[p++] = 0x78; zlibStream[p++] = 0x01;
         for (let b = 0; b < numBlocks; b++) {
                 const start = b * maxBlock, end = Math.min(start + maxBlock, rawDeflate.length);
                 const isFinal = end === rawDeflate.length;
-                zlibStream[p++] = isFinal ? 1 : 0; // BFINAL + BTYPE=00
+                zlibStream[p++] = isFinal ? 1 : 0;
                 const len = end - start;
-                zlibStream[p++] = len & 0xff; zlibStream[p++] = (len >> 8) & 0xff; // LEN (LE)
+                zlibStream[p++] = len & 0xff; zlibStream[p++] = (len >> 8) & 0xff;
                 const nlen = len ^ 0xffff;
-                zlibStream[p++] = nlen & 0xff; zlibStream[p++] = (nlen >> 8) & 0xff; // NLEN (LE)
+                zlibStream[p++] = nlen & 0xff; zlibStream[p++] = (nlen >> 8) & 0xff;
                 zlibStream.set(rawDeflate.subarray(start, end), p);
                 p += len;
         }
-        // Adler-32 (big-endian)
         let a = 1, b = 0;
         for (let i = 0; i < rawDeflate.length; i++) { a = (a + rawDeflate[i]) % 65521; b = (b + a) % 65521; }
         const adler = ((b << 16) | a) >>> 0;
         const adlerView = new DataView(zlibStream.buffer, p);
-        adlerView.setUint32(0, adler, false); // big-endian
-        // Assemble PNG chunks
+        adlerView.setUint32(0, adler, false);
         const chunks = [
-                { type: [0x49, 0x48, 0x44, 0x52], data: ihdr }, // IHDR
-                { type: [0x49, 0x44, 0x41, 0x54], data: zlibStream }, // IDAT
-                { type: [0x49, 0x45, 0x4e, 0x44], data: new Uint8Array(0) }, // IEND
+                { type: [0x49, 0x48, 0x44, 0x52], data: ihdr },
+                { type: [0x49, 0x44, 0x41, 0x54], data: zlibStream },
+                { type: [0x49, 0x45, 0x4e, 0x44], data: new Uint8Array(0) },
         ];
         let total = 8;
         for (const c of chunks) total += 8 + c.data.length + 4;
@@ -438,14 +376,14 @@ function encodeRgbaPng(width: number, height: number, pixels: Uint8Array): Array
         let q = 8;
         for (const c of chunks) {
                 const lenView = new DataView(out.buffer, q, 4);
-                lenView.setUint32(0, c.data.length, false); // big-endian
+                lenView.setUint32(0, c.data.length, false);
                 out[q + 4] = c.type[0]; out[q + 5] = c.type[1]; out[q + 6] = c.type[2]; out[q + 7] = c.type[3];
                 out.set(c.data, q + 8);
                 const crcBytes = new Uint8Array(4 + c.data.length);
                 crcBytes[0] = c.type[0]; crcBytes[1] = c.type[1]; crcBytes[2] = c.type[2]; crcBytes[3] = c.type[3];
                 crcBytes.set(c.data, 4);
                 const crcView = new DataView(out.buffer, q + 8 + c.data.length, 4);
-                crcView.setUint32(0, crc32(crcBytes), false); // big-endian
+                crcView.setUint32(0, crc32(crcBytes), false);
                 q += 8 + c.data.length + 4;
         }
         return out.buffer;

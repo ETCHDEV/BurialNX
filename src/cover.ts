@@ -2,21 +2,6 @@ import type { LibraryAccess } from './game-library';
 import { extractExeIcon, extractIco } from './icon-extract';
 import { normalizePngTo8bitRgba } from './png-normalize';
 
-/**
- * Cover image management for library entries. Covers are stored as regular
- * PNG files under `sdmc:/switch/burialnx/covers/<id>.png`. The library UI
- * loads them once and caches decoded Image objects across frames.
- *
- * A cover is derived in this priority order:
- *   1. User-selected image file (.png/.jpg/.ico in any SD folder)
- *   2. Auto-extracted icon from a .exe file in the game's parent folder
- *   3. Auto-extracted icon from a .ico file in the game's parent folder
- *   4. Placeholder (no cover)
- *
- * For .ico and .exe inputs the bytes are decoded to PNG so nx.js's Image
- * decoder can render them without a separate ICO/BMP code path at runtime.
- */
-
 const COVERS_DIR = 'sdmc:/switch/burialnx/covers';
 const COVER_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'exe'];
 
@@ -25,12 +10,9 @@ export function coverPathFor(id: string): string { return `${COVERS_DIR}/${id}.p
 const isDir = (mode: number) => (mode & 0o170000) === 0o040000;
 const isFile = (mode: number) => (mode & 0o170000) === 0o100000;
 
-/** Scan a game's parent folder for .exe and .ico candidates. Returns the
- *  candidate paths in priority order (exe before ico). */
+/** Scan a game's parent folder for .exe and .ico cover candidates (exe before ico). */
 export function findCoverCandidates(fs: LibraryAccess & { readDirSync(path: string): string[] | null }, root: string): { exe: string[]; ico: string[] } {
         const clean = root.replace(/\/+$/, '');
-        // RPG Maker MV's www/ contains the web assets; the .exe usually lives
-        // next to it. Look one level up when the selected root is `www`.
         const parent = /\/www$/i.test(clean) ? clean.slice(0, -4) : clean;
         const exe: string[] = [];
         const ico: string[] = [];
@@ -54,7 +36,7 @@ export function findCoverCandidates(fs: LibraryAccess & { readDirSync(path: stri
         return { exe, ico };
 }
 
-/** Decode an arbitrary cover source to PNG bytes, or null if unsupported. */
+/** Decode an arbitrary cover source (.png/.jpg/.gif/.webp/.ico/.exe) to PNG bytes. */
 export function decodeCoverSource(fs: LibraryAccess, path: string): ArrayBuffer | null {
         const ext = (path.split('.').pop() || '').toLowerCase();
         let bytes: ArrayBuffer | null = null;
@@ -66,10 +48,7 @@ export function decodeCoverSource(fs: LibraryAccess, path: string): ArrayBuffer 
         return null;
 }
 
-/** Same as decodeCoverSource but logs (via the provided callback) which path
- *  was taken and the resulting PNG size. This is the entry point used by the
- *  loader UI so the debug log shows whether the cover came from a PNG-embedded
- *  .exe icon, a BMP DIB, or failed. */
+/** Like decodeCoverSource but logs each step (path, byte count, decoder used). */
 export function decodeCoverSourceLogged(fs: LibraryAccess, path: string, log: (s: string) => void): ArrayBuffer | null {
         const ext = (path.split('.').pop() || '').toLowerCase();
         log(`Cover decode: ${path} (ext=${ext})`);
@@ -84,8 +63,7 @@ export function decodeCoverSourceLogged(fs: LibraryAccess, path: string, log: (s
         return null;
 }
 
-/** Try to derive a cover from a game folder using .exe then .ico. The first
- *  successful extraction wins. Returns the cover path on success. */
+/** Derive a cover from a game folder using .exe then .ico; first success wins. */
 export function deriveDefaultCover(fs: LibraryAccess & { readDirSync(path: string): string[] | null }, id: string, root: string): string | null {
         const candidates = findCoverCandidates(fs, root);
         for (const exe of candidates.exe) {
@@ -109,14 +87,10 @@ export function deriveDefaultCover(fs: LibraryAccess & { readDirSync(path: strin
         return null;
 }
 
+/** Save cover bytes (normalizing PNGs to 8-bit RGBA first) to <id>.png. */
 export function saveCoverBytes(fs: LibraryAccess, id: string, bytes: ArrayBuffer): boolean {
         try {
                 try { fs.mkdirSync(COVERS_DIR); } catch { /* may already exist */ }
-                // Normalize PNGs to 8-bit RGBA before saving. Windows .exe icons
-                // are often 16-bit RGBA PNGs, which crash nx.js's native Image
-                // decoder. normalizePngTo8bitRgba decodes (inflate + unfilter),
-                // converts to 8-bit, and re-encodes — so the saved file is
-                // always a standard 8-bit RGBA PNG that nx.js can display.
                 let toWrite = bytes;
                 const u8 = new Uint8Array(bytes);
                 if (u8.length >= 4 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) {
@@ -128,16 +102,14 @@ export function saveCoverBytes(fs: LibraryAccess, id: string, bytes: ArrayBuffer
         } catch (error) { console.error(`Could not save cover: ${String(error)}`); return false; }
 }
 
-/** Save a user-selected cover. Accepts .png/.jpg (copied verbatim) and .ico
- *  (decoded to PNG). Returns the stored cover path on success. */
+/** Save a user-selected cover (.png/.jpg verbatim, .ico decoded). Returns stored path. */
 export function saveUserCover(fs: LibraryAccess, id: string, sourcePath: string): string | null {
         const png = decodeCoverSource(fs, sourcePath);
         if (!png) return null;
         return saveCoverBytes(fs, id, png) ? coverPathFor(id) : null;
 }
 
-/** Like saveUserCover but logs each step via the provided callback so the
- *  loader's debug log shows where cover extraction succeeded or failed. */
+/** Like saveUserCover but logs each step via the provided callback. */
 export function saveUserCoverLogged(fs: LibraryAccess, id: string, sourcePath: string, log: (s: string) => void): string | null {
         const png = decodeCoverSourceLogged(fs, sourcePath, log);
         if (!png) { log('Cover save: decode returned null, no cover written'); return null; }

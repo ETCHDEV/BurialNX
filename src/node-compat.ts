@@ -1,31 +1,4 @@
-/**
- * Node.js / NW.js compatibility layer for RPG Maker MV games.
- *
- * Many RPG Maker MV games — especially modded or "DLC+Cheats" builds — are
- * packaged as NW.js desktop apps and call Node/NW.js globals (`require`,
- * `process`, `Buffer`, `module`, `exports`, `global`, `__dirname`,
- * `__filename`, `nw`) that nx.js's browser-like realm does not provide.
- * Without them the game throws `ReferenceError: require is not defined`
- * (or `process is not defined`, …) the first time a plugin or a patched
- * title window touches them, killing the launch:
- *
- *     FAILURE: ReferenceError: require is not defined
- *         at Window_TitleCommand.checkAddCommandEnable
- *         at Window_TitleCommand.makeCommandList
- *
- * nw.dll itself is an x86 Windows DLL and cannot run on the Switch's ARM64
- * CPU, so the only viable fix is to polyfill the globals NW.js would have
- * provided. This module installs minimal, best-effort shims so such games
- * boot. It is NOT a full Node runtime: only the surface RPG Maker MV plugins
- * commonly touch is implemented.
- *
- * `fs` is wired to nx.js's synchronous SD-card I/O through the `Switch`
- * global, with a per-game writable overlay so game/mod scripts cannot modify
- * the game's own files. This is a compatibility shim, not a security sandbox
- * (game and mod scripts already run with native privileges — see
- * SECURITY.md); the overlay exists to keep the game directory pristine and
- * to make read-after-write of the same path behave like NW.js.
- */
+/** Node.js/NW.js compatibility shims (require, process, Buffer, fs, nw) for RPG Maker MV games. */
 
 import { libraryIdFromRoot } from './game-library';
 
@@ -53,10 +26,6 @@ const S_IFREG = 0o100000;
 const S_IFDIR = 0o040000;
 const NWFS_BASE = 'sdmc:/switch/burialnx/nwfs';
 
-// Schedule a callback on the next microtask, falling back to a 0ms timer if
-// nx.js does not expose `queueMicrotask` (it is browser-standard, but the
-// loader's own code consistently uses `setTimeout` for the same purpose, so
-// the fallback keeps this layer robust without depending on it).
 const nextMicrotask: (fn: () => void) => void =
         typeof (globalThis as any).queueMicrotask === 'function'
                 ? (fn) => (globalThis as any).queueMicrotask(fn)
@@ -73,18 +42,11 @@ export function overlayBaseFor(gameRoot: string): string {
         return `${NWFS_BASE}/${libraryIdFromRoot(gameRoot)}`;
 }
 
-/**
- * Resolve a (possibly relative, possibly URL-like) fs path against the NW.js
- * app root and return an absolute `sdmc:/` path, or `null` if the path is
- * unsafe (traversal, unsupported scheme, empty). Backslashes are accepted
- * (NW.js games ported from Windows use them) and normalized.
- */
+/** Resolve an fs path against the NW.js app root to a safe absolute sdmc:/ path. */
 export function resolveFsPath(gameRoot: string, raw: string): string | null {
         let p = String(raw ?? '');
         if (!p) return null;
         p = p.split('?')[0].split('#')[0];
-        // file://, nwjs:// or nw:// URLs → the path part is absolute; map it to an
-        // absolute `sdmc:/` path (the Switch equivalent of a native filesystem URL).
         const url = /^(?:file|nwjs|nw):\/\//i.exec(p);
         if (url) {
                 const rest = p.slice(url[0].length);
@@ -107,8 +69,6 @@ export function resolveFsPath(gameRoot: string, raw: string): string | null {
         if (/^[a-z]:[\\/]/i.test(p)) p = p.slice(2);
         p = p.replace(/\\/g, '/');
         if (p.startsWith('/')) p = p.slice(1);
-        // Drop '.' segments (valid in relative paths like ./cheats.json); reject
-        // any '..' segment so a path cannot escape the app root.
         const segs = p.split('/').filter((s) => s && s !== '.');
         if (segs.some((s) => s === '..')) return null;
         const root = appRootFrom(gameRoot).replace(/^sdmc:\//i, '');
@@ -124,11 +84,6 @@ function relFromAppRoot(gameRoot: string, resolved: string): string | null {
         return resolved.slice(root.length + 1).replace(/\/+$/, '');
 }
 
-// === Minimal Buffer ====================================================
-// RPG Maker MV's Decrypter uses Uint8Array directly, but cheat plugins and a
-// few NW.js helpers use Node's `Buffer`. Implement the commonly used surface
-// over a Uint8Array so `Buffer.from(str,'base64')`, `buf.toString('hex')`,
-// `Buffer.concat`, and the little-endian read/write helpers all work.
 
 function encodeUtf8(input: string): number[] {
         const out: number[] = [];
@@ -296,7 +251,6 @@ class MiniBuffer extends Uint8Array {
         writeInt32LE(value: number, offset: number): number { return this.writeUInt32LE(value >>> 0, offset); }
 }
 
-// === path (pure JS, POSIX semantics) ==================================
 function pathNormalize(p: string): string {
         const isAbs = p.startsWith('/');
         const segs = p.split('/');
@@ -374,7 +328,6 @@ const pathModule = {
 (pathModule as any).posix = pathModule;
 (pathModule as any).win32 = pathModule;
 
-// === events (minimal EventEmitter) ===================================
 class MiniEventEmitter {
         private _events: Record<string, Array<(arg?: any) => void> | ((arg?: any) => void) | undefined> = {};
         on(event: string, listener: (arg?: any) => void): this {
@@ -399,28 +352,18 @@ class MiniEventEmitter {
                 const list = this._events[event];
                 if (!list) return false;
                 const arr = Array.isArray(list) ? list : [list];
-                for (const l of [...arr]) { try { l(...args); } catch { /* one listener must not break others */ } }
+                for (const l of [...arr]) { try { l(...args); } catch {} }
                 return true;
         }
 }
 
-// === fs (Switch-backed, with per-game writable overlay) ===============
-//
-// Reads check the overlay first (files the game wrote), then the real SD
-// path under the app root. Writes always go to the overlay, so the game's
-// own files are never modified. Paths are validated and clamped to the app
-// root + overlay subtrees: a crafted `..` path is rejected.
 
 function makeFs(switchFs: SwitchFs | null, opts: NodeCompatOptions) {
         const { gameRoot } = opts;
         const overlayBase = overlayBaseFor(gameRoot);
-        const mem = new Map<string, ArrayBuffer>(); // in-memory overlay when no switchFs (tests)
+        const mem = new Map<string, ArrayBuffer>();
         let overlayReady = false;
 
-        // Resolve a raw user-supplied path to an absolute `sdmc:/` path under the
-        // app root. Returns null for unsafe/traversal paths. Every fs method runs
-        // its argument through this first — `Switch.readFileSync` etc. expect
-        // absolute sdmc paths, not the relative strings RPG Maker plugins pass.
         const resolve = (raw: string): string => {
                 const r = resolveFsPath(gameRoot, raw);
                 if (r === null) { const e: any = new Error(`EPERM: path outside app root '${raw}'`); e.code = 'EPERM'; throw e; }
@@ -433,7 +376,7 @@ function makeFs(switchFs: SwitchFs | null, opts: NodeCompatOptions) {
         };
         const ensureOverlay = (): void => {
                 if (overlayReady || !switchFs) { overlayReady = true; return; }
-                try { switchFs.mkdirSync?.(overlayBase); } catch { /* may already exist */ }
+                try { switchFs.mkdirSync?.(overlayBase); } catch {}
                 overlayReady = true;
         };
 
@@ -446,9 +389,9 @@ function makeFs(switchFs: SwitchFs | null, opts: NodeCompatOptions) {
                 }
                 const overlay = overlayPathFor(resolved);
                 if (overlay) {
-                        try { const o = switchFs.statSync(overlay); if (o) return { mode: o.mode, size: 0, mtime: new Date(0), isDirectory: () => (o.mode & 0o170000) === S_IFDIR, isFile: () => (o.mode & 0o170000) === S_IFREG }; } catch { /* fall through */ }
+                        try { const o = switchFs.statSync(overlay); if (o) return { mode: o.mode, size: 0, mtime: new Date(0), isDirectory: () => (o.mode & 0o170000) === S_IFDIR, isFile: () => (o.mode & 0o170000) === S_IFREG }; } catch {}
                 }
-                try { const r = switchFs.statSync(resolved); if (r) return { mode: r.mode, size: 0, mtime: new Date(0), isDirectory: () => (r.mode & 0o170000) === S_IFDIR, isFile: () => (r.mode & 0o170000) === S_IFREG }; } catch { /* missing */ }
+                try { const r = switchFs.statSync(resolved); if (r) return { mode: r.mode, size: 0, mtime: new Date(0), isDirectory: () => (r.mode & 0o170000) === S_IFDIR, isFile: () => (r.mode & 0o170000) === S_IFREG }; } catch {}
                 return null;
         };
 
@@ -476,26 +419,26 @@ function makeFs(switchFs: SwitchFs | null, opts: NodeCompatOptions) {
                         ensureOverlay();
                         const overlay = overlayPathFor(resolved);
                         if (!overlay) { const e: any = new Error(`EPERM: path outside app root '${path}'`); e.code = 'EPERM'; throw e; }
-                        try { const dir = pathDirname(overlay.replace(/^sdmc:\//i, '')); if (dir) switchFs.mkdirSync?.(`sdmc:/${dir}`); } catch { /* best-effort */ }
+                        try { const dir = pathDirname(overlay.replace(/^sdmc:\//i, '')); if (dir) switchFs.mkdirSync?.(`sdmc:/${dir}`); } catch {}
                         switchFs.writeFileSync(overlay, buf);
                 },
                 appendFileSync(path: string, data: string | ArrayBuffer): void {
                         let prev = '';
-                        try { prev = this.readFileSync(path, 'utf8') as string; } catch { /* new file */ }
+                        try { prev = this.readFileSync(path, 'utf8') as string; } catch {}
                         this.writeFileSync(path, prev + (typeof data === 'string' ? data : new TextDecoder().decode(data)));
                 },
                 unlinkSync(path: string): void {
                         const resolved = resolve(path);
                         if (!switchFs) { mem.delete(resolved); return; }
                         const overlay = overlayPathFor(resolved);
-                        if (overlay) { try { (switchFs.removeSync || switchFs.unlinkSync)?.(overlay); } catch { /* ignore */ } }
+                        if (overlay) { try { (switchFs.removeSync || switchFs.unlinkSync)?.(overlay); } catch {} }
                 },
                 mkdirSync(path: string): void {
                         const resolved = resolve(path);
                         if (!switchFs) return;
                         ensureOverlay();
                         const overlay = overlayPathFor(resolved);
-                        if (overlay) { try { switchFs.mkdirSync?.(overlay); } catch { /* may exist */ } }
+                        if (overlay) { try { switchFs.mkdirSync?.(overlay); } catch {} }
                 },
                 readdirSync(path: string): string[] {
                         const resolved = resolve(path);
@@ -534,17 +477,7 @@ function makeFs(switchFs: SwitchFs | null, opts: NodeCompatOptions) {
         return fs;
 }
 
-// === A safe no-op stub module for unknown require() calls =============
-//
-// Returns a callable proxy whose every property access yields itself, so
-// `require('anything').foo.bar().baz` never throws — it just no-ops. This
-// keeps unfamiliar Node modules from crashing the boot; features that need
-// them simply won't do anything useful.
 function stubModule(): any {
-        // The target returns `proxy` (the Proxy itself) so that calling the stub
-        // yields the SAME proxy — keeping every chained access (`s().foo().bar`)
-        // on the proxy instead of falling off onto a raw function. `proxy` is
-        // assigned immediately after and closed over.
         const target: any = function () { return proxy; };
         let proxy: any;
         proxy = new Proxy(target, {
@@ -556,17 +489,8 @@ function stubModule(): any {
         return proxy;
 }
 
-// === process / nw shims ===============================================
 function makeProcess(appRoot: string, switchFs: SwitchFs | null, log?: (s: string) => void): any {
         const stream = { write: () => true, end() {}, on() { return this; } };
-        // NW.js exposes `process.mainModule.filename` as the path to the app's main
-        // module (the HTML entry from package.json's `main`). RPG Maker MV's
-        // StorageManager.localFileDirectoryPath() and several patch plugins
-        // (Wataridori_AddFileSystem) call `path.dirname(process.mainModule.filename)`
-        // to find the game's base directory, then resolve sibling folders like
-        // `save/` or `patch/` relative to it. Point this at `<appRoot>/www/index.html`
-        // so `dirname()` = `<appRoot>/www` and `../patch/` = `<appRoot>/patch/`,
-        // matching the on-disk Windows/NW.js layout the game was built for.
         const mainModule = { filename: `${appRoot}/www/index.html`, id: '.', path: `${appRoot}/www/index.html`, paths: [], children: [], loaded: true, exports: {} as any, require: null as any };
         return {
                 platform: 'switch', arch: 'arm64', type: 'switch', release: { name: 'switch' },
@@ -574,7 +498,7 @@ function makeProcess(appRoot: string, switchFs: SwitchFs | null, log?: (s: strin
                 argv: ['burialnx'],
                 cwd: () => appRoot,
                 chdir() {},
-                exit: (code?: number) => { try { (globalThis as any).Switch?.exit?.(code ?? 0); } catch { /* best-effort */ } },
+                exit: (code?: number) => { try { (globalThis as any).Switch?.exit?.(code ?? 0); } catch {} },
                 on: () => ({} as any), once: () => ({} as any), off: () => ({} as any), emit: () => false,
                 addListener: () => ({} as any), removeListener: () => ({} as any), removeAllListeners: () => ({} as any),
                 nextTick: (fn: (...a: unknown[]) => void, ...args: unknown[]) => { nextMicrotask(() => fn(...args)); },
@@ -617,7 +541,7 @@ function makeNw(appRoot: string, switchFs: SwitchFs | null, manifest: any, log?:
         const App = new MiniEventEmitter();
         Object.assign(App, {
                 manifest, argv: [], dataPath: appRoot, userAppDir: appRoot,
-                quit() { try { (globalThis as any).Switch?.exit?.(0); } catch { /* best-effort */ } },
+                quit() { try { (globalThis as any).Switch?.exit?.(0); } catch {} },
                 closeAllWindows() { this.quit(); },
                 setWindowOpenHandler() {}, getArgvSync: () => [], addEnv() {}, removeEnv() {},
                 on: App.on.bind(App), once: App.once.bind(App), off: App.off.bind(App), emit: App.emit.bind(App),
@@ -634,7 +558,6 @@ function makeNw(appRoot: string, switchFs: SwitchFs | null, manifest: any, log?:
         return nw;
 }
 
-// === require() resolver ==============================================
 export interface NodeCompatRuntime {
         require: ((id: string) => any) & { cache?: Map<string, any>; resolve?: (id: string) => string };
         process: any;
@@ -647,12 +570,7 @@ export interface NodeCompatRuntime {
         nw: any;
 }
 
-/**
- * Install the Node/NW.js compatibility globals on `runtime` (globalThis).
- * Globals already present (e.g. a native nx.js `require`) are left intact so
- * this layer only fills gaps. Installed globals are picked up by the loader's
- * session snapshot/restore because this runs after `beginGameSession()`.
- */
+/** Install Node/NW.js compatibility globals on the runtime, preserving any already present. */
 export function installNodeCompat(runtime: any, switchFs: SwitchFs | null, opts: NodeCompatOptions): NodeCompatRuntime {
         const { gameRoot, log } = opts;
         const appRoot = appRootFrom(gameRoot);
@@ -729,10 +647,6 @@ export function installNodeCompat(runtime: any, switchFs: SwitchFs | null, opts:
         register('nw', nwObj);
 
         function requireRelative(id: string, fromDir: string): any {
-                // `id` is normalized to a relative path (./ or ../) before reaching here.
-                // RPG Maker MV scripts live under `www/`, but NW.js sets the CWD to the
-                // app root (parent of www), so probe BOTH bases to maximize the chance
-                // of locating a local module regardless of which convention it uses.
                 const candidates = [id, `${id}.js`, `${id}.json`, `${id}/index.js`, `${id}/index.json`];
                 const bases = [fromDir, `${appRoot}/www`, appRoot];
                 for (const base of bases) {
@@ -778,8 +692,6 @@ export function installNodeCompat(runtime: any, switchFs: SwitchFs | null, opts:
 
         const rootRequire = makeRequire(appRoot);
 
-        // Only install globals that are NOT already present, so a native nx.js
-        // `require`/`process` (if any) is preserved.
         const g = runtime;
         if (typeof g.require === 'undefined') g.require = rootRequire;
         if (typeof g.process === 'undefined') g.process = processObj;
@@ -797,7 +709,6 @@ export function installNodeCompat(runtime: any, switchFs: SwitchFs | null, opts:
         return { require: rootRequire, process: processObj, Buffer: MiniBuffer, module: g.module, exports: g.exports, global: runtime, __dirname: appRoot, __filename: `${appRoot}/index.html`, nw: nwObj };
 }
 
-// === helpers ==========================================================
 function stubStreamCtor(): any {
         function Ctor() { return Object.assign(new MiniEventEmitter(), { write() { return this; }, end() { return this; }, pipe() { return this; }, on() { return this; }, read() { return null; }, destroy() {} }); }
         return Ctor;
@@ -805,9 +716,6 @@ function stubStreamCtor(): any {
 function stubStream(): any { return stubStreamCtor()(); }
 
 function simpleHash(data: string, alg: string): string {
-        // A non-cryptographic FNV-1a hash is plenty for a polyfill: RPG Maker
-        // plugins only use it for cache keys and equality checks, never for
-        // security. md5/sha* requests all map to this 32-byte hex string.
         let h = 0x811c9dc5;
         for (let i = 0; i < data.length; i++) { h ^= data.charCodeAt(i); h = Math.imul(h, 0x01000193); }
         let out = (h >>> 0).toString(16).padStart(8, '0');

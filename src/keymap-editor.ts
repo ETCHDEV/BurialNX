@@ -1,22 +1,4 @@
-// === Keymap editor logic ============================================
-// Extracted from main.ts. The keymap editor's mutators + the touch
-// handler for the keymap page. Reads/writes the shared `S` state.
-//
-// mergedKeymap() — pure read of S.currentEntry?.keymap + S.globalKeymap
-//                  that returns the per-game-override-merged KeyMap used
-//                  by installGameCompatibility and saveEditingKeymap.
-// applyPreset(i) — applies one of the 4 L/ZL/R/ZR presets to the working
-//                  keymap, preserving stick bindings, then saves.
-// saveEditingKeymap() — persists the working keymap to the appropriate
-//                  target (global keymap.json or per-game library entry)
-//                  and re-applies it to the running game's gamepadMapper
-//                  if a game is currently running.
-// openKeymapEditor(target) — opens the editor for 'global' or a specific
-//                  library entry, copying every field (buttons, labels,
-//                  keyCodes, sticks) into the working copy.
-// handleKeymapTouch(px, py) — routes a single touch tap on the keymap
-//                  page to the same action as the gamepad A button.
-
+/** Keymap editor logic: mutators + touch handler for the keymap page. */
 import { S } from './state';
 import { log } from './log';
 import { PRESETS, applyKeyMap, saveKeyMap, setButtonWithLabel, displayToButtonIndex, type KeyMap, type VirtualKey } from './keymap';
@@ -27,38 +9,24 @@ import type { LibraryEntry, LibraryAccess } from './game-library';
 
 declare const __DEBUG__: boolean;
 
-/** Build a MERGED KeyMap: the per-game keymap (if any) takes precedence
- *  per-button/per-direction, and the global default fills every gap.
- *  This is the single source of truth for "what keymap is active right
- *  now" — used by installGameCompatibility (to set gamepadMapper at
- *  launch) and by saveEditingKeymap (to re-apply after an edit).
- *
- *  Without this merge, a per-game keymap that only overrides SOME
- *  buttons/directions would silently drop the global bindings for the
- *  rest — the root cause of the "right stick doesn't fire" bug: the
- *  per-game keymap had left-stick bindings but not right-stick ones,
- *  and the global right-stick bindings were ignored. */
+/** Build a MERGED KeyMap: per-game overrides per-button/per-direction, global fills gaps. */
 export function mergedKeymap(): KeyMap {
         const per = S.currentEntry?.keymap;
         const base = S.globalKeymap;
         if (!per) return base;
-        // Buttons: per-game overrides per index, global fills the rest.
         const buttons: VirtualKey[] = [];
         for (let i = 0; i < 16; i++) buttons[i] = per.buttons[i] ?? base.buttons[i];
         const result: KeyMap = { buttons };
-        // Labels: merge — per-game label wins, fall back to global.
         if (per.labels || base.labels) {
                 const labels: string[] = [];
                 for (let i = 0; i < 16; i++) labels[i] = per.labels?.[i] ?? base.labels?.[i] ?? '';
                 result.labels = labels;
         }
-        // KeyCodes: merge — per-game keyCode wins, fall back to global.
         if (per.keyCodes || base.keyCodes) {
                 const keyCodes: number[] = [];
                 for (let i = 0; i < 16; i++) keyCodes[i] = per.keyCodes?.[i] ?? base.keyCodes?.[i] ?? 0;
                 result.keyCodes = keyCodes;
         }
-        // Sticks: merge per direction.
         const perSticks = per.sticks;
         const baseSticks = base.sticks;
         if (perSticks || baseSticks) {
@@ -72,15 +40,10 @@ export function mergedKeymap(): KeyMap {
         return result;
 }
 
+/** Apply one of the 4 L/ZL/R/ZR presets, preserving stick bindings, then save. */
 export function applyPreset(index: number) {
         const preset = PRESETS[index];
         if (!preset) return;
-        // A preset only redefines the 16 face-button → vkey mappings. It does
-        // NOT touch analog-stick bindings (presets don't model sticks), so the
-        // user's L/R-stick → keyboard-key bindings survive a preset switch.
-        // Without preserving sticks here, applying any preset would silently
-        // wipe the user's stick bindings (same root cause as the editor
-        // display bug — sticks were dropped on every KeyMap copy).
         const savedSticks = S.editingKeymap.sticks;
         S.editingKeymap = { buttons: [...preset.map.buttons] };
         if (savedSticks) {
@@ -94,19 +57,11 @@ export function applyPreset(index: number) {
         if (__DEBUG__) log(`Applied preset: ${preset.name}`);
 }
 
-/** Persist the working keymap to the appropriate target. When editing the
- *  global default, this writes keymap.json; when editing a per-game keymap,
- *  this updates the library entry and writes library.json. If a game is
- *  currently running, the change is applied immediately to runtime.Input
- *  so the user can test the new binding without restarting. */
+/** Persist the working keymap to the appropriate target and re-apply if a game is running. */
 export function saveEditingKeymap() {
         if (S.keymapTarget === 'global') {
                 S.keymapValid = saveKeyMap(Switch as unknown as LibraryAccess, S.editingKeymap);
                 if (S.keymapValid) {
-                        // CRITICAL: copy labels AND sticks, not just buttons.
-                        // Without labels, the editor shows 'ok' instead of the
-                        // bound key (e.g. '1', 'W'). Without sticks, analog
-                        // stick bindings are lost.
                         S.globalKeymap = { buttons: [...S.editingKeymap.buttons] };
                         if (S.editingKeymap.labels) S.globalKeymap.labels = [...S.editingKeymap.labels];
                         if (S.editingKeymap.sticks) S.globalKeymap.sticks = S.editingKeymap.sticks;
@@ -127,38 +82,20 @@ export function saveEditingKeymap() {
         }
         if (S.host && S.runtime?.Input) {
                 try {
-                        // Re-apply the MERGED keymap (per-game + global) to the
-                        // running game's gamepadMapper, so a change to either the
-                        // per-game or global keymap takes effect immediately.
                         applyKeyMap(S.runtime, mergedKeymap());
                         if (__DEBUG__) log('Keymap re-applied to running game');
                 } catch (error) { log(`Could not re-apply keymap: ${String(error)}`); }
         }
 }
 
-/** Open the keymap editor. If a game is running (host is set), default to
- *  editing the active game's per-game keymap when one exists, otherwise the
- *  global default (which the running game is using). Called from the library
- *  tile, the pause-menu "keymap" entry, or the game-options "Edit keymap". */
+/** Open the keymap editor for 'global' or a specific library entry. */
 export function openKeymapEditor(target: 'global' | LibraryEntry) {
         S.keymapTarget = target;
         const source = target === 'global' ? S.globalKeymap : (target.keymap || S.globalKeymap);
-        // Copy buttons, labels, keyCodes AND sticks from the source keymap.
-        // Missing any one of these caused display bugs:
-        //  - no labels  → editor shows the vkey ('ok') instead of the bound
-        //    key label ('1', 'W', 'Enter') — the "bindings reset to ok" bug.
-        //  - no sticks   → analog-stick bindings (e.g. L-stick ↑ = arrow key)
-        //    work at runtime (pollStickBindings reads currentEntry.keymap /
-        //    globalKeymap directly) but the editor grid shows 'none' for every
-        //    stick direction, so the user thinks nothing is assigned. This
-        //    was the root cause of the "stick bindings don't show in settings"
-        //    bug.
         S.editingKeymap = { buttons: [...source.buttons] };
         if (source.labels) S.editingKeymap.labels = [...source.labels];
         if (source.keyCodes) S.editingKeymap.keyCodes = [...source.keyCodes];
         if (source.sticks) {
-                // Shallow-clone each stick binding so editing the working copy
-                // never mutates the saved source map.
                 S.editingKeymap.sticks = {};
                 for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                         const b = source.sticks[dir];
@@ -170,11 +107,7 @@ export function openKeymapEditor(target: 'global' | LibraryEntry) {
         S.phase = 'keymap';
 }
 
-/** Route a single touch tap on the keymap page to the same action as
- *  the gamepad A button: tap a cell/key = move cursor + confirm in one
- *  motion. Tap the "← Back" button (top-right) = same as the B button.
- *  Tapping anywhere else does nothing — the user must hit a real UI
- *  element, which makes the touch zones unambiguous. */
+/** Route a single touch tap on the keymap page to the same action as the gamepad A button. */
 export function handleKeymapTouch(px: number, py: number): void {
         if (pointInRect(px, py, keymapBackButtonRect())) {
                 if (S.keymapPicking) {

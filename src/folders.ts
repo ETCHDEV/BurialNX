@@ -13,7 +13,7 @@ export function gameRoot(fs: DirectoryAccess, folder: string): string | null {
                         const index = fs.statSync(join(candidate, 'index.html'));
                         const core = fs.statSync(join(candidate, 'js/rpg_core.js'));
                         if (index && core && isFile(index.mode) && isFile(core.mode)) return candidate;
-                } catch { /* another candidate may work */ }
+                } catch {}
         }
         return null;
 }
@@ -38,17 +38,10 @@ export class FolderBrowser {
                                 try {
                                         const info = this.fs.statSync(join(this.path, name));
                                         if (!info) return false;
-                                        // In image mode, files matching supported extensions are
-                                        // listed alongside directories.
                                         if (this.mode === 'image' && isFile(info.mode)) {
                                                 const ext = name.toLowerCase().split('.').pop() || '';
-                                                // 'exe' is included so the user can pick a .exe file
-                                                // and have its embedded PE icon resource extracted
-                                                // as the cover (handled in src/cover.ts).
                                                 return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'exe'].includes(ext);
                                         }
-                                        // In file mode, ALL files are shown (for picking a name
-                                        // from any folder or file — used by the rename feature).
                                         if (this.mode === 'file' && isFile(info.mode)) return true;
                                         return isDirectory(info.mode);
                                 } catch { return false; }
@@ -60,10 +53,6 @@ export class FolderBrowser {
         step(buttons: ArrayLike<{ pressed: boolean }> | null, confirmIndex = 1, cancelIndex = 0): string | null | undefined {
                 const down = (id: number) => !!buttons?.[id]?.pressed;
                 const edge = (id: number) => down(id) && !this.previous[id];
-                // CONFIRM (the game's 'ok' button) opens/selects; CANCEL (the
-                // game's 'cancel' button) goes to the parent / cancels at root.
-                // confirmIndex/cancelIndex come from menuButtonIndicesFor() so
-                // the picker mirrors the game's A/B mapping — see frame-loop.ts.
                 const edgeConfirm = () => edge(confirmIndex);
                 const edgeCancel = () => edge(cancelIndex);
                 let result: string | null | undefined;
@@ -78,11 +67,6 @@ export class FolderBrowser {
                                 else { this.path = join(this.path, entry); this.selected = 0; this.message = ''; this.refresh(); }
                         } else { this.path = join(this.path, entry); this.selected = 0; this.message = ''; this.refresh(); }
                 }
-                // CANCEL navigates to the parent folder. At the SD root, CANCEL
-                // cancels the picker for every mode (returns null), so the user can
-                // always back out to the previous menu — not just from the
-                // 'saves' / 'image' modes. The legacy 'game' purpose also
-                // returns null so the new library picker can be cancelled.
                 if (edgeCancel()) {
                         if (this.path !== 'sdmc:') { this.path = this.path.slice(0, this.path.lastIndexOf('/')); this.selected = 0; this.message = ''; this.refresh(); }
                         else result = null;
@@ -93,9 +77,6 @@ export class FolderBrowser {
                         if (result && this.mode === 'game') this.sharedSaves = edge(2);
                         if (!result) this.message = 'No supported game found in that folder.';
                 }
-                // In file mode, X selects the CURRENT entry (folder or file) as
-                // the name source. A on a folder navigates into it; X on a
-                // folder picks it. A on a file picks it (handled above).
                 if (edge(3) && this.mode === 'file' && entry) {
                         result = join(this.path, entry);
                         this.pickedFile = result;

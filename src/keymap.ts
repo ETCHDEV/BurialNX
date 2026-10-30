@@ -1,34 +1,12 @@
 import { safeSdPath } from './settings';
 
-/**
- * Joycon → virtual mouse/keyboard remapping.
- *
- * The Switch runtime cannot synthesize a real mouse or keyboard event from
- * inside a homebrew loader: those HID devices belong to the OS and are not
- * writable by user-mode applications. What we *can* do is remap the meaning
- * of each joycon button *as the game sees it*: RPG Maker MV reads input
- * through a small number of named virtual keys (`ok`, `cancel`, `shift`,
- * `menu`, `up/down/left/right`, `pageup/pagedown`). By editing
- * `Input.gamepadMapper` we can make button 1 act like "left mouse button"
- * (i.e. the game's `ok`), button 0 act like "right mouse button"
- * (i.e. the game's `cancel`), and the D-pad move the in-game cursor — which
- * is exactly what a mouse would do in an RPG Maker MV game.
- *
- * This module defines a portable, JSON-serializable mapping so the user can
- * edit it from the in-app settings UI without writing code, and a small set
- * of presets for common control schemes ("Default", "Mouse", "Keyboard",
- * "WASD + Mouse").
- */
-
+/** Joycon → virtual mouse/keyboard remapping (JSON-serializable KeyMap + presets). */
 export type VirtualKey =
         | 'ok' | 'cancel' | 'shift' | 'control' | 'tab' | 'escape'
         | 'menu' | 'pageup' | 'pagedown'
         | 'up' | 'down' | 'left' | 'right' | 'none';
 
-/** Logical names for the 16 standard Web Gamepad button indices.
- *  The index follows the Web Gamepad API standard mapping:
- *    0 = South (Nintendo B), 1 = East (Nintendo A),
- *    2 = North (Nintendo X), 3 = West (Nintendo Y). */
+/** Logical names for the 16 standard Web Gamepad button indices. */
 export const BUTTON_NAMES: readonly string[] = Object.freeze([
         'B / South', 'A / East', 'X', 'Y',
         'L (LB)', 'R (RB)', 'ZL (LT)', 'ZR (RT)',
@@ -36,17 +14,12 @@ export const BUTTON_NAMES: readonly string[] = Object.freeze([
         'D-Up', 'D-Down', 'D-Left', 'D-Right',
 ]);
 
-/** Display order for the 16 buttons in the keymap editor grid.
- *  Position 0 = button index 1 (East / Nintendo A) — shown FIRST.
- *  Position 1 = button index 0 (South / Nintendo B) — shown SECOND.
- *  Positions 2..15 = unchanged. This way the user sees "A" first, "B"
- *  second in the grid, matching the physical Switch layout (A = right). */
+/** Display order for the 16 buttons in the keymap editor grid (A first, B second). */
 export const BUTTON_DISPLAY_ORDER: readonly number[] = Object.freeze([
         1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ]);
 
-/** Convert a grid display position (0..15) to the real button index.
- *  For stick directions (16..23) returns the position as-is. */
+/** Convert a grid display position (0..15) to the real button index. */
 export function displayToButtonIndex(displayPos: number): number {
         if (displayPos < 16) return BUTTON_DISPLAY_ORDER[displayPos] ?? displayPos;
         return displayPos;
@@ -67,19 +40,11 @@ export interface StickBinding {
 export interface KeyMap {
         /** Maps a gamepad button index (0-15) to a virtual RPG Maker MV key. */
         buttons: VirtualKey[];
-        /** Optional display labels (keyboard key names like '5', 'U', 'Enter').
-         *  When present, the UI shows the label instead of the virtual key name
-         *  so the user can see which keyboard key is bound to each button. */
+        /** Optional display labels (keyboard key names like '5', 'U', 'Enter'). */
         labels?: string[];
-        /** Optional keyCodes — when present, the bound keyCode is sent
-         *  directly to Input._currentState (simulating a keyboard key press)
-         *  instead of using the vkey via gamepadMapper. This lets the game's
-         *  own keyMapper decide what the key does. */
+        /** Optional keyCodes sent directly to Input._currentState. */
         keyCodes?: number[];
-        /** Analog stick → keyboard key bindings. When the stick is pushed
-         *  past 0.5 in a direction, the bound keyCode is "pressed" via
-         *  Input._currentState. This lets the user bind sticks to movement
-         *  keys (e.g. L-stick up = W, L-stick down = S, etc.). */
+        /** Analog stick → keyboard key bindings. */
         sticks?: {
                 lUp?: StickBinding; lDown?: StickBinding;
                 lLeft?: StickBinding; lRight?: StickBinding;
@@ -114,54 +79,29 @@ export const PRESETS: { name: string; map: KeyMap }[] = [
         },
 ];
 
-/** Nintendo face-button LETTERS for the 16 gamepad button indices, where
- *  the index follows the Web Gamepad API standard mapping (which BurialNX
- *  uses via `navigator.getGamepads()[0].buttons`):
- *    0 = South = Nintendo B (bottom)
- *    1 = East  = Nintendo A (right)
- *    2 = North = Nintendo X (top)
- *    3 = West  = Nintendo Y (left)
- *  4..11 are shoulder/trigger/stick-clicks (L/R/ZL/ZR/Minus/Plus/LSt/RSt),
- *  12..15 are the D-pad. Only the face buttons (0..3) have meaningful
- *  single-letter labels; the rest render their index so they're never
- *  blank. This is what the loader's own menu panels use to print the
- *  correct "A:" / "B:" hint for whichever button the active keymap maps
- *  to ok/cancel (see menuButtonIndices). */
+/** Nintendo face-button letters for the 16 gamepad button indices. */
 export const FACE_BUTTON_LETTERS: readonly string[] = Object.freeze([
         'B', 'A', 'X', 'Y', '4', '5', '6', '7', '-', '+', 'L3', 'R3', 'D↑', 'D↓', 'D←', 'D→',
 ]);
 
-/** The printable letter for a gamepad button index (0..15). Face buttons
- *  return their Nintendo label ('B'/'A'/'X'/'Y'); others return a short
- *  symbol. Never returns an empty string. */
+/** The printable letter for a gamepad button index (0..15). */
 export function faceButtonLetter(index: number): string {
         return FACE_BUTTON_LETTERS[index] ?? String(index);
 }
 
-/** keyCode constants used to detect "ok" / "cancel" roles from a button's
- *  optional keyCode binding (the `keyCodes` array on a KeyMap). RPG Maker
- *  MV's default Input.keyMapper maps these keyCodes to the named vkeys:
- *    enter (13) → 'ok', space (32) → 'ok', esc (27) → 'escape' (≈ cancel).
- *  So a button bound to keyCode 13 "is ok" for menu purposes even if its
- *  vkey entry is 'none' — the game's keyMapper translates the fired keydown
- *  to 'ok' at runtime. */
+/** keyCode constants for ok/space/esc used to detect menu roles from keyCode bindings. */
 export const KEYCODE_ENTER = 13;
 export const KEYCODE_SPACE = 32;
 export const KEYCODE_ESCAPE = 27;
 
-/** True if button `i` acts as the "ok" (confirm) role in the game — either
- *  via its vkey being 'ok', OR via its keyCode binding being enter/space
- *  (which RPG Maker MV's keyMapper translates to 'ok'). */
+/** True if button `i` acts as the "ok" (confirm) role in the game. */
 function isOkRoleAt(keymap: KeyMap, i: number): boolean {
         if (keymap.buttons[i] === 'ok') return true;
         const kc = keymap.keyCodes?.[i];
         return kc === KEYCODE_ENTER || kc === KEYCODE_SPACE;
 }
 
-/** True if button `i` acts as the "cancel" role in the game — either via
- *  its vkey being 'cancel' or 'escape' (RPG Maker MV treats 'escape' as a
- *  cancel/back key alongside 'cancel'), OR via its keyCode binding being
- *  esc (27, which the keyMapper maps to 'escape'). */
+/** True if button `i` acts as the "cancel" role in the game. */
 function isCancelRoleAt(keymap: KeyMap, i: number): boolean {
         const v = keymap.buttons[i];
         if (v === 'cancel' || v === 'escape') return true;
@@ -169,46 +109,14 @@ function isCancelRoleAt(keymap: KeyMap, i: number): boolean {
         return kc === KEYCODE_ESCAPE;
 }
 
-/** Determine which face-button indices act as CONFIRM (ok) and CANCEL in
- *  the loader's OWN menus (pause menu, save-choice, save/load scene,
- *  quit/return notice, keymap editor, picker, rename, game-options,
- *  library — EVERY loader screen).
- *
- *  Rule (per the user's spec, with the priority made explicit):
- *
- *    1. A is checked FIRST. If A (Nintendo A, button 1) is set to
- *       ok(enter/space) or cancel(esc) — by vkey OR by keyCode — A
- *       determines BOTH menu roles: A = its role, B = the opposite.
- *       This holds REGARDLESS of what B is set to ("вне зависимости от
- *       того что на B установлено").
- *
- *    2. Only if A is NOT set (not ok/enter/space AND not cancel/esc) do we
- *       check B (Nintendo B, button 0). If B is set to ok or cancel, B
- *       determines both roles: B = its role, A = the opposite.
- *
- *    3. If NEITHER A nor B is set → default: A = ok (confirm), B = cancel.
- *
- *  "Set to ok"   = vkey 'ok'                 OR keyCode enter(13)/space(32).
- *  "Set to cancel" = vkey 'cancel'/'escape'  OR keyCode esc(27).
- *
- *  Only buttons 0 and 1 (Nintendo A/B) are considered — X/Y/shoulders/
- *  D-pad never become the menu confirm/cancel.
- *
- *  Button indices follow the Web Gamepad API standard mapping BurialNX
- *  uses: 0 = Nintendo B (South), 1 = Nintendo A (East). Returns
- *  { confirm, cancel } where both are 0 or 1. */
+/** Determine which face-button indices act as CONFIRM and CANCEL in the loader's menus. */
 export function menuButtonIndicesFor(keymap: KeyMap): { confirm: number; cancel: number } {
-        const A = 1; // Nintendo A (East) = button index 1
-        const B = 0; // Nintendo B (South) = button index 0
-        // Priority: A first. If A is set (ok or cancel), A wins and B takes
-        // the opposite role — regardless of B's own binding.
+        const A = 1;
+        const B = 0;
         if (isOkRoleAt(keymap, A)) return { confirm: A, cancel: B };
         if (isCancelRoleAt(keymap, A)) return { confirm: B, cancel: A };
-        // A is NOT set → check B. If B is set, B wins and A takes the
-        // opposite role.
         if (isOkRoleAt(keymap, B)) return { confirm: B, cancel: A };
         if (isCancelRoleAt(keymap, B)) return { confirm: A, cancel: B };
-        // Neither A nor B is set → default: A = ok (confirm), B = cancel.
         return { confirm: A, cancel: B };
 }
 
@@ -251,30 +159,14 @@ export function saveKeyMap(fs: KeyMapAccess, map: KeyMap): boolean {
         } catch (error) { console.error(`Could not save key map: ${String(error)}`); return false; }
 }
 
-/** Apply the user's remap to RPG Maker MV's Input.gamepadMapper, replacing the
- *  hard-coded default. Only buttons remapped to `none` are removed; others are
- *  set so the engine sees the chosen virtual key.
- *
- *  Buttons with a non-zero keyCode binding are SKIPPED here — those are sent
- *  via Input._onKeyDown by pollButtonBindings() in main.ts. Setting
- *  gamepadMapper for them too would cause DOUBLE input (gamepad vkey +
- *  keyboard keyCode). keyCode=0 means "no keyboard binding, use
- *  gamepadMapper" — don't skip those. */
+/** Apply the user's remap to RPG Maker MV's Input.gamepadMapper. */
 export function applyKeyMap(runtime: any, map: KeyMap): void {
         if (!runtime?.Input) return;
         const mapper: Record<number, string> = {};
         map.buttons.forEach((key, index) => {
-                // Skip buttons with a keyCode binding — those are sent via
-                // Input._onKeyDown by pollButtonBindings(). Setting
-                // gamepadMapper would cause DOUBLE input (gamepad vkey +
-                // keyboard keyCode). keyCode=0 means "no keyboard binding,
-                // use gamepadMapper" — don't skip those.
                 if (map.keyCodes && map.keyCodes[index]) return;
                 if (key !== 'none') mapper[index] = key;
         });
-        // The original loader also maps buttons 9 and 12-15 to in-game menu and
-        // directions. If the user has remapped them, honor the user. Otherwise,
-        // keep them so a fresh KeyMap behaves like the original loader.
         if (mapper[9] === undefined) mapper[9] = 'menu';
         if (mapper[12] === undefined) mapper[12] = 'up';
         if (mapper[13] === undefined) mapper[13] = 'down';
@@ -298,9 +190,7 @@ export function setButton(map: KeyMap, index: number, key: VirtualKey): KeyMap {
         return result;
 }
 
-/** Set a button binding with a display label AND a keyCode. The keyCode
- *  is sent to Input._currentState at runtime so the game's keyMapper
- *  (not gamepadMapper) decides what the key does. */
+/** Set a button binding with a display label AND a keyCode. */
 export function setButtonWithLabel(map: KeyMap, index: number, key: VirtualKey, label: string, keyCode: number): KeyMap {
         if (index < 0 || index >= 16) throw new Error('Invalid button index');
         const buttons = map.buttons.slice();

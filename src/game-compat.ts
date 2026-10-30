@@ -4,30 +4,10 @@ import { applyKeyMap } from './keymap';
 import { interactionTextY } from './dialogue';
 import { fixIndexedPng } from './indexed-png';
 
-/**
- * Two desktop-only plugins cannot run on nx.js. Use MV audio instead of the
- * streaming Worker, and omit only the appended Node payload from the region
- * plugin. The region collision rules themselves must remain enabled.
- *
- * Additionally, the top-level `'use strict'` directive is stripped from every
- * script. BurialNX evaluates game scripts via indirect eval `(0, eval)(...)`,
- * which runs in the global scope. Under strict mode, indirect eval does NOT
- * leak `var`/`function` declarations to the global object — so a plugin that
- * declares `function Game_EnemyEvent() {}` under `'use strict'` would NOT
- * expose `Game_EnemyEvent` as a global, and subsequent plugins referencing it
- * would throw `ReferenceError: Game_EnemyEvent is not defined`. In a browser
- * `<script>` tag, top-level declarations become global even under strict mode
- * (a special case for script-tag evaluation). Stripping the directive makes
- * indirect eval run in sloppy mode, matching that behavior. Only the top-level
- * directive prologue is stripped; `'use strict'` inside function bodies (which
- * affects those functions' semantics) is preserved.
- */
+/** Strip desktop-only plugin payloads and the top-level 'use strict' directive so indirect eval matches a <script> tag. */
 export function prepareGameScript(path: string, source: string): string | null {
         if (path.endsWith('/AudioStreaming.js')) return null;
         if (path.endsWith('/YEP_RegionRestrictions.js') && source.includes("'zlib'") && source.includes('Buffer[')) {
-                // Keep the code before the single-line desktop bootstrap. Depending on
-                // the game build it closes a method or initializes the RR namespace.
-                // Reject unfamiliar layouts rather than deleting real plugin code.
                 const lines = source.split('\n');
                 const injected = lines.flatMap((line, index) =>
                         line.includes("'zlib'") && line.includes('Buffer[') ? [index] : []);
@@ -39,25 +19,11 @@ export function prepareGameScript(path: string, source: string): string | null {
                 lines[injected[0]] = prefix;
                 source = lines.join('\n');
         }
-        // Strip the top-level 'use strict' directive so indirect eval runs in
-        // sloppy mode and function/var declarations become global (like a
-        // <script> tag). See the function-level comment above for the full
-        // rationale. Only the directive prologue (before any real code) is
-        // stripped; function-body 'use strict' directives are preserved.
         source = stripTopLevelUseStrict(source);
         return source;
 }
 
-/**
- * Remove the top-level `'use strict'` / `"use strict"` directive prologue
- * from a script source. The directive is only stripped when it appears as the
- * first actual statement (after optional comments and whitespace). Directives
- * inside function bodies are left intact because they affect those functions'
- * runtime semantics (e.g. `this` binding, assignment to undeclared variables).
- *
- * Uses a single-pass line scan (O(n)) rather than a regex to avoid
- * catastrophic backtracking on large files like rpg_core.js (240+ KiB).
- */
+/** Remove only the top-level 'use strict' prologue (not function-body directives), via a single-pass line scan. */
 export function stripTopLevelUseStrict(source: string): string {
         const lines = source.split('\n');
         let inBlockComment = false;
@@ -66,9 +32,8 @@ export function stripTopLevelUseStrict(source: string): string {
                 if (inBlockComment) {
                         const end = line.indexOf('*/');
                         if (end >= 0) { inBlockComment = false; line = line.slice(end + 2); }
-                        else continue; // still inside a multi-line block comment
+                        else continue;
                 }
-                // Strip any remaining inline block comments on this line (non-nested).
                 let rest = line;
                 for (;;) {
                         const start = rest.indexOf('/*');
@@ -77,15 +42,12 @@ export function stripTopLevelUseStrict(source: string): string {
                         if (end < 0) { inBlockComment = true; rest = rest.slice(0, start); break; }
                         rest = rest.slice(0, start) + rest.slice(end + 2);
                 }
-                // Strip line comments.
                 const commentIdx = rest.indexOf('//');
                 if (commentIdx >= 0) rest = rest.slice(0, commentIdx);
                 const trimmed = rest.trim();
-                if (!trimmed) continue; // whitespace or comment-only line
-                // First real code line — check if it's a 'use strict' directive.
+                if (!trimmed) continue;
                 const m = /^(['"])use strict\1;?$/.exec(trimmed);
                 if (m) { lines.splice(i, 1); return lines.join('\n'); }
-                // First real code is something else — no top-level 'use strict' to strip.
                 return source;
         }
         return source;
@@ -93,11 +55,7 @@ export function stripTopLevelUseStrict(source: string): string {
 
 type Language = Record<string, Record<string, string | string[]>>;
 
-/**
- * A fully-decoded language pack. The base `Language` type holds the translation
- * tables used by translate(); this wrapper carries the extra metadata embedded
- * in a `.cld` pack (font + translated images) so the loader can register them.
- */
+/** A fully-decoded language pack: translation tables plus embedded font + translated images. */
 export interface LanguagePack {
         table: Language;
         /** Logical font-family name to use for this language (e.g. 'bitter-pro-regular'). */
@@ -119,7 +77,6 @@ export function parseLanguagePack(bytes: ArrayBuffer, source: string | null): La
         const text = new TextDecoder().decode(bytes);
         if (!text.startsWith('LANGDATA')) throw new Error('Unsupported language data');
         const raw = JSON.parse(text.slice(8)) as Record<string, unknown>;
-        // Extract the tables translate() actually reads; keep the rest as raw metadata.
         const table: Language = {};
         for (const key of ['linesLUT', 'labelLUT', 'sysLabel', 'sysMenus'] as const) {
                 const value = raw[key];
@@ -136,22 +93,14 @@ export function parseLanguagePack(bytes: ArrayBuffer, source: string | null): La
 /** The hashed asset path of the default (English) language data embedded in data/. */
 const DEFAULT_LANGUAGE_PATH = 'data/9c7050ae76645487';
 
-/**
- * Load the default (English) language table. Kept for backward compatibility with
- * tests and callers that only need the translation tables. Prefer loadLanguagePack().
- */
+/** Load the default English language table (kept for backward compatibility with tests). */
 export async function languageTable(assets: Reader): Promise<Language | null> {
         const data = await assets.read(DEFAULT_LANGUAGE_PATH);
         if (!data) return null;
         return parseLanguagePack(data, null).table;
 }
 
-/**
- * Load a language pack from a `.cld` file. Falls back to the default English data
- * embedded in data/ when the requested pack cannot be read. Always returns a pack
- * (never null) when the default exists; returns null only if neither the requested
- * pack nor the default could be read.
- */
+/** Load a language pack from a .cld, falling back to the default English data when the requested pack can't be read. */
 export async function loadLanguagePack(assets: Reader, cldPath: string | null): Promise<LanguagePack | null> {
         if (cldPath) {
                 const bytes = await assets.read(cldPath);
@@ -182,16 +131,10 @@ export interface LanguageEntry {
         name: string;
 }
 
-/**
- * Scan the `languages/` folder (and one level above the www root as a fallback)
- * for `.cld` language packs. Returns entries sorted by code. The www-relative
- * path is preferred because RPG Maker MV games ship languages there; the parent
- * folder is checked because some builds place `languages/` next to the exe.
- */
+/** Scan www/languages (and one level above www as a fallback) for .cld packs, sorted by code. */
 export function scanLanguageFiles(fs: LanguageScanFs | null, gameRoot: string): LanguageEntry[] {
         if (!fs?.readDirSync) return [];
         const clean = gameRoot.replace(/\/+$/, '');
-        // The game root is the www folder. languages/ may be inside it, or one level up.
         const candidates = [
                 { dir: `${clean}/languages`, relBase: 'languages', parent: false },
                 { dir: `${clean.replace(/\/www$/i, '')}/languages`, relBase: '../languages', parent: true },
@@ -207,24 +150,16 @@ export function scanLanguageFiles(fs: LanguageScanFs | null, gameRoot: string): 
                         const code = name.replace(/\.cld$/i, '').toLowerCase();
                         if (seen.has(code)) continue;
                         seen.add(code);
-                        // For in-www languages, path is a relative asset path the Reader accepts.
-                        // For parent-folder languages, path is null (assetPath rejects `..`); callers read via absPath.
                         const path = parent ? null : `${relBase}/${name}`;
                         const absPath = `${dir}/${name}`;
                         entries.push({ path, absPath, code, name: code });
                 }
         }
-        // Sort by code for deterministic ordering. 'ru' (Russian) is the primary
-        // target language for this game; keep it first if present.
         entries.sort((a, b) => (a.code === 'ru' ? -1 : b.code === 'ru' ? 1 : a.code.localeCompare(b.code)));
         return entries;
 }
 
-/**
- * Best-effort lookup of a human-readable name for a language pack by peeking at
- * its `langName` field. Used so the scan results can show 'Русский' instead of 'ru'.
- * Falls back to the code if the pack can't be read or parsed.
- */
+/** Best-effort lookup of a human-readable name for a language pack by peeking at its langName field. */
 export async function resolveLanguageName(assets: Reader, entry: LanguageEntry): Promise<string> {
         const bytes = await assets.read(entry.path);
         if (!bytes) return entry.code;
@@ -238,7 +173,6 @@ export async function resolveLanguageName(assets: Reader, entry: LanguageEntry):
 
 /** Decode a base64 string into an ArrayBuffer (used for embedded fonts/images). */
 function decodeBase64(base64: string): ArrayBuffer {
-        // Use atob when available (Switch runtime + tests); fall back to manual decode.
         const clean = base64.replace(/\s+/g, '');
         if (typeof atob === 'function') {
                 const binary = atob(clean);
@@ -246,7 +180,6 @@ function decodeBase64(base64: string): ArrayBuffer {
                 for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
                 return bytes.buffer;
         }
-        // Manual decode path (no atob).
         const lookup = new Int8Array(128).fill(-1);
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
         for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
@@ -256,7 +189,7 @@ function decodeBase64(base64: string): ArrayBuffer {
                 const c = clean.charCodeAt(i);
                 if (c >= 128) continue;
                 const v = lookup[c];
-                if (v < 0) { if (c === 61 /* = */) break; continue; }
+                if (v < 0) { if (c === 61 ) break; continue; }
                 buffer = (buffer << 6) | v;
                 bits += 6;
                 if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff); }
@@ -264,21 +197,7 @@ function decodeBase64(base64: string): ArrayBuffer {
         return new Uint8Array(out).buffer;
 }
 
-/** Roll back a Game_Interpreter that is waiting on a message (`_waitMode ==
- *  'message'`) so the save captures it at the ShowText (101) / ShowChoices
- *  (102) command instead of PAST the choice branches. On load (and on
- *  resume after save), the interpreter re-runs 101/102 → setupChoices
- *  re-populates $gameMessage + re-establishes the choice callback → the
- *  choice re-displays (instead of being skipped because $gameMessage isn't
- *  saved). The 101/401/102 commands are display-only, so re-running them
- *  has no side effects.
- *
- *  Scans the interpreter's `_list` backwards from `_index - 1` for a command
- *  with code 101 (ShowText, preferred — re-runs text + choices) or 102
- *  (ShowChoices, fallback — choices only), stopping at a lower indent
- *  (outside the message block). Sets `_index` to that command, clears
- *  `_waitMode`, and clears `$gameMessage` so the re-run re-populates it
- *  fresh. */
+/** Roll back an interpreter waiting on a message so the save captures it at the ShowText/ShowChoices command. */
 function rollbackInterpreterForMessageWait(interp: any, runtime: any): void {
         if (!interp || interp._waitMode !== 'message') return;
         const list = interp._list;
@@ -288,33 +207,18 @@ function rollbackInterpreterForMessageWait(interp: any, runtime: any): void {
         for (let i = interp._index - 1; i >= 0; i--) {
                 const cmd = list[i];
                 if (!cmd) continue;
-                // Stop at a lower indent (we've left the message block).
                 if (typeof cmd.indent === 'number' && cmd.indent < startIndent) break;
-                if (cmd.code === 101) { target101 = i; break; }       // ShowText — prefer (re-runs text + choices)
-                if (cmd.code === 102 && target102 < 0) target102 = i; // ShowChoices — fallback
+                if (cmd.code === 101) { target101 = i; break; }
+                if (cmd.code === 102 && target102 < 0) target102 = i;
         }
         const target = target101 >= 0 ? target101 : target102;
-        if (target < 0) return; // No 101/102 found — can't roll back safely.
+        if (target < 0) return;
         interp._index = target;
         interp._waitMode = '';
-        // Clear $gameMessage so the re-run re-populates it fresh (avoids
-        // stale text/choices state lingering from before the save).
         try { runtime.$gameMessage?.clear?.(); } catch { /* best-effort */ }
 }
 
-/**
- * Register the font embedded in a language pack (if any) and override RPG Maker
- * MV's font selection so the game actually uses it. The .cld's fontFile is a
- * base64-encoded TTF/OTF/WOFF; we decode it, create a FontFace, and add it to the
- * runtime font set. We also override Window_Base.standardFontFace and
- * standardFontSize (and Yanfly's YEP_CoreEngine override of the same) so every
- * window and bitmap draws with this language's font instead of GameFont.
- *
- * Registers ALL 4 variants (normal, bold, italic, bold-italic) — same as
- * registerFonts — so the game can render bold/italic text in the language font.
- * Without all 4 variants, bold/italic text falls back to GameFont which has
- * no Cyrillic glyphs → empty/blank dialogue lines.
- */
+/** Register the language pack's embedded font and override MV's font selection so every window/bitmap uses it. */
 export async function registerLanguageFont(runtime: any, pack: LanguagePack): Promise<void> {
         const face = pack.fontFace;
         const size = pack.fontSize;
@@ -322,10 +226,6 @@ export async function registerLanguageFont(runtime: any, pack: LanguagePack): Pr
                 try {
                         const bytes = decodeBase64(pack.fontFile);
                         if (runtime.FontFace && runtime.fonts?.add) {
-                                // Register ALL 4 variants (normal, bold, italic, bold-italic)
-                                // — same pattern as registerFonts. Without bold/italic variants,
-                                // the game falls back to GameFont for bold/italic text, which
-                                // has no Cyrillic glyphs → empty lines for Russian dialogue.
                                 for (const variant of [{}, { weight: 'bold' }, { style: 'italic' }, { style: 'italic', weight: 'bold' }]) {
                                         try { runtime.fonts.add(new runtime.FontFace(face, bytes, variant)); }
                                         catch { /* best-effort: variant may not be supported */ }
@@ -338,16 +238,7 @@ export async function registerLanguageFont(runtime: any, pack: LanguagePack): Pr
                 if (base && typeof base.standardFontFace === 'function') {
                         base.standardFontFace = function() { return face; };
                 }
-                // Yanfly's YEP_CoreEngine replaces standardFontFace to read Yanfly.Param.DefaultFont.
-                // Override that parameter so the YEP path also picks up the language font.
                 if (runtime.Yanfly?.Param) runtime.Yanfly.Param.DefaultFont = face;
-                // YEP_MessageCore has its OWN font system for dialogue windows:
-                // it overrides standardFontFace for Window_Message, Window_ChoiceList,
-                // and Window_NameBox to return $gameSystem.getMessageFontName() which
-                // reads from Yanfly.Param.MSGFontName (= "GameFont"). Without overriding
-                // these, dialogue text uses GameFont (no Cyrillic glyphs) → empty lines.
-                // Fix: override the YEP message font parameters AND the message window
-                // prototypes' standardFontFace directly.
                 if (runtime.Yanfly?.Param) {
                         runtime.Yanfly.Param.MSGFontName = face;
                         runtime.Yanfly.Param.MSGCNFontName = face;
@@ -356,9 +247,7 @@ export async function registerLanguageFont(runtime: any, pack: LanguagePack): Pr
                 for (const proto of [runtime.Window_Message?.prototype, runtime.Window_ChoiceList?.prototype, runtime.Window_NameBox?.prototype]) {
                         if (proto) proto.standardFontFace = function() { return face; };
                 }
-                // Graphics.fontFace is the Bitmap default; set it so raw Bitmap draws match.
                 if (runtime.Graphics) runtime.Graphics.fontFace = face;
-                // Bitmap's constructor default is 'GameFont'; update the prototype property too.
                 if (runtime.Bitmap?.prototype) runtime.Bitmap.prototype.fontFace = face;
         }
         if (size) {
@@ -368,24 +257,16 @@ export async function registerLanguageFont(runtime: any, pack: LanguagePack): Pr
                 }
                 if (runtime.Yanfly?.Param) {
                         runtime.Yanfly.Param.FontSize = size;
-                        // Override message font size too (YEP_MessageCore uses MSGFontSize).
                         runtime.Yanfly.Param.MSGFontSize = size;
                 }
                 if (runtime.Bitmap?.prototype) runtime.Bitmap.prototype.fontSize = size;
         }
 }
 
-/**
- * Wrap a Reader so that paths listed in the language pack's `imgFiles` return the
- * base64-decoded replacement image instead of reading from disk. This applies
- * translated parallaxes, title art, and any other localized images. Paths not in
- * the pack fall through to the base reader unchanged.
- */
+/** Wrap a Reader so paths in the pack's imgFiles return decoded replacement images; others fall through. */
 export function withLanguageImages(base: Reader, pack: LanguagePack): Reader {
         const entries = Object.entries(pack.imgFiles);
         if (!entries.length) return base;
-        // Pre-decode images lazily (the Russian pack has 44 images; decoding all
-        // upfront would spike memory). Cache the decoded buffer per path.
         const cache = new Map<string, ArrayBuffer>();
         const decode = (key: string): ArrayBuffer | null => {
                 const cached = cache.get(key);
@@ -400,8 +281,6 @@ export function withLanguageImages(base: Reader, pack: LanguagePack): Reader {
                 async read(path: string): Promise<ArrayBuffer | null> {
                         const direct = pack.imgFiles[path];
                         if (direct) { const decoded = decode(path); if (decoded) return decoded; }
-                        // imgFiles keys may omit extensions or use a hashed path that the
-                        // request normalizes; try a few close matches.
                         if (path) {
                                 const noExt = path.replace(/\.[^/.]+$/, '');
                                 const viaNoExt = pack.imgFiles[noExt];
@@ -412,17 +291,10 @@ export function withLanguageImages(base: Reader, pack: LanguagePack): Reader {
         };
 }
 
-// Hoisted constants for translate() — avoid per-call allocation of the names
-// object and the regex. The fast path (no '(' in input) skips the regex
-// entirely for ~95% of drawText calls, which is the common case for games
-// without language packs or for text that doesn't use escape sequences.
 const TRANSLATE_NAMES: Record<string, string> = { lines: 'linesLUT', label: 'labelLUT', syslabel: 'sysLabel', sysmenus: 'sysMenus' };
 const TRANSLATE_RE = /\((lines|label|sysLabel|sysMenus)\)\[([^\]]+)\]/gi;
 
 export function translate(input: string, table: Language): string {
-        // Fast path: if there's no '(' character, the escape-sequence regex can't
-        // match anything — return the input unchanged without allocating regex
-        // state or a callback closure.
         if (input.indexOf('(') < 0) return input;
         return input.replace(TRANSLATE_RE, (whole, type: string, key: string) => {
                 const value = table[TRANSLATE_NAMES[type.toLowerCase()]]?.[key];
@@ -447,31 +319,11 @@ export async function registerFonts(assets: Reader, runtime: any): Promise<void>
         }
 }
 
-/**
- * Wrap the game's plain-English system text (terms, plugin title strings) in
- * translate() escape sequences so the loaded language pack can convert them.
- *
- * The game's $dataSystem.terms (commands, basic, params, messages) and plugin
- * constants (e.g. Galv.CRED.titleText = "Credits") hold raw English strings.
- * The .cld's sysMenus/sysLabel tables map those English keys to translations,
- * but translate() only fires on `(sysMenus)[key]` / `(sysLabel)[key]` escape
- * sequences. On PC the game's obfuscated language loader wraps these strings;
- * BurialNX replicates that by wrapping every term that has a matching table key.
- *
- * Only strings whose value EXACTLY matches a table key are wrapped, so terms
- * without a translation are left untouched (no ugly "(sysMenus)[...]" shown).
- *
- * This must run AFTER $dataSystem is loaded (DataManager.onLoad) and AFTER any
- * plugin that sets title-text constants (i.e. after all scripts are evaluated).
- */
+/** Wrap system text (terms, gameTitle, plugin constants) in translate() escape sequences so the language pack converts them. */
 export function wrapSystemTerms(runtime: any, language: Language | null): void {
         if (!language) return;
         const sysMenus = language.sysMenus as Record<string, string | string[]> | undefined;
         const sysLabel = language.sysLabel as Record<string, string | string[]> | undefined;
-        // The .cld's sysMenus keys don't always match the game's standard RPG Maker
-        // MV text. For example, the game's option label is "Always Dash" but the .cld
-        // uses "Run Always". This map bridges the gap: when a game string has no
-        // direct sysMenus/sysLabel key, check if a known alias exists.
         const OPTION_ALIASES: Record<string, string> = {
                 'Always Dash': 'Run Always',
                 'BGM Volume': 'Volume BGM',
@@ -479,10 +331,9 @@ export function wrapSystemTerms(runtime: any, language: Language | null): void {
         };
         const wrap = (value: unknown): unknown => {
                 if (typeof value !== 'string' || !value) return value;
-                if (value.startsWith('(')) return value; // already wrapped
+                if (value.startsWith('(')) return value;
                 if (sysMenus && sysMenus[value] !== undefined) return `(sysMenus)[${value}]`;
                 if (sysLabel && sysLabel[value] !== undefined) return `(sysLabel)[${value}]`;
-                // Try alias mapping: "Always Dash" → check sysMenus["Run Always"]
                 const alias = OPTION_ALIASES[value];
                 if (alias && sysMenus && sysMenus[alias] !== undefined) return `(sysMenus)[${alias}]`;
                 return value;
@@ -495,8 +346,6 @@ export function wrapSystemTerms(runtime: any, language: Language | null): void {
                 if (!obj || typeof obj !== 'object') return;
                 for (const key of Object.keys(obj)) obj[key] = wrap(obj[key]);
         };
-        // 1. $dataSystem.terms (commands, basic, params, messages) — the main
-        //    source of menu/window text in RPG Maker MV.
         const system = runtime.$dataSystem;
         if (system?.terms) {
                 wrapArray(system.terms.commands);
@@ -504,17 +353,9 @@ export function wrapSystemTerms(runtime: any, language: Language | null): void {
                 wrapArray(system.terms.params);
                 wrapObject(system.terms.messages);
         }
-        // 2. $dataSystem.gameTitle — the .cld's sysLabel['Game'] holds the translated
-        //    game title (e.g. "Гроб для Энди и Лейли"). The English gameTitle is NOT the
-        //    key "Game"; the game's own language loader maps gameTitle → sysLabel['Game'].
-        //    Replicate that by wrapping the title in (sysLabel)[Game] unconditionally.
         if (typeof system?.gameTitle === 'string' && system.gameTitle && sysLabel && sysLabel['Game'] !== undefined && !system.gameTitle.startsWith('(')) {
                 system.gameTitle = `(sysLabel)[Game]`;
         }
-        // 3. The save/load prompts. The game's terms.messages.saveMessage is
-        //    "Save to which file?" but the .cld's sysLabel['Save'] = "Какой файл
-        //    перезаписать?" — the key 'Save' maps to the save prompt, not the raw
-        //    message text. Map them explicitly (same for Load).
         if (system?.terms?.messages) {
                 const msgs = system.terms.messages;
                 if (typeof msgs.saveMessage === 'string' && msgs.saveMessage && !msgs.saveMessage.startsWith('(') && sysLabel && sysLabel['Save'] !== undefined) {
@@ -524,7 +365,6 @@ export function wrapSystemTerms(runtime: any, language: Language | null): void {
                         msgs.loadMessage = `(sysLabel)[Load]`;
                 }
         }
-        // 4. Plugin title-text constants. Galv.CRED.titleText = "Credits" → sysMenus['Credits'].
         const galv = runtime.Galv?.CRED;
         if (galv && typeof galv.titleText === 'string') {
                 const wrapped = wrap(galv.titleText);
@@ -537,9 +377,6 @@ export function wrapSystemTerms(runtime: any, language: Language | null): void {
 
 /** Install after plugins load, before window.onload starts the game. */
 export function installGameCompatibility(runtime: any, root: string, sharedSaves: boolean, language: Language | null, pngFix = false, keyMap?: KeyMap) {
-        // The bundled credits scene is currently unreliable on nx.js. Keep its
-        // title entry visible but disabled and make event-script calls harmless.
-        // Remove this guard only after the credits scene is tested on hardware.
         const credits = runtime.Galv?.CRED;
         if (typeof credits?.start === 'function') {
                 credits.start = () => {};
@@ -568,16 +405,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         12: 'up', 13: 'down', 14: 'left', 15: 'right',
                 };
         }
-        // Forward screen touch events to document for RPG Maker MV's TouchInput.
-        // nx.js dispatches 'touchstart'/'touchmove'/'touchend' on the `screen`
-        // global. RPG Maker MV's TouchInput listens on `document`. Without
-        // forwarding, touch/tap interactions in the game don't work.
-        // The listeners are installed ONCE per process: each new launch
-        // replaces globalThis.document with a fresh one, so the handler
-        // resolves the current document at event time instead of closing over
-        // the document of the first launch (which would send the second
-        // game's touches to a dead document, and stack a listener set per
-        // launch on the shared screen object).
         const doc = runtime.document;
         if (doc && typeof screen?.addEventListener === 'function' && !(screen as any).__burialnxTouchForwarded) {
                 (screen as any).__burialnxTouchForwarded = true;
@@ -585,9 +412,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         screen.addEventListener(type, ((e: any) => {
                                 const target = (globalThis as any).document;
                                 if (!target) return;
-                                // RPG Maker MV's TouchInput uses touch.pageX/pageY.
-                                // nx.js touch events have clientX/clientY but not pageX/pageY.
-                                // Add them as aliases so the game can read them.
                                 if (e?.changedTouches) {
                                         for (const t of e.changedTouches) {
                                                 if (t && t.pageX === undefined) { t.pageX = t.clientX; t.pageY = t.clientY; }
@@ -597,8 +421,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         }) as EventListener);
                 }
         }
-        // MV normally keeps a pool of Image objects. Native images can retain their
-        // pixel buffers and bound listeners, so release those references on cleanup.
         const bitmap = runtime.Bitmap;
         if (bitmap?.prototype?._clearImgInstance) {
                 const clear = bitmap.prototype._clearImgInstance;
@@ -612,8 +434,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         return result;
                 };
         }
-        // WindowLayer explicitly clears its temporary canvas each frame. Avoid
-        // repeatedly allocating a same-sized native surface for that one canvas.
         const layer = runtime.WindowLayer?.prototype;
         if (layer?.renderCanvas) {
                 const render = layer.renderCanvas;
@@ -629,24 +449,13 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 const original = storage.webStorageKey;
                 storage.webStorageKey = function(...args: unknown[]) { return `NX:${encodeURIComponent(root.replace(/\/+$/, ''))}:` + original.apply(this, args); };
         }
-        // The game's skipped desktop helper provides autoSave(). Keep its recovery
-        // snapshot separate from ordinary slots so it cannot overwrite the player.
         const manager = runtime.DataManager;
-        // Wrap the game's system text (terms, gameTitle, plugin constants) in
-        // translate() escape sequences so the loaded language pack can convert
-        // the title-menu commands, item/skill names, save/load prompts, etc.
-        // This runs once now (for plugin constants like Galv.CRED.titleText that
-        // were set during script evaluation) and again when $dataSystem loads.
-        // Wrapped in try/catch so a translation failure never crashes the game.
         try { wrapSystemTerms(runtime, language); } catch { /* best-effort */ }
         if (manager && typeof manager.onLoad === 'function' && !manager.__bnxTermsWrap) {
                 const onLoad = manager.onLoad;
                 manager.__bnxTermsWrap = true;
                 manager.onLoad = function(data: any, name: string) {
                         const result = onLoad.apply(this, arguments);
-                        // $dataSystem carries the terms (commands/basic/params/messages)
-                        // and gameTitle. Wrap them now so the title-menu and every window
-                        // that reads TextManager sees the escape sequences translate() hooks.
                         if (name === '$dataSystem' || (data === runtime.$dataSystem && data?.terms)) {
                                 try { wrapSystemTerms(runtime, language); }
                                 catch { /* best-effort: untranslated text is not fatal */ }
@@ -658,8 +467,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 const setup = manager.setupNewGame;
                 manager.setupNewGame = function() {
                         const result = setup.apply(this, arguments);
-                        // This game's intro card uses this known starting position and its
-                        // first transfer makes the player visible again.
                         if (runtime.$dataSystem?.startMapId === 15 && runtime.$dataSystem.startX === 8 && runtime.$dataSystem.startY === 7) runtime.$gamePlayer?.setTransparent?.(true);
                         return result;
                 };
@@ -667,56 +474,19 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
         if (manager && typeof manager.autoSave !== 'function') manager.autoSave = function() {
                 try {
                         const data = runtime.JsonEx.stringify(this.makeSaveContents());
-                        // Write the recovery snapshot to the SD card, NOT localStorage.
-                        // nx.js implements localStorage on top of account save data, so the
-                        // first `localStorage.setItem(...)` lazily launches the profile-picker
-                        // applet (because startupUserAccount=0 means no user is preselected).
-                        // That would interrupt gameplay with a "select a user" dialog every
-                        // time autosave fires. Redirecting to a regular file on the SD card
-                        // keeps the recovery-snapshot feature working without ever touching
-                        // localStorage — consistent with how installSdSaves() writes the
-                        // game's own .rpgsave slots to the SD card.
                         const SwitchAny = (globalThis as any).Switch;
                         const dir = 'sdmc:/switch/burialnx/autosaves';
                         try { SwitchAny?.mkdirSync?.(dir); } catch { /* dir may already exist */ }
                         const path = `${dir}/${encodeURIComponent(root)}.rpgsave`;
-                        // Do not overwrite recovery snapshots made by the previous loader.
                         SwitchAny.writeFileSync(path, runtime.LZString.compressToBase64(data));
                         return true;
                 } catch { return false; }
         };
-        // === Fix: save mid-choice → load should resume ON the choice, not skip past it. ===
-        //
-        // RPG Maker MV's `DataManager.makeSaveContents` deliberately EXCLUDES
-        // `$gameMessage` from the save data (see the comment in rpg_managers.js:
-        // "A save data does not contain $gameTemp, $gameMessage, and $gameTroop").
-        // The interpreter's `_waitMode='message'` IS saved (it's on the
-        // Game_Interpreter, serialized via $gameMap). So on load:
-        //   - the interpreter is at the ShowChoices command (index past 101/102,
-        //     pointing at the first choice branch 402), `_waitMode='message'`;
-        //   - `$gameMessage` is fresh/empty (not saved);
-        //   - `updateWaitMode('message')` → `$gameMessage.isBusy()` = false →
-        //     `_waitMode=''` → the interpreter ADVANCES past the choice branches;
-        //   - the branches (402) check `_branch[indent]` which is unset (the
-        //     choice callback was never called) → skipBranch → the game skips
-        //     the entire choice → the user is "thrown further" than the choice.
-        //
-        // FIX: wrap `DataManager.makeSaveContents` to, BEFORE serializing, roll
-        // the waiting interpreter's `_index` BACK to the ShowText (101) or
-        // ShowChoices (102) command that set up the message, and clear
-        // `_waitMode`. The save then captures the interpreter at the 101/102
-        // command (not waiting). On load (and on resume after save), the
-        // interpreter RE-RUNS 101/102 → setupChoices re-populates $gameMessage
-        // + re-establishes the choice callback → setWaitMode('message') → the
-        // choice re-displays. The 101/401/102 commands are display-only (no
-        // side effects), so re-running them is safe.
         const dataManager = runtime.DataManager;
         if (dataManager && typeof dataManager.makeSaveContents === 'function' && !dataManager.__bnxSaveRollbackWrap) {
                 const origMakeSaveContents = dataManager.makeSaveContents;
                 dataManager.makeSaveContents = function() {
                         try {
-                                // Roll back any interpreter waiting on a message so the choice
-                                // re-displays on load instead of being skipped.
                                 const candidates = [];
                                 if (runtime.$gameMap?._interpreter) candidates.push(runtime.$gameMap._interpreter);
                                 if (runtime.$gameTroop?._interpreter) candidates.push(runtime.$gameTroop._interpreter);
@@ -726,39 +496,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 };
                 dataManager.__bnxSaveRollbackWrap = true;
         }
-        // === Defensive: prevent the "Cannot read properties of undefined
-        // (reading 'bitmap' / 'getPixel')" crashes when resuming from
-        // Scene_Save/Scene_Load during a dialogue choice. ===
-        //
-        // Root cause (from studying the game's rpg_core.js / rpg_windows.js):
-        // `SceneManager.pop` → `goto(prevClass)` → `new Scene_Map()` — a FRESH
-        // scene is created (scenes don't "resume"). Scene_Map.create →
-        // createMessageWindow → new Window_Message + sub-windows. Scene_Map.start
-        // → Window_Message.update → (canStart || startInput) → startMessage /
-        // _choiceWindow.start() → refresh → createContents → `this.contents =
-        // new Bitmap(...)` → setter `this._windowContentsSprite.bitmap = value`
-        // AND drawItem → resetTextColor → textColor → `this.windowskin.getPixel`.
-        // If `_windowContentsSprite` or `_windowskin` is undefined at that
-        // moment → crash.
-        //
-        // IMPORTANT: the earlier fix only suppressed `canStart`, but
-        // Window_Message.update falls through to `startInput()` when canStart
-        // is false — and startInput → `$gameMessage.isChoice()` →
-        // `_choiceWindow.start()` STILL runs the choice re-draw during the
-        // suppress window. So the suppress must cover the WHOLE message
-        // processing loop (update), not just canStart.
-        //
-        // Two-layer fix:
-        //  (1) Suppress `Window_Message.update`'s message-processing loop for
-        //      a few frames after a save/load pop (flag set by
-        //      installSaveLoadPopHook). Only the parent Window_Base.update
-        //      (window animation / openness) runs; startMessage AND startInput
-        //      (→ choice window start → refresh → drawItem → getPixel) are
-        //      deferred until the fresh scene's windows fully settle.
-        //  (2) Make Window.prototype.contents AND windowskin getters robust
-        //      against a missing _windowContentsSprite / _windowskin: lazily
-        //      create a dummy sprite+bitmap instead of crashing. Belt-and-braces
-        //      that catches any remaining undefined-sprite/bitmap access.
         const WindowMessage = runtime.Window_Message?.prototype;
         const WindowBaseUpdate = runtime.Window_Base?.prototype?.update;
         if (WindowMessage && typeof WindowMessage.update === 'function' && !WindowMessage.__bnxUpdateWrap) {
@@ -767,13 +504,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         const g = runtime as any;
                         if (g._bnxSuppressMessageStart && g._bnxSuppressMessageStart > 0) {
                                 g._bnxSuppressMessageStart--;
-                                // Skip the message/choice processing loop (the `while`
-                                // in Window_Message.update that calls canStart /
-                                // startMessage / startInput → _choiceWindow.start).
-                                // Only run the parent Window_Base.update so the
-                                // window still animates (openness etc.). This
-                                // defers BOTH startMessage AND the choice-window
-                                // start until the fresh scene's windows settle.
                                 if (typeof WindowBaseUpdate === 'function') WindowBaseUpdate.call(this);
                                 return;
                         }
@@ -782,9 +512,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 WindowMessage.__bnxUpdateWrap = true;
         }
         const WindowProto = runtime.Window?.prototype;
-        // Defensive: `contents` getter/setter — lazily create a dummy
-        // _windowContentsSprite + 1x1 bitmap if undefined (prevents the
-        // "reading 'bitmap'" crash).
         const contentsDesc = WindowProto ? Object.getOwnPropertyDescriptor(WindowProto, 'contents') : undefined;
         if (contentsDesc && !WindowProto.__bnxContentsWrap) {
                 WindowProto.__bnxContentsWrap = true;
@@ -803,9 +530,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         configurable: true,
                 });
         }
-        // Defensive: `windowskin` getter — lazily create a dummy _windowskin
-        // bitmap if undefined (prevents the "reading 'getPixel'" crash in
-        // Window_Base.textColor → this.windowskin.getPixel).
         const windowskinDesc = WindowProto && !WindowProto.__bnxWindowskinWrap ? Object.getOwnPropertyDescriptor(WindowProto, 'windowskin') : undefined;
         if (windowskinDesc && windowskinDesc.get) {
                 WindowProto.__bnxWindowskinWrap = true;
@@ -813,10 +537,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 Object.defineProperty(WindowProto, 'windowskin', {
                         get: function() {
                                 if (this._windowskin == null) {
-                                        // Lazily create a dummy 1x1 bitmap AND try to load the real
-                                        // windowskin so textColor/getPixel don't crash on undefined.
-                                        // Bitmap.getPixel on a 1x1 returns a transparent-ish color
-                                        // (no crash) — enough to survive the resume frame.
                                         this._windowskin = new runtime.Bitmap(1, 1);
                                         try { this._windowskin = runtime.ImageManager?.loadSystem?.('Window') ?? this._windowskin; } catch { /* keep dummy */ }
                                 }
@@ -839,11 +559,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                                 return original.call(this, typeof text === 'string' ? translate(text, language) : text, ...rest);
                         };
                 }
-                // RPG Maker MV's Window_Options.booleanStatusText returns 'ON'/'OFF'
-                // (hardcoded uppercase). The .cld's sysMenus has 'On'/'Off' keys → wrap
-                // them in escape sequences so translate() converts them (e.g. 'ON' →
-                // '(sysMenus)[On]' → 'Вкл.'). The translate() hook on drawText then
-                // converts them when the option status is drawn.
                 const options = runtime.Window_Options?.prototype;
                 if (options && typeof options.booleanStatusText === 'function') {
                         const langMenus = language.sysMenus as Record<string, string | string[]> | undefined;
@@ -853,41 +568,23 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         };
                 }
         }
-        // RPG Maker MV's WebAudio._createNodes calls context.createPanner() for
-        // every audio source. nx.js's AudioContext does NOT implement createPanner
-        // (it throws "Method not implemented."). The context may be created DURING
-        // SCRIPT LOADING (the WebAudio constructor calls WebAudio.initialize() →
-        // _createContext() the first time `new WebAudio(url)` runs), which is
-        // BEFORE installGameCompatibility runs. So patching _createContext alone
-        // is too late. Instead, patch _createNodes (the instance method that
-        // actually calls createPanner) to ensure createPanner is overridden on
-        // the context right before it's used — regardless of when the context
-        // was created.
         const audio = runtime.WebAudio;
         if (audio) {
-                // Shared no-op closures (hoisted to avoid per-panner allocation).
                 const NO_OP = () => {};
                 const PANNING_MODEL_DESC = { get: () => 'equalpower', set: NO_OP, configurable: true };
-                // Helper: create a working panner node replacement.
                 const makePanner = (context: any) => {
                         if (context && typeof context.createStereoPanner === 'function') {
                                 try {
                                         const node = context.createStereoPanner();
-                                        // MV calls setPosition(x, y, z) with 3 args; StereoPanner only
-                                        // takes pan (-1..1). Use x as pan, ignore y/z.
                                         node.setPosition = (x: number, _y?: number, _z?: number) => {
                                                 try { node.pan.setValueAtTime(Math.max(-1, Math.min(1, x)), context.currentTime); } catch { /* best-effort */ }
                                         };
                                         node.setVelocity = NO_OP;
                                         node.setOrientation = NO_OP;
-                                        // panningModel is a PannerNode property; StereoPanner doesn't
-                                        // have it. Make it a no-op setter so MV's assignment doesn't throw.
                                         try { Object.defineProperty(node, 'panningModel', PANNING_MODEL_DESC); } catch { /* best-effort */ }
                                         return node;
                                 } catch { /* createStereoPanner exists but throws — fall through */ }
                         }
-                        // Fallback: a GainNode that accepts setPosition() but
-                        // ignores it. Audio passes through without panning.
                         const gain = context && typeof context.createGain === 'function'
                                 ? context.createGain()
                                 : { gain: { value: 1, setValueAtTime: NO_OP }, connect() { return this; }, disconnect() {} };
@@ -897,16 +594,12 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         try { Object.defineProperty(gain, 'panningModel', PANNING_MODEL_DESC); } catch { /* best-effort */ }
                         return gain;
                 };
-                // Install createPanner override on a context (once). The closure
-                // captures `context` so it can be shared across all audio sources
-                // that use that context — no per-source allocation.
                 const installPanner = (context: any) => {
                         if (context && !context.__bnxPannerInstalled) {
                                 context.__bnxPannerInstalled = true;
                                 context.createPanner = () => makePanner(context);
                         }
                 };
-                // Patch _createContext (for contexts created after this point).
                 const create = audio._createContext;
                 if (typeof create === 'function') {
                         audio._createContext = function() {
@@ -914,14 +607,7 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                                 if (this._context) installPanner(this._context);
                         };
                 }
-                // ALSO patch the existing context if it was already created.
                 if (audio._context) installPanner(audio._context);
-                // CRITICAL: Patch _createNodes (instance method) to ensure
-                // createPanner is overridden on the context right before it's
-                // called. This catches the case where the context was created
-                // during script loading (before installGameCompatibility).
-                // installPanner() is idempotent (checks __bnxPannerInstalled),
-                // so calling it per-source is cheap — no closure allocation.
                 const proto = audio.prototype;
                 if (proto?._createNodes) {
                         const origCreateNodes = proto._createNodes;
@@ -944,7 +630,6 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         } catch { this._hasError = true; }
                 };
         }
-        // Anonymous center-screen interaction text has excess empty space in MV.
         const nameBox = runtime.Window_NameBox?.prototype;
         if (nameBox?.adjustPositionY) {
                 const adjust = nameBox.adjustPositionY;

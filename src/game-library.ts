@@ -1,16 +1,7 @@
 import { parseSelection, safeSdPath, type GameSelection, type SaveLocation } from './settings';
 import { parseKeyMap, type KeyMap } from './keymap';
 
-/**
- * A library entry is the persisted, editable description of one added game.
- * It is richer than {@link GameSelection}: it adds an id, display name, an
- * optional cover image path so the library UI can render a thumbnail grid,
- * and an optional per-game keymap that overrides the global default.
- *
- * Cover paths are absolute SD paths (`sdmc:/...`) that point at a regular file.
- * They are not stored as data URLs because the library file is meant to stay
- * small and editable, and because cover images can be large.
- */
+/** Persisted description of one added game: id, name, root, saves, cover, keymap, language. */
 export interface LibraryEntry {
         id: string;
         name: string;
@@ -24,10 +15,7 @@ export interface LibraryEntry {
         keymap?: KeyMap;
         /** ISO timestamp of the last launch. Used for sorting and "recent". */
         lastPlayed?: number;
-        /** Per-game language preference: a .cld code (e.g. 'ru') or '' for
-         *  English (default). Absent = no preference (auto-select first .cld).
-         *  Stored in the library file (SD card), NOT localStorage, so it works
-         *  in forwarder NROs which have saveData=0 (localStorage unavailable). */
+        /** Per-game language preference: a .cld code (e.g. 'ru') or '' for English. */
         language?: string;
 }
 
@@ -57,8 +45,6 @@ export function parseLibrary(text: string): LibraryFile {
                 if (typeof raw.sharedSaves !== 'boolean') throw new Error('Invalid sharedSaves flag');
                 if (raw.mod !== undefined && raw.mod !== null && !safeSdPath(raw.mod)) throw new Error('Invalid mod path');
                 if (raw.cover !== undefined && raw.cover !== null && !safeSdPath(raw.cover)) throw new Error('Invalid cover path');
-                // The per-game keymap is optional but, if present, must be a
-                // valid KeyMap (16 buttons, all known virtual keys).
                 let keymap: KeyMap | undefined;
                 if (raw.keymap !== undefined) {
                         if (raw.keymap === null) throw new Error('Invalid per-game keymap');
@@ -86,8 +72,7 @@ export function parseLibrary(text: string): LibraryFile {
         return file;
 }
 
-/** Stable, URL-safe id derived from the SD path. Two entries with the same root
- * resolve to the same id, which keeps the library deduplicated. */
+/** Stable URL-safe id derived from the SD path; same root → same id for dedup. */
 export function libraryIdFromRoot(root: string): string {
         const clean = root.replace(/\/+$/, '').toLowerCase();
         let hash = 0;
@@ -122,19 +107,16 @@ export interface LibraryAccess {
         mkdirSync(path: string): void;
 }
 
-/** Load the library, or return an empty one. Migrates a legacy settings.json
- * the first time so existing users keep their remembered game. */
+/** Load the library or return an empty one; migrates a legacy settings.json on first load. */
 export function loadLibrary(fs: LibraryAccess): LibraryFile {
         try {
                 const raw = fs.readFileSync(LIBRARY_PATH);
                 if (raw) return parseLibrary(new TextDecoder().decode(raw));
         } catch (error) { /* corrupt or unreadable: fall through and start empty */ }
-        // Migrate the legacy single-game settings file the first time.
         try {
                 const legacy = fs.readFileSync('sdmc:/switch/burialnx/settings.json');
                 if (legacy) {
                         const text = new TextDecoder().decode(legacy);
-                        // parseSelection is intentionally strict; ignore if invalid.
                         const selection = parseSelection(text);
                         const entry = entryFromSelection(selection);
                         const file: LibraryFile = { version: 1, games: [entry], lastPlayed: entry.id };
@@ -145,8 +127,7 @@ export function loadLibrary(fs: LibraryAccess): LibraryFile {
         return { version: 1, games: [] };
 }
 
-/** Write the library atomically. A failure (e.g. read-only SD) is reported
- * through the boolean return value; callers can surface it to the user. */
+/** Write the library atomically; returns false on failure so callers can surface it. */
 export function saveLibrary(fs: LibraryAccess, file: LibraryFile): boolean {
         try {
                 try { fs.mkdirSync('sdmc:/switch/burialnx'); } catch { /* may already exist */ }
@@ -165,10 +146,7 @@ export function upsertGame(fs: LibraryAccess, file: LibraryFile, entry: LibraryE
         return updated;
 }
 
-/** Move a game up (dir=-1) or down (dir=+1) in the library order. The three
- *  action tiles (Add Game, Keymap, Quit) are always at the end and never
- *  move. Swaps the game at the given index with its neighbor. No-op at the
- *  boundaries (first game can't move up, last game can't move down). */
+/** Swap a game up (dir=-1) or down (dir=+1) in library order; no-op at boundaries. */
 export function moveGame(fs: LibraryAccess, file: LibraryFile, id: string, dir: -1 | 1): LibraryFile {
         const index = file.games.findIndex((g) => g.id === id);
         if (index < 0) return file;
