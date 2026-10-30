@@ -36,6 +36,13 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
         const nativeFetch = rawFetch?.__burialnxNativeFetch || rawFetch.bind(globalThis);
         let fitScreen = true;
         let queue: ScriptQueue;
+        // Cached destination rect for host.present() — the game canvas dimensions and
+        // the screen size don't change frame-to-frame, so the viewport math is only
+        // redone on resize / fit toggle / screen change. See docs/doc/browser-host.md.
+        const presentCache = {
+                sw: 0, sh: 0, gw: 0, gh: 0, width: 0, height: 0, fit: false,
+                x: 0, y: 0, w: 0, h: 0, valid: false, fullScreen: false,
+        };
 
         class Node extends EventTarget {
                 children: Node[] = [];
@@ -74,9 +81,18 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 revision = 0;
                 constructor() { super('CANVAS'); }
                 get width() { return this.w; }
-                set width(value: number) { if (this.preserveSize && value === this.w) return; this.w = value; this.revision++; if (this.canvas && !this.direct) this.canvas.width = value; }
+                set width(value: number) {
+                        // Skip same-value resize: assigning canvas.width clears the surface.
+                        if (value === this.w) return;
+                        if (this.preserveSize && value === this.w) return;
+                        this.w = value; this.revision++; if (this.canvas && !this.direct) this.canvas.width = value;
+                }
                 get height() { return this.h; }
-                set height(value: number) { if (this.preserveSize && value === this.h) return; this.h = value; this.revision++; if (this.canvas && !this.direct) this.canvas.height = value; }
+                set height(value: number) {
+                        if (value === this.h) return;
+                        if (this.preserveSize && value === this.h) return;
+                        this.h = value; this.revision++; if (this.canvas && !this.direct) this.canvas.height = value;
+                }
                 surface() {
                         if (!this.canvas) this.canvas = new OffscreenCanvas(Math.max(1, this.w), Math.max(1, this.h));
                         return this.canvas;
@@ -104,39 +120,68 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         if (this.context) return this.context;
                         const target = this.surface().getContext('2d');
                         if (!target) return null;
+                        // Explicit wrapper (pre-bound methods + property accessors) instead of a
+                        // Proxy — avoids per-call trap overhead on every Canvas2D operation.
+                        // See docs/doc/browser-host.md for the rationale.
+                        const owner = this;
                         let pattern: RepeatedPattern | null = null;
                         const saved: (RepeatedPattern | null)[] = [];
-                        const owner = this;
-                        const drawing = new Set(['clearRect', 'strokeRect', 'fillText', 'strokeText', 'putImageData', 'fill', 'stroke']);
-                        const methods = new Map<PropertyKey, Function>();
-                        this.context = new Proxy(target, { get(object, key) {
-                                if (key === 'fillStyle' && pattern) return pattern;
-                                const cached = methods.get(key);
-                                if (cached) return cached;
-                                const value = (object as any)[key];
-                                let method: Function | undefined;
-                                if (key === 'createPattern') method = (image: any, repeat = 'repeat') => {
-                                        const source = image instanceof CanvasNode ? image.surface() : image;
-                                        if (!source?.width || !source?.height) return null;
-                                        return new RepeatedPattern(source, repeat, () => image instanceof CanvasNode ? image.revision : 0);
-                                };
-                                else if (key === 'save') method = () => { saved.push(pattern); object.save(); };
-                                else if (key === 'restore') method = () => { if (saved.length) pattern = saved.pop()!; object.restore(); };
-                                else if (key === 'fillRect') method = (x: number, y: number, w: number, h: number) => {
-                                        owner.revision++;
-                                        return pattern ? pattern.fill(object, x, y, w, h, (width, height) => new OffscreenCanvas(width, height)) : object.fillRect(x, y, w, h);
-                                };
-                                else if (key === 'drawImage') method = (image: any, ...args: any[]) => { owner.revision++; return value.call(object, image instanceof CanvasNode ? image.surface() : image, ...args); };
-                                else if (typeof key === 'string' && drawing.has(key)) method = (...args: any[]) => { owner.revision++; return value.apply(object, args); };
-                                else if (typeof value === 'function') method = value.bind(object);
-                                if (method) { methods.set(key, method); return method; }
-                                return value;
-                        }, set(object, key, value) {
-                                if (key === 'fillStyle' && value instanceof RepeatedPattern) { pattern = value; return true; }
-                                if (key === 'fillStyle') pattern = null;
-                                methods.delete(key);
-                                (object as any)[key] = value; return true;
-                        } });
+                        const ctx: any = {};
+                        const bindNative = (obj: any) => {
+                                if (!obj) return;
+                                for (const key of Object.getOwnPropertyNames(obj)) {
+                                        if (key === 'constructor' || key in ctx) continue;
+                                        let value: any;
+                                        try { value = obj[key]; } catch { continue; }
+                                        if (typeof value === 'function') ctx[key] = value.bind(target);
+                                }
+                        };
+                        bindNative(target);
+                        try { bindNative(Object.getPrototypeOf(target)); } catch { /* best-effort */ }
+                        for (const prop of [
+                                'strokeStyle', 'globalAlpha', 'globalCompositeOperation',
+                                'lineWidth', 'lineCap', 'lineJoin', 'miterLimit', 'lineDashOffset',
+                                'font', 'textAlign', 'textBaseline', 'direction',
+                                'imageSmoothingEnabled', 'imageSmoothingQuality',
+                                'shadowColor', 'shadowBlur', 'shadowOffsetX', 'shadowOffsetY',
+                                'filter', 'webkitFilter',
+                                'webkitImageSmoothingEnabled', 'mozImageSmoothingEnabled',
+                                'oImageSmoothingEnabled', 'msImageSmoothingEnabled',
+                                'webkitBackingStorePixelRatio',
+                        ]) {
+                                Object.defineProperty(ctx, prop, {
+                                        configurable: true, enumerable: true,
+                                        get: () => (target as any)[prop],
+                                        set: (v: any) => { (target as any)[prop] = v; },
+                                });
+                        }
+                        Object.defineProperty(ctx, 'fillStyle', {
+                                configurable: true, enumerable: true,
+                                get: () => pattern || target.fillStyle,
+                                set: (v: any) => { if (v instanceof RepeatedPattern) pattern = v; else { pattern = null; target.fillStyle = v; } },
+                        });
+                        Object.defineProperty(ctx, 'canvas', { configurable: true, enumerable: true, get: () => (target as any).canvas });
+                        ctx.createPattern = function(image: any, repeat = 'repeat') {
+                                const source = image instanceof CanvasNode ? image.surface() : image;
+                                if (!source?.width || !source?.height) return null;
+                                return new RepeatedPattern(source, repeat, () => image instanceof CanvasNode ? image.revision : 0);
+                        };
+                        ctx.save = function() { saved.push(pattern); target.save(); };
+                        ctx.restore = function() { if (saved.length) pattern = saved.pop()!; target.restore(); };
+                        ctx.fillRect = function(x: number, y: number, w: number, h: number) {
+                                owner.revision++;
+                                if (pattern) return pattern.fill(target, x, y, w, h, (width: number, height: number) => new OffscreenCanvas(width, height));
+                                return target.fillRect(x, y, w, h);
+                        };
+                        ctx.drawImage = function(image: any, ...args: any[]) {
+                                owner.revision++;
+                                return target.drawImage(image instanceof CanvasNode ? image.surface() : image, ...args);
+                        };
+                        for (const key of ['clearRect', 'strokeRect', 'fillText', 'strokeText', 'putImageData', 'fill', 'stroke']) {
+                                const fn = (target as any)[key];
+                                if (typeof fn === 'function') ctx[key] = function(...args: any[]) { owner.revision++; return fn.apply(target, args); };
+                        }
+                        this.context = ctx;
                         return this.context;
                 }
                 toDataURL() { return ''; }
@@ -229,13 +274,30 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 toggleFit() { fitScreen = !fitScreen; return fitScreen; },
                 present() {
                         if (!gameCanvas || gameCanvas.direct) return;
-                        const width = fitScreen ? screen.width : Math.min(screen.width, gameCanvas.width);
-                        const height = fitScreen ? screen.height : Math.min(screen.height, gameCanvas.height);
-                        const target = viewport(gameCanvas.width, gameCanvas.height, width, height);
-                        if (!target) return;
-                        target.x += (screen.width - width) / 2; target.y += (screen.height - height) / 2;
-                        screenContext.fillStyle = '#000'; screenContext.fillRect(0, 0, screen.width, screen.height);
-                        screenContext.drawImage(gameCanvas.surface(), 0, 0, gameCanvas.width, gameCanvas.height, target.x, target.y, target.width, target.height);
+                        const sw = screen.width, sh = screen.height;
+                        const gw = gameCanvas.width, gh = gameCanvas.height;
+                        const width = fitScreen ? sw : Math.min(sw, gw);
+                        const height = fitScreen ? sh : Math.min(sh, gh);
+                        if (sw !== presentCache.sw || sh !== presentCache.sh || gw !== presentCache.gw || gh !== presentCache.gh || width !== presentCache.width || height !== presentCache.height || fitScreen !== presentCache.fit) {
+                                const t = viewport(gw, gh, width, height);
+                                if (!t) { presentCache.valid = false; return; }
+                                t.x += (sw - width) / 2; t.y += (sh - height) / 2;
+                                presentCache.x = t.x; presentCache.y = t.y; presentCache.w = t.width; presentCache.h = t.height;
+                                presentCache.sw = sw; presentCache.sh = sh; presentCache.gw = gw; presentCache.gh = gh;
+                                presentCache.width = width; presentCache.height = height; presentCache.fit = fitScreen;
+                                presentCache.fullScreen = (t.x === 0 && t.y === 0 && t.width === sw && t.height === sh);
+                                presentCache.valid = true;
+                        }
+                        if (!presentCache.valid) return;
+                        const dx = presentCache.x, dy = presentCache.y, dw = presentCache.w, dh = presentCache.h;
+                        if (!presentCache.fullScreen) {
+                                screenContext.fillStyle = '#000';
+                                if (dy > 0) screenContext.fillRect(0, 0, sw, dy);
+                                if (dy + dh < sh) screenContext.fillRect(0, dy + dh, sw, sh - (dy + dh));
+                                if (dx > 0) screenContext.fillRect(0, dy, dx, dh);
+                                if (dx + dw < sw) screenContext.fillRect(dx + dw, dy, sw - (dx + dw), dh);
+                        }
+                        screenContext.drawImage(gameCanvas.surface(), 0, 0, gw, gh, dx, dy, dw, dh);
                 },
         };
 }

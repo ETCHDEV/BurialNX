@@ -42,3 +42,10 @@ Controller-only pause-menu overlay state: tracks open/close, current page (main 
 
 ## `step` — language confirm
 > confirm = cycle forward
+
+## `step` — frame skip slider
+> The "Frame skip" item (page 2, between Mouse speed and Select mod)
+> is a slider: Left/Right set `frameSkipDelta` to -1/+1, consumed by
+> the frame loop. A is a no-op (slider-only). The value (0..10)
+> controls how many dirty frames to skip between renders on a stable
+> scene — see `SceneManager.updateMain` in game-compat.ts.

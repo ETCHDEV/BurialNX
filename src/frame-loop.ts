@@ -35,6 +35,15 @@ declare const __DEBUG__: boolean;
 
 const GAME_OPTIONS_BASE_COUNT = 14;
 
+// === FPS optimization (variant F): zero-allocation button scan ============
+function anyPressed(buttons: ArrayLike<{ pressed?: boolean }> | null): boolean {
+        if (!buttons) return false;
+        for (let i = 0, n = buttons.length; i < n; i++) {
+                if (buttons[i]?.pressed) return true;
+        }
+        return false;
+}
+
 export function frame(now: number) {
         try {
                 if (S.exitInProgress) {
@@ -69,7 +78,7 @@ export function frame(now: number) {
                 const edgeC = () => down(mc) && !S.previousButtons[mc];
                 const edgeX = () => down(mx) && !S.previousButtons[mx];
                 if (S.phase === 'library') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 const total = libraryTileCount(S.library, LIBRARY_ACTION_TILES);
                                 if (edge(14)) S.libraryCursor = (S.libraryCursor + total - 1) % total;
@@ -115,7 +124,7 @@ export function frame(now: number) {
                         }
                         renderLibrary();
                 } else if (S.phase === 'game-options') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 const optsCount = GAME_OPTIONS_BASE_COUNT + (S.currentGameLanguages.length > 0 ? 1 : 0);
                                 if (edge(13)) S.gameOptionsCursor = (S.gameOptionsCursor + 1) % optsCount;
@@ -233,7 +242,7 @@ export function frame(now: number) {
                         }
                         renderGameOptions();
                 } else if (S.phase === 'keymap') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 if (S.keymapPicking) {
                                         if (edge(12)) S.keymapPickCursor = findNearestKey(S.keymapPickCursor, 0, -1);
@@ -282,7 +291,7 @@ export function frame(now: number) {
                         }
                         renderKeymap();
                 } else if (S.phase === 'rename-choice') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 if (edge(13)) S.gameOptionsCursor = (S.gameOptionsCursor + 1) % 2;
                                 if (edge(12)) S.gameOptionsCursor = (S.gameOptionsCursor + 2) % 2;
@@ -372,7 +381,7 @@ export function frame(now: number) {
                 } else if (S.phase === 'rename-kb' || S.phase === 'add-game-name') {
                         renderRenameKb();
                 } else if (S.phase === 'rename') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 if (edge(12)) {
                                         const c = S.renameBuffer.charCodeAt(S.renameCursor) || 32;
@@ -398,7 +407,7 @@ export function frame(now: number) {
                         }
                         panel(S.ctx!, ['BurialNX — rename game', `Up/Down: cycle char  Left/Right: move  ${lc}: save  ${lx}: cancel`, `Name: ${S.renameBuffer}`, `Pos: ${S.renameCursor + 1}/${S.renameBuffer.length}`], true);
                 } else if (S.phase === 'picker') {
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease) {
                                 const result = S.browser.step(buttons, mc, mx);
                                 if (result !== undefined) {
@@ -507,7 +516,7 @@ export function frame(now: number) {
                                 ...entryLines], true);
                 } else if (S.phase === 'save-choice') {
                         panel(S.ctx!, ['BurialNX — save location', `${lc}: Switch user save data`, 'X: choose an SD-card folder', 'Y: use the game’s save folder', ...(S.choiceFromMenu ? [`${lx}: cancel`] : ['Select where new saves will be stored.'])], true);
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease && edgeC()) chooseSaves({ kind: 'switch' });
                         else if (!S.waitForRelease && buttons?.[3]?.pressed && !S.previousButtons[3]) { const saveStart = S.saveLocation?.kind === 'sd' ? S.saveLocation.folder : (S.selectedGame?.replace(/\/www$/i, '') || S.selectedGame); S.browser = new FolderBrowser((Switch as any), 'saves', saveStart); S.pickerPurpose = S.choiceFromMenu ? 'menu-saves' : 'startup-saves'; S.waitForRelease = true; S.phase = 'picker'; }
                         else if (!S.waitForRelease && buttons?.[2]?.pressed && !S.previousButtons[2]) { S.waitForRelease = true; S.phase = 'game-save-choice'; }
@@ -515,13 +524,13 @@ export function frame(now: number) {
                 } else if (S.phase === 'game-save-choice') {
                         const folders = gameSaveFolders(S.selectedGame!);
                         panel(S.ctx!, ['BurialNX — use game-folder saves', 'Saves will be written in the game folder. Back them up first.', `${lc}: ${folders[0]}`, ...(folders[1] ? [`X: ${folders[1]}`] : []), `A missing save folder will be created. ${lx}: back.`], true);
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease && edgeC()) chooseSaves({ kind: 'game', folder: folders[0] });
                         else if (!S.waitForRelease && folders[1] && buttons?.[3]?.pressed && !S.previousButtons[3]) chooseSaves({ kind: 'game', folder: folders[1] });
                         else if (!S.waitForRelease && edgeX()) { S.waitForRelease = true; S.phase = 'save-choice'; }
                 } else if (S.phase === 'import-confirm') {
                         panel(S.ctx!, ['BurialNX — Steam saves', `Current destination: ${S.saveLocation && S.saveLocation.kind !== 'switch' ? S.saveLocation.folder : 'Switch user save data'}`, `${lc}: import game-folder Steam saves into this empty location`, `${lx}: skip`, 'Existing saves are never overwritten.'], true);
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease && (edgeC() || edgeX())) {
                                 const wantsImport = edgeC();
                                 if (S.choiceFromMenu) {
@@ -536,7 +545,7 @@ export function frame(now: number) {
                         } else {
                                 renderNoticePopup(S.message);
                         }
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease && (edgeX() || (!S.exitNoticeArmed && edgeC()))) {
                                 S.exitNoticeArmed = false; S.exitArmed = false;
                                 if (S.host) { S.menu.dismiss(); S.phase = 'game'; }
@@ -552,7 +561,7 @@ export function frame(now: number) {
                         }
                 } else if (S.phase === 'error') {
                         panel(S.ctx!, ['BurialNX — game could not start', S.message, __DEBUG__ ? `Details: ${(globalThis as any).__hostLogPath || ''}` : 'Try the debug build for details.', S.exitBehavior === 'restart' ? `Press ${lx} to return to the library.` : `Press ${lx} to exit BurialNX.`], true);
-                        if (S.waitForRelease && !Array.from(buttons || []).some((button) => button.pressed)) S.waitForRelease = false;
+                        if (S.waitForRelease && !anyPressed(buttons)) S.waitForRelease = false;
                         else if (!S.waitForRelease && edgeX()) {
                                 S.waitForRelease = true;
                                 quitApp();
@@ -640,6 +649,13 @@ export function frame(now: number) {
                         if (S.menu.mouseSpeedDelta !== 0) {
                                 S.mouseSpeed = Math.max(1, Math.min(10, S.mouseSpeed + S.menu.mouseSpeedDelta));
                                 try { (Switch as any).writeFileSync('sdmc:/switch/burialnx/mouse-settings.json', JSON.stringify({ speed: S.mouseSpeed })); } catch { /* best-effort */ }
+                                try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                        }
+                        // Frame-skip slider (pause menu → Another…): apply Left/Right delta and persist.
+                        // 0 = render every dirty frame; 1..10 = skip N frames between renders on stable scenes.
+                        if (S.menu.frameSkipDelta !== 0) {
+                                S.frameSkip = Math.max(0, Math.min(10, S.frameSkip + S.menu.frameSkipDelta));
+                                try { (Switch as any).writeFileSync('sdmc:/switch/burialnx/frame-skip-settings.json', JSON.stringify({ frameSkip: S.frameSkip })); } catch { /* best-effort */ }
                                 try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                         }
                         S.host?.present();

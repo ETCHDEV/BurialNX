@@ -522,3 +522,49 @@ The compatibility shim that adapts a stock RPG Maker MV game (specifically *The 
 ## `installGameCompatibility` — name box / message window layout
 
 > // Anonymous center-screen interaction text has excess empty space in MV.
+
+## `installGameCompatibility` — render-cost optimizations
+
+> The wrappers below reduce per-frame work on the CPU CanvasRenderer
+> path (nx.js has no WebGL for OffscreenCanvas, and the screen's
+> WebGL2 is blocked by the 2D context BurialNX holds for its UI).
+> None of them touch game assets or scripts — they wrap runtime
+> objects after the game loads. See docs/doc/fps-optimizations.md for
+> the full rationale and revert steps.
+
+## `WindowLayer.renderCanvas` — skip temp-canvas when no windows
+
+> The stock method allocates/clears a full-screen temp canvas, clips,
+> and blits it back for every layer every frame. When no window is
+> visible that is pure waste (~3.2M pixel ops per layer). The wrapper
+> counts visible windows first; if none, it renders only non-window
+> children directly and skips the temp-canvas dance entirely.
+
+## `Window._refreshFrame` / `_refreshCursor` — Bitmap reuse
+
+> Stock creates a new `Bitmap` (→ new `OffscreenCanvas` → new Skia
+> GPU surface) on every refresh. The wrappers reuse the sprite's
+> existing `Bitmap` when the dimensions haven't changed (`clearRect`
+> in place), only allocating a new `Bitmap` when the size actually
+> changes. This eliminated the canvas-churn that was growing the
+> canvas counter ~100 over 30 s of gameplay.
+
+## `Graphics._createRenderer` — raise textureGC.maxIdle
+
+> Stock sets `textureGC.maxIdle = 1` (free any texture unused for a
+> single frame). The wrapper raises it to 600 (10 s at 60 fps) so
+> recently-used textures stay hot. No-op on `CanvasRenderer` (no
+> `textureGC`); applies when WebGL is on.
+
+## `SceneManager.updateMain` — accumulator cap + dirty-flag render-skip
+
+> Caps the fixed-timestep accumulator to 2 update steps per rAF tick
+> (stock allows up to 15, which spirals on a slow frame) and skips
+> `renderScene` when nothing on screen changed (PIXI v4 redraws the
+> whole graph every frame). Dirty sources: player movement, map
+> scroll, message busy/content index, choice cursor, timer,
+> animations, scene transitions, scene children count. A 250 ms
+> fallback render keeps cursor blink / auto-tile animations live.
+> `S.frameSkip` (0..10) adds a user-adjustable extra skip on stable
+> scenes. See docs/doc/fps-optimizations.md for the dirty-source list
+> and revert steps.

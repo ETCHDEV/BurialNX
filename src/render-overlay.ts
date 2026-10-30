@@ -57,7 +57,7 @@ export function renderPauseMenu(): void {
         const letters = menuLetters();
         const topBar = `BurialNX  |  Up/Down: select  ${letters.confirm}: choose  ${letters.cancel}: back/close`
                 + (S.menu.fps ? `  |  ${S.fps.toFixed(1)} FPS` : '');
-        const maxItems = __DEBUG__ ? 10 : 8;
+        const maxItems = __DEBUG__ ? 11 : 9;
         const itemH = 26;
         const topH = 30;
         const padding = 12;
@@ -108,6 +108,23 @@ export function renderPauseMenu(): void {
                         S.ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
                         S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
                         S.ctx.fillText(`${S.mouseSpeed}/10`, barX + barW + 12, y);
+                } else if (items[i] === 'frameSkip') {
+                        // Slider: 0..10 — how many frames to skip between renders on a stable scene.
+                        S.ctx.fillText(prefix + 'Frame skip', panelX + padding, y);
+                        const barX = panelX + padding + 190;
+                        const barY = y - 16;
+                        const barW = 180;
+                        const barH = 14;
+                        const filled = Math.round((barW * S.frameSkip) / 10);
+                        S.ctx.fillStyle = '#3a3f4b';
+                        S.ctx.fillRect(barX, barY, barW, barH);
+                        S.ctx.fillStyle = '#39d0d8';
+                        S.ctx.fillRect(barX, barY, filled, barH);
+                        S.ctx.strokeStyle = '#565f8d';
+                        S.ctx.lineWidth = 1;
+                        S.ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
+                        S.ctx.fillStyle = isSel ? '#3fb950' : '#c9cdd6';
+                        S.ctx.fillText(`${S.frameSkip}/10`, barX + barW + 12, y);
                 } else {
                         S.ctx.fillText(prefix + labels[items[i]], panelX + padding, y);
                 }

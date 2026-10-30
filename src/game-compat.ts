@@ -508,12 +508,28 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 };
         }
         const layer = runtime.WindowLayer?.prototype;
-        if (layer?.renderCanvas) {
-                const render = layer.renderCanvas;
-                layer.renderCanvas = function() {
+        if (layer?.renderCanvas && !layer.__bnxOptimized) {
+                layer.__bnxOptimized = true;
+                const origRenderCanvas = layer.renderCanvas;
+                layer.renderCanvas = function(renderer: any) {
+                        if (!this.visible || !this.renderable) return;
+                        // Count visible windows — if none, skip the entire temp-canvas dance
+                        // (clearRect 1600x1000 + clip + drawImage 1600x1000 back). On a map with
+                        // no open menus this is pure waste: ~3.2M pixel ops per WindowLayer/frame.
+                        let visibleWindows = 0;
+                        for (let i = 0; i < this.children.length; i++) {
+                                const c = this.children[i];
+                                if (c._isWindow && c.visible && c.openness > 0) visibleWindows++;
+                        }
+                        if (visibleWindows === 0) {
+                                for (let j = 0; j < this.children.length; j++) {
+                                        if (!this.children[j]._isWindow) this.children[j].renderCanvas(renderer);
+                                }
+                                return;
+                        }
                         const canvas = this._tempCanvas;
                         if (canvas) canvas.preserveSize = true;
-                        try { return render.apply(this, arguments); }
+                        try { return origRenderCanvas.apply(this, arguments); }
                         finally { if (canvas) canvas.preserveSize = false; }
                 };
         }
@@ -733,6 +749,185 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                                 state.y += interactionTextY(this.contents?.height, height, 0);
                         }
                         return result;
+                };
+        }
+
+        // === Render-cost optimizations =============================================
+        // The wrappers below reduce per-frame work on the CPU CanvasRenderer path
+        // (nx.js has no WebGL for OffscreenCanvas, and the screen's WebGL2 is blocked
+        // by the 2D context BurialNX holds for its UI). None of them touch game assets
+        // or scripts — they wrap runtime objects after the game loads. See
+        // docs/doc/fps-optimizations.md for the full rationale and revert steps.
+
+        // --- Window._refreshFrame / _refreshCursor: reuse Bitmap ------------------
+        // Stock creates a new Bitmap (→ new OffscreenCanvas → new Skia surface) on
+        // every refresh. Reuse the sprite's existing Bitmap when the size is unchanged;
+        // only allocate a new one when the dimensions actually change.
+        const WinProto = runtime.Window?.prototype;
+        const BitmapClass = runtime.Bitmap;
+        if (WinProto && BitmapClass && typeof WinProto._refreshFrame === 'function' && !WinProto.__bnxFrameReuse) {
+                WinProto.__bnxFrameReuse = true;
+                WinProto._refreshFrame = function() {
+                        const w = this._width, h = this._height;
+                        const sprite = this._windowFrameSprite;
+                        const existing = sprite?.bitmap;
+                        if (existing && existing.width === w && existing.height === h) {
+                                existing.clearRect(0, 0, w, h);
+                        } else {
+                                const bitmap = new BitmapClass(w, h);
+                                sprite.bitmap = bitmap;
+                                sprite.setFrame(0, 0, w, h);
+                        }
+                        const m = 24;
+                        if (w > 0 && h > 0 && this._windowskin) {
+                                const bitmap = sprite.bitmap;
+                                const skin = this._windowskin;
+                                const p = 96, q = 96;
+                                bitmap.blt(skin, p+m, 0, p-m*2, m, 0, w-m*2, m);
+                                bitmap.blt(skin, p+m, q-m, p-m*2, m, m, h-m, w-m*2, m);
+                                bitmap.blt(skin, p, m, m, p-m*2, 0, m, m, h-m*2);
+                                bitmap.blt(skin, p+q-m, m, m, p-m*2, w-m, m, m, h-m*2);
+                                bitmap.blt(skin, p, 0, m, m, 0, 0, m, m);
+                                bitmap.blt(skin, p+q-m, 0, m, m, w-m, 0, m, m);
+                                bitmap.blt(skin, p, q-m, m, m, 0, h-m, m, m);
+                                bitmap.blt(skin, p+q-m, q-m, m, m, w-m, h-m, m, m);
+                        }
+                };
+                WinProto._refreshCursor = function() {
+                        const pad = this._padding;
+                        const x = this._cursorRect.x + pad - this.origin.x;
+                        const y = this._cursorRect.y + pad - this.origin.y;
+                        const w = this._cursorRect.width;
+                        const h = this._cursorRect.height;
+                        const m = 4;
+                        const x2 = Math.max(x, pad);
+                        const y2 = Math.max(y, pad);
+                        const ox = x - x2;
+                        const oy = y - y2;
+                        const w2 = Math.min(w, this._width - pad - x2);
+                        const h2 = Math.min(h, this._height - pad - y2);
+                        const sprite = this._windowCursorSprite;
+                        const existing = sprite?.bitmap;
+                        if (existing && existing.width === w2 && existing.height === h2) {
+                                existing.clearRect(0, 0, w2, h2);
+                        } else {
+                                const bitmap = new BitmapClass(w2, h2);
+                                sprite.bitmap = bitmap;
+                                sprite.setFrame(0, 0, w2, h2);
+                        }
+                        sprite.move(x2, y2);
+                        if (w > 0 && h > 0 && this._windowskin) {
+                                const bitmap = sprite.bitmap;
+                                const skin = this._windowskin;
+                                const p = 96, q = 48;
+                                bitmap.blt(skin, p+m, p+m, q-m*2, q-m*2, ox+m, oy+m, w-m*2, h-m*2);
+                                bitmap.blt(skin, p+m, p, q-m*2, m, ox+m, oy, w-m*2, m);
+                                bitmap.blt(skin, p+m, p+q-m, q-m*2, m, ox+m, oy+h-m, w-m*2, m);
+                                bitmap.blt(skin, p, p+m, m, q-m*2, ox, oy+m, m, h-m*2);
+                                bitmap.blt(skin, p+q-m, p+m, m, q-m*2, ox+w-m, oy+m, m, h-m*2);
+                                bitmap.blt(skin, p, p, m, m, ox, oy, m, m);
+                                bitmap.blt(skin, p+q-m, p, m, m, ox+w-m, oy, m, m);
+                                bitmap.blt(skin, p, p+q-m, m, m, ox, oy+h-m, m, m);
+                                bitmap.blt(skin, p+q-m, p+q-m, m, m, ox+w-m, oy+h-m, m, m);
+                        }
+                };
+        }
+
+        // --- Renderer tuning (textureGC maxIdle; no-op on CanvasRenderer) -----------
+        const graphics = runtime.Graphics;
+        if (graphics && typeof graphics._createRenderer === 'function' && !graphics.__bnxRendererTune) {
+                graphics.__bnxRendererTune = true;
+                const origCreateRenderer = graphics._createRenderer;
+                graphics._createRenderer = function() {
+                        origCreateRenderer.apply(this, arguments);
+                        const renderer = this._renderer;
+                        if (!renderer) return;
+                        if (renderer.textureGC && typeof renderer.textureGC.maxIdle === 'number') {
+                                renderer.textureGC.maxIdle = 600;
+                        }
+                };
+        }
+
+        // --- SceneManager.updateMain: accumulator cap + dirty-flag render-skip ----
+        // Caps the fixed-timestep accumulator to 2 update steps per rAF tick (stock
+        // allows up to 15, which spirals on a slow frame) and skips renderScene when
+        // nothing on screen changed (PIXI v4 redraws the whole graph every frame).
+        // S.frameSkip (0..10) adds a user-adjustable extra skip on stable scenes.
+        // See docs/doc/fps-optimizations.md for the dirty-source list and revert steps.
+        const sceneManager = runtime.SceneManager;
+        if (sceneManager && typeof sceneManager.updateMain === 'function' && !sceneManager.__bnxFrameskipWrap) {
+                sceneManager.__bnxFrameskipWrap = true;
+                const origUpdateMain = sceneManager.updateMain;
+                let lastPlayerX = NaN, lastPlayerY = NaN;
+                let lastDispX = NaN, lastDispY = NaN;
+                let lastMsgBusy = false;
+                let lastMsgIndex = -1;
+                let lastChoiceIndex = -1;
+                let lastSceneRef: any = null;
+                let lastChildrenCount = -1;
+                let lastRenderTime = 0;
+                let stableSkipCount = 0;
+                sceneManager.updateMain = function() {
+                        if (runtime.Utils?.isMobileSafari?.()) return origUpdateMain.apply(this, arguments);
+                        if (typeof this._deltaTime !== 'number' || this._deltaTime <= 0) return origUpdateMain.apply(this, arguments);
+                        if (typeof this._getTimeInMsWithoutMobileSafari !== 'function') return origUpdateMain.apply(this, arguments);
+                        const newTime = this._getTimeInMsWithoutMobileSafari();
+                        let fTime = (newTime - this._currentTime) / 1000;
+                        if (fTime > 0.25) fTime = 0.25;
+                        if (fTime < 0) fTime = 0;
+                        this._currentTime = newTime;
+                        this._accumulator += fTime;
+                        const maxAccum = this._deltaTime * 2;
+                        if (this._accumulator > maxAccum) this._accumulator = maxAccum;
+                        while (this._accumulator >= this._deltaTime) {
+                                this.updateInputData();
+                                this.changeScene();
+                                this.updateScene();
+                                this._accumulator -= this._deltaTime;
+                        }
+                        const scene = this._scene;
+                        const player = runtime.$gamePlayer;
+                        const map = runtime.$gameMap;
+                        const msg = runtime.$gameMessage;
+                        const temp = runtime.$gameTemp;
+                        const animCount = (temp?._animationQueue?.length || 0) + (temp?._balloonQueue?.length || 0);
+                        const msgBusy = !!(msg && msg.isBusy && msg.isBusy());
+                        const msgWindow = scene?._messageWindow;
+                        const msgIndex = msgWindow ? (msgWindow._index ?? 0) + (msgWindow._textState?.index ?? 0) + (msgWindow._waitCount ?? 0) : 0;
+                        const choiceIndex = msg && msg._choiceCallCallback ? (msgWindow?._choiceList?.length || 0) : -1;
+                        const timerWorking = !!(runtime.$gameTimer && runtime.$gameTimer._working);
+                        const sceneChanged = scene !== lastSceneRef;
+                        const childrenChanged = scene && scene.children && scene.children.length !== lastChildrenCount;
+                        const playerMoved = player && (player._realX !== lastPlayerX || player._realY !== lastPlayerY);
+                        const mapScrolled = map && (map._displayX !== lastDispX || map._displayY !== lastDispY);
+                        const transitioning = !scene || !this._sceneStarted || this._nextScene || this._stopped;
+                        const dirty = sceneChanged || childrenChanged || playerMoved || mapScrolled
+                                || msgBusy !== lastMsgBusy || msgBusy
+                                || msgIndex !== lastMsgIndex || choiceIndex !== lastChoiceIndex
+                                || timerWorking || animCount > 0 || transitioning;
+                        lastSceneRef = scene;
+                        lastChildrenCount = scene?.children?.length ?? -1;
+                        if (player) { lastPlayerX = player._realX; lastPlayerY = player._realY; }
+                        if (map) { lastDispX = map._displayX; lastDispY = map._displayY; }
+                        lastMsgBusy = msgBusy;
+                        lastMsgIndex = msgIndex;
+                        lastChoiceIndex = choiceIndex;
+                        const fallbackDue = (newTime - lastRenderTime) >= 250;
+                        const renderNow = dirty || fallbackDue;
+                        // S.frameSkip: on a stable scene, skip N dirty frames between renders.
+                        if (renderNow && S.frameSkip > 0 && !fallbackDue && !msgBusy && !transitioning) {
+                                stableSkipCount++;
+                                if (stableSkipCount <= S.frameSkip) {
+                                        this.requestUpdate();
+                                        return;
+                                }
+                                stableSkipCount = 0;
+                        }
+                        if (renderNow) {
+                                this.renderScene();
+                                lastRenderTime = newTime;
+                        }
+                        this.requestUpdate();
                 };
         }
 }

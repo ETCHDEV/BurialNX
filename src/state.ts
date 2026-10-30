@@ -111,6 +111,10 @@ export interface AppState {
         /** Mouse-speed slider value (1..10). Effective speed = MOUSE_SPEED × (mouseSpeed × 0.3) × ramp.
          *  Default 5 → multiplier 1.5. Adjusted in the pause menu under "Another…". */
         mouseSpeed: number;
+        /** Frame-skip slider value (0..10). 0 = render every dirty frame; 1..10 = on a stable
+         *  scene, skip N frames between renders (extra throttle for low-intensity movement).
+         *  Adjusted in the pause menu under "Another…" → "Frame skip". Default 0. */
+        frameSkip: number;
 }
 
 /** Construct the singleton state object shared across every loader module. */
@@ -211,6 +215,7 @@ export function createState(debug: boolean): AppState {
                 mouseRmbDown: false,
                 mouseVisible: false,
                 mouseSpeed: 5,
+                frameSkip: 0,
         };
 }
 

@@ -449,3 +449,15 @@ The single `requestAnimationFrame`-driven frame dispatcher for BurialNX. Reads g
 > // (esbuild would tree-shake this anyway, but the explicit helper makes
 > // the intent clear: the frame loop reads them at call time when the user
 > // actually binds a key in the keyboard picker).
+
+## `anyPressed` (module-scope helper)
+> Zero-allocation replacement for `Array.from(buttons).some((b) => b.pressed)`
+> — a plain indexed loop over the gamepad buttons, used at 12 call sites
+> (one per phase) on the hot `waitForRelease` path. The original allocated
+> a new array AND a closure every frame; this allocates nothing.
+
+## `frame` — frame skip delta
+> The "Frame skip" pause-menu slider sets `S.menu.frameSkipDelta` to -1/+1;
+> the frame loop applies it to `S.frameSkip` (clamped 0..10) and persists
+> the value to `sdmc:/switch/burialnx/frame-skip-settings.json`. The value
+> is read by the `SceneManager.updateMain` wrapper in game-compat.ts.

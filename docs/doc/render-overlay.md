@@ -131,3 +131,9 @@ Three modal-style overlay renderers (pause menu, quit dialog, notice popup) that
 > success/info notice is dismissed by the same button the game
 > uses for 'ok' (both confirm and cancel dismiss a non-exit
 > notice, but the hint reads more naturally as confirm/OK).
+
+## `renderPauseMenu` — frame skip slider
+> Rendered identically to the Mouse speed slider: label + horizontal
+> bar (filled proportionally to `frameSkip/10`) + numeric
+> `${frameSkip}/10`. The `maxItems` count grew by 1 (8→9 release,
+> 10→11 debug) to fit the new item between Mouse speed and Select mod.

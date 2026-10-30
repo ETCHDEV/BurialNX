@@ -77,3 +77,11 @@ A single typed bag (`AppState`) holding every `let` that used to live at the top
 ## Type re-exports
 > Re-export the types this module's callers commonly need so they don't
 > each have to import them from three different files.
+
+## `frameSkip` (AppState field)
+> User-adjustable slider (0..10), default 0. On a stable scene, the
+> `SceneManager.updateMain` wrapper (see game-compat.ts) skips N dirty
+> frames between renders when this is > 0. 0 = render every dirty
+> frame (dirty-flag still skips static frames). Persisted to
+> `sdmc:/switch/burialnx/frame-skip-settings.json` and loaded at startup
+> in main.ts. Adjusted in the pause menu under "Another…" → "Frame skip".

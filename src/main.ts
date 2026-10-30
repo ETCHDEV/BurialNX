@@ -113,6 +113,15 @@ try {
         }
 } catch { /* defaults to 5 */ }
 
+// Load the persisted frame-skip slider value (pause menu → Another…). Default 0.
+try {
+        const raw = Switch.readFileSync('sdmc:/switch/burialnx/frame-skip-settings.json');
+        if (raw) {
+                const value = JSON.parse(new TextDecoder().decode(raw));
+                if (typeof value?.frameSkip === 'number') S.frameSkip = Math.max(0, Math.min(10, Math.round(value.frameSkip)));
+        }
+} catch { /* defaults to 0 */ }
+
 try {
         if (S.library.lastPlayed) {
                 const idx = S.library.games.findIndex((g) => g.id === S.library.lastPlayed);
