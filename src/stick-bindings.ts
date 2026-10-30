@@ -1,5 +1,5 @@
 /** Analog stick + face-button bindings: per-frame polling and synthetic keyup/keydown dispatch. */
-import type { KeyMap, VirtualKey } from './keymap';
+import { isMouseAction, type KeyMap, type VirtualKey } from './keymap';
 import type { LibraryEntry } from './game-library';
 
 const prevStickDirActive: Record<string, boolean> = {};
@@ -63,6 +63,7 @@ export function pollStickBindings(currentEntry: LibraryEntry | null, globalKeyma
         for (const name of dirNames) {
                 const binding = s[name as keyof typeof s];
                 if (!binding || binding.keyCode === 0) continue;
+                if (isMouseAction(binding.vkey)) continue;   // mouse-bound sticks handled by pollMouseInput
                 const active = dirActive[name];
                 const wasActive = !!prevStickDirActive[name];
                 if (active && !wasActive) {
@@ -84,8 +85,10 @@ export function pollStickBindings(currentEntry: LibraryEntry | null, globalKeyma
         for (const name of dirNames) {
                 const binding = s[name as keyof typeof s];
                 if (!binding || binding.keyCode !== 0) continue;
+                if (isMouseAction(binding.vkey)) continue;   // mouse-bound sticks handled by pollMouseInput
                 const active = dirActive[name];
-                vkeyActive.set(binding.label, (vkeyActive.get(binding.label) || false) || active);
+                const vk = binding.vkey || binding.label;
+                vkeyActive.set(vk, (vkeyActive.get(vk) || false) || active);
         }
         for (const [vkey, active] of vkeyActive) {
                 if (active) {
@@ -95,7 +98,9 @@ export function pollStickBindings(currentEntry: LibraryEntry | null, globalKeyma
                         for (const name of dirNames) {
                                 const binding = s[name as keyof typeof s];
                                 if (!binding || binding.keyCode !== 0) continue;
-                                if (binding.label === vkey && prevStickDirActive[name]) { justReleased = true; break; }
+                                if (isMouseAction(binding.vkey)) continue;
+                                const vk = binding.vkey || binding.label;
+                                if (vk === vkey && prevStickDirActive[name]) { justReleased = true; break; }
                         }
                         if (justReleased) input._currentState[vkey] = false;
                 }

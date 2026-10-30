@@ -9,6 +9,7 @@ import { renderQuitDialog, renderNoticePopup, hud } from './render-overlay';
 import { diagnoseScene } from './diagnostics';
 import { overrideKeymapForSaveLoadScene, isSaveLoadKeymapActive } from './save-load-keymap';
 import { pollButtonBindings } from './stick-bindings';
+import { pollMouseInput, renderMouseCursor, hasMouseMovementBinding } from './mouse-input';
 import { libraryTileCount, libraryNavigateRow } from './library-nav';
 import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection } from './selection';
 import { getAllPickKeys, findNearestKey } from './keymap-layout';
@@ -248,7 +249,7 @@ export function frame(now: number) {
                                                                 const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
                                                                 const dir = stickDirs[S.keymapCursor - 16];
                                                                 if (!S.editingKeymap.sticks) S.editingKeymap.sticks = {};
-                                                                S.editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label };
+                                                                S.editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label, vkey: def.vkey };
                                                         }
                                                         saveEditingKeymap();
                                                         S.keymapPicking = false;
@@ -561,6 +562,11 @@ export function frame(now: number) {
                         diagnoseScene(now, S.runtime, S.fps, log, snapshotRuntimeLog);
                         overrideKeymapForSaveLoadScene(log, S.currentEntry, S.globalKeymap);
                         if (!isSaveLoadKeymapActive()) pollButtonBindings(S.currentEntry, S.globalKeymap);
+                        // Virtual mouse cursor: poll joycon→mouse bindings and dispatch synthetic
+                        // TouchInput events. Suppressed during save/load scenes (where the gamepadMapper
+                        // is overridden to A/B ok/cancel) and while the pause menu blocks game input.
+                        try { S.mouseVisible = hasMouseMovementBinding(mergedKeymap()); } catch { S.mouseVisible = false; }
+                        if (!isSaveLoadKeymapActive() && !S.menu.blocksInput) pollMouseInput(S.currentEntry, S.globalKeymap);
                         if (now - S.lastMemoryCheck >= 5000) {
                                 S.lastMemoryCheck = now;
                                 try {
@@ -593,7 +599,7 @@ export function frame(now: number) {
                                                         seededKm.sticks = {};
                                                         for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                                                                 const b = S.globalKeymap.sticks[dir];
-                                                                if (b) seededKm.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                                                                if (b) seededKm.sticks[dir] = { keyCode: b.keyCode, label: b.label, vkey: b.vkey };
                                                         }
                                                 }
                                                 const seeded: any = { ...S.currentEntry, keymap: seededKm };
@@ -630,8 +636,17 @@ export function frame(now: number) {
                                 S.activeLanguageCode = nextCode;
                                 log(`Language set to ${nextCode || 'English (default)'}; applies on next launch.`);
                         }
+                        // Mouse-speed slider (pause menu → Another…): apply Left/Right delta and persist.
+                        if (S.menu.mouseSpeedDelta !== 0) {
+                                S.mouseSpeed = Math.max(1, Math.min(10, S.mouseSpeed + S.menu.mouseSpeedDelta));
+                                try { (Switch as any).writeFileSync('sdmc:/switch/burialnx/mouse-settings.json', JSON.stringify({ speed: S.mouseSpeed })); } catch { /* best-effort */ }
+                                try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
+                        }
                         S.host?.present();
                         if (S.menu.blocksInput || !S.host?.direct()) hud();
+                        // Draw the virtual mouse cursor on top of the game frame + HUD.
+                        // Hidden while the pause menu is open (it uses d-pad navigation).
+                        if (S.mouseVisible && !S.menu.blocksInput) renderMouseCursor(S.ctx);
                 }
                 const plusDown = down(9);
                 const plusBlocked = S.phase === 'notice' || S.phase === 'rename-kb' || S.phase === 'add-game-name' || S.phase === 'rename-choice' || S.phase === 'forwarder-building' || S.phase === 'loading';

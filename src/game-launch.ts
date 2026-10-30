@@ -102,7 +102,18 @@ export async function launch() {
                 setLoadingProgress(0.92, 'Settling runtime…');
                 await S.host.settled();
                 setLoadingProgress(0.95, 'Installing compatibility…');
-                installGameCompatibility(S.runtime, S.selectedGame, S.sharedSaves, language, pngFix, mergedKeymap());
+                const km0 = mergedKeymap();
+                const btnSummary = km0.buttons.map((b: string, i: number) => b !== 'none' ? `${i}=${b}` : null).filter(Boolean).join(' ');
+                log(`_keymap: buttons = ${btnSummary}`);
+                const stickDirs = ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const;
+                const stickSummary = stickDirs.filter(d => km0.sticks?.[d]).map(d => `${d}=${km0.sticks![d].vkey || km0.sticks![d].label}`).join(' ');
+                log(`_keymap: sticks = ${stickSummary || '(none)'}`);
+                const mouseBtns = km0.buttons.map((b: string, i: number) => {
+                        const isMouse = b === 'mup' || b === 'mdown' || b === 'mleft' || b === 'mright' || b === 'lmb' || b === 'rmb';
+                        return isMouse ? `${i}=${b}` : null;
+                }).filter(Boolean).join(' ');
+                log(`_keymap: mouse buttons = ${mouseBtns || '(none)'}`);
+                installGameCompatibility(S.runtime, S.selectedGame, S.sharedSaves, language, pngFix, km0);
                 if (languagePack) {
                         try { await registerLanguageFont(S.runtime, languagePack); }
                         catch (fontError) { log(`Language font install failed: ${fontError instanceof Error ? fontError.message : String(fontError)}`); }

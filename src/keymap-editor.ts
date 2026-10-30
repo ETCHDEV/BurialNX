@@ -33,7 +33,7 @@ export function mergedKeymap(): KeyMap {
                 const sticks: NonNullable<KeyMap['sticks']> = {};
                 for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                         const b = perSticks?.[dir] ?? baseSticks?.[dir];
-                        if (b) sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                        if (b) sticks[dir] = { keyCode: b.keyCode, label: b.label, vkey: b.vkey };
                 }
                 result.sticks = sticks;
         }
@@ -50,7 +50,7 @@ export function applyPreset(index: number) {
                 S.editingKeymap.sticks = {};
                 for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                         const b = savedSticks[dir];
-                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label, vkey: b.vkey };
                 }
         }
         saveEditingKeymap();
@@ -99,7 +99,7 @@ export function openKeymapEditor(target: 'global' | LibraryEntry) {
                 S.editingKeymap.sticks = {};
                 for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                         const b = source.sticks[dir];
-                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label, vkey: b.vkey };
                 }
         }
         S.keymapCursor = 0;
@@ -133,7 +133,7 @@ export function handleKeymapTouch(px: number, py: number): void {
                                                 const stickDirs = ['lUp', 'lDown', 'lLeft', 'lRight', 'rUp', 'rDown', 'rLeft', 'rRight'] as const;
                                                 const dir = stickDirs[S.keymapCursor - 16];
                                                 if (!S.editingKeymap.sticks) S.editingKeymap.sticks = {};
-                                                S.editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label };
+                                                S.editingKeymap.sticks[dir] = { keyCode: def.keyCode || 0, label: def.label, vkey: def.vkey };
                                         }
                                         saveEditingKeymap();
                                         S.keymapPicking = false;

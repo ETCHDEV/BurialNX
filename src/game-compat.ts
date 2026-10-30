@@ -1,8 +1,10 @@
 import type { Reader } from './library';
 import type { KeyMap } from './keymap';
-import { applyKeyMap } from './keymap';
+import { applyKeyMap, isMouseAction } from './keymap';
 import { interactionTextY } from './dialogue';
 import { fixIndexedPng } from './indexed-png';
+import { S } from './state';
+import { log } from './log';
 
 /** Strip desktop-only plugin payloads and the top-level 'use strict' directive so indirect eval matches a <script> tag. */
 export function prepareGameScript(path: string, source: string): string | null {
@@ -403,6 +405,77 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                 else runtime.Input.gamepadMapper = {
                         0: 'cancel', 1: 'ok', 2: 'shift', 3: 'menu', 4: 'pageup', 5: 'pagedown', 9: 'menu',
                         12: 'up', 13: 'down', 14: 'left', 15: 'right',
+                };
+        }
+        // Fix Graphics.pageToCanvasX/Y: RPG Maker MV 1.6+ uses canvas.offsetLeft +
+        // _realScale, but the browser-host CanvasNode has no offsetLeft/offsetTop and
+        // _realScale doesn't match host.present()'s fit scaling → pageToCanvasX returns
+        // NaN → isInsideCanvas(NaN,NaN) is always false → _onLeftButtonDown silently
+        // drops the click, and _onMouseMove sets _x/_y to NaN → hover breaks.
+        // Override to compute the exact screen→game-canvas mapping that host.present()
+        // + viewport() use (fit: scale=min(sw/gw,sh/gh), centered; native: 1:1, centered).
+        if (runtime.Graphics) {
+                const gfx = runtime.Graphics;
+                gfx.pageToCanvasX = function(x: number) {
+                        const sw = (screen as any).width || 1280;
+                        const sh = (screen as any).height || 720;
+                        const gw = gfx._width || sw, gh = gfx._height || sh;
+                        const fit = S.host ? S.fit : true;
+                        if (fit) {
+                                const scale = Math.min(sw / gw, sh / gh);
+                                const off = (sw - gw * scale) / 2;
+                                return Math.round((x - off) / scale);
+                        } else {
+                                const drawW = Math.min(sw, gw);
+                                const off = (sw - drawW) / 2;
+                                return Math.round(x - off);
+                        }
+                };
+                gfx.pageToCanvasY = function(y: number) {
+                        const sw = (screen as any).width || 1280;
+                        const sh = (screen as any).height || 720;
+                        const gw = gfx._width || sw, gh = gfx._height || sh;
+                        const fit = S.host ? S.fit : true;
+                        if (fit) {
+                                const scale = Math.min(sw / gw, sh / gh);
+                                const off = (sh - gh * scale) / 2;
+                                return Math.round((y - off) / scale);
+                        } else {
+                                const drawH = Math.min(sh, gh);
+                                const off = (sh - drawH) / 2;
+                                return Math.round(y - off);
+                        }
+                };
+        }
+        // Replace Input._updateGamepadState so the analog stick axes are NEVER converted
+        // to virtual D-pad buttons (12-15). The original RPG Maker MV implementation reads
+        // axes[0]/[1] and sets newState[12..15] accordingly, which leaks stick movement
+        // into the game as direction input even when the user bound the stick to mouse or
+        // keyboard control. The replacement below only reads physical button states and
+        // dispatches them via gamepadMapper (set by applyKeyMap) — stick movement reaches
+        // the game exclusively through pollStickBindings (keyboard) and pollMouseInput
+        // (mouse), which are the user's configured bindings. Buttons set to 'none' in the
+        // keymap have no gamepadMapper entry, so they are truly silent.
+        if (runtime.Input && !runtime.Input.__bnxGamepadPatched) {
+                runtime.Input.__bnxGamepadPatched = true;
+                runtime.Input._updateGamepadState = function(gamepad: any) {
+                        if (!gamepad) return;
+                        var lastState = this._gamepadStates[gamepad.index] || [];
+                        var newState = [];
+                        var buttons = gamepad.buttons;
+                        newState[12] = false; newState[13] = false; newState[14] = false; newState[15] = false;
+                        for (var i = 0; buttons && i < buttons.length; i++) {
+                                newState[i] = !!(buttons[i] && buttons[i].pressed);
+                        }
+                        for (var j = 0; j < newState.length; j++) {
+                                if (newState[j] !== lastState[j]) {
+                                        var buttonName = this.gamepadMapper[j];
+                                        if (buttonName) {
+                                                this._currentState[buttonName] = newState[j];
+                                        }
+                                }
+                        }
+                        this._gamepadStates[gamepad.index] = newState;
                 };
         }
         const doc = runtime.document;

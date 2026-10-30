@@ -7,7 +7,7 @@ export const KEYMAP_CELL_W = 280, KEYMAP_CELL_H = 85, KEYMAP_CELL_GAP = 8;
 export const KEYMAP_GRID_START_Y = 108;
 export const KEYMAP_KB_SCALE = 55;
 export const KEYMAP_KB_UNITS_W = 20;
-export const KEYMAP_KB_UNITS_H = 9.7;
+export const KEYMAP_KB_UNITS_H = 10.7;
 
 export interface Rect { x: number; y: number; w: number; h: number; }
 
@@ -27,7 +27,9 @@ export function keymapKbOrigin(): { x: number; y: number } {
         const kbMaxH = KEYMAP_KB_UNITS_H * KEYMAP_KB_SCALE;
         return {
                 x: Math.floor(((screen as any).width - kbMaxW) / 2),
-                y: Math.floor(((screen as any).height - kbMaxH) / 2),
+                // Shift the whole keyboard DOWN by one key height (KEYMAP_KB_SCALE) so the
+                // top row (Esc) doesn't overlap the "D-pad / tap: …" hint text at y=84.
+                y: Math.floor(((screen as any).height - kbMaxH) / 2) + KEYMAP_KB_SCALE,
         };
 }
 

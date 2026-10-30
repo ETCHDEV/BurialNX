@@ -1,6 +1,6 @@
 /** Keymap page renderers: button grid, keyboard picker, and rename-keyboard preview. */
 import { S } from './state';
-import { BUTTON_NAMES, displayToButtonIndex, menuButtonIndicesFor, faceButtonLetter, type VirtualKey } from './keymap';
+import { BUTTON_NAMES, MOUSE_DISPLAY, displayToButtonIndex, menuButtonIndicesFor, faceButtonLetter, isMouseAction, type VirtualKey } from './keymap';
 import { mergedKeymap } from './keymap-editor';
 import { KEYMAP_COLORS, KEYBOARD_LAYOUT, KEYCODE_TO_VKEY, getAllPickKeys } from './keymap-layout';
 import { KEYMAP_GRID_COLS, KEYMAP_CELL_W, KEYMAP_CELL_H, KEYMAP_KB_SCALE, keymapButtonCellRect, keymapKbOrigin, drawBackButton } from './keymap-geometry';
@@ -53,12 +53,16 @@ function renderButtonGrid(targetLabel: string) {
                 if (isStick) {
                         const dir = stickDirs[i - 16];
                         const binding = S.editingKeymap.sticks?.[dir];
+                        const stickVkey = binding?.vkey;
                         displayLabel = binding ? binding.label : 'none';
-                        color = KEYMAP_COLORS[displayLabel as VirtualKey] || '#6e7681';
+                        color = KEYMAP_COLORS[(stickVkey || displayLabel) as VirtualKey] || '#6e7681';
                 } else {
                         const btnIdx = displayToButtonIndex(i);
                         const key = S.editingKeymap.buttons[btnIdx];
-                        displayLabel = S.editingKeymap.labels?.[btnIdx] || key;
+                        // Show the explicit label if present, else a friendly mouse glyph
+                        // (M↑/LMB/...) for mouse-action keys, else the raw vkey.
+                        const lbl = S.editingKeymap.labels?.[btnIdx];
+                        displayLabel = lbl || (isMouseAction(key) ? (MOUSE_DISPLAY[key] || key) : key);
                         color = KEYMAP_COLORS[key] || '#6e7681';
                 }
                 S.ctx.fillStyle = selected ? '#3a3f5c' : '#252840';
@@ -92,7 +96,8 @@ function renderKeyboardPicker(targetLabel: string) {
         } else {
                 const btnIdx = displayToButtonIndex(S.keymapCursor);
                 const curKey = S.editingKeymap.buttons[btnIdx];
-                curLabel = S.editingKeymap.labels?.[btnIdx] || curKey;
+                const lbl = S.editingKeymap.labels?.[btnIdx];
+                curLabel = lbl || (isMouseAction(curKey) ? (MOUSE_DISPLAY[curKey] || curKey) : curKey);
         }
         S.ctx.fillStyle = '#f4f3ef'; S.ctx.textAlign = 'left';
         S.ctx.fillText(`Pick a key for: ${btn}`, 28, 36);
@@ -106,15 +111,18 @@ function renderKeyboardPicker(targetLabel: string) {
         S.ctx.fillStyle = '#9aa0b4';
         S.ctx.textAlign = 'left';
         S.ctx.fillText('Joystick action buttons', 28, kbY + 7.35 * scale);
+        // "Mouse Control" section caption — same color as the joystick label (#9aa0b4),
+        // drawn above the 2×3 mouse tile group on the right.
+        S.ctx.fillText('Mouse Control', kbX + 16.0 * scale, kbY + 8.35 * scale);
         for (let i = 0; i < KEYBOARD_LAYOUT.length; i++) {
                 const k = KEYBOARD_LAYOUT[i];
                 const x = kbX + k.x * scale, y = kbY + k.y * scale;
                 const w = k.w * scale - 2, h = k.h * scale - 2;
                 let vkey: VirtualKey;
                 if (k.keyCode === -1) {
-                        vkey = k.label as VirtualKey;
+                        vkey = (k.vkey ?? k.label) as VirtualKey;
                 } else {
-                        vkey = KEYCODE_TO_VKEY[k.keyCode] || 'none';
+                        vkey = (k.vkey ?? KEYCODE_TO_VKEY[k.keyCode] ?? 'none') as VirtualKey;
                 }
                 const color = KEYMAP_COLORS[vkey] || '#6e7681';
                 const selected = i === S.keymapPickCursor;

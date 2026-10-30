@@ -42,6 +42,7 @@ import { frame } from './frame-loop';
 import { installLocalStorageShim } from './localstorage-shim';
 import { consumeSleepMarker, installSleepAutoload } from './sleep-recovery';
 import { S, type Phase, type ExitBehavior } from './state';
+import { resetMouseCursor } from './mouse-input';
 
 declare const __DEBUG__: boolean;
 declare const __FORWARDER_GAME_ID__: string;
@@ -58,6 +59,11 @@ try {
 }
 
 drawSplash(S.ctx, 'Loading…');
+
+// Center the virtual mouse cursor on the physical screen now that the screen
+// global is available. (createState defaults to 640x360; this corrects for
+// docked 1080p or any other resolution.)
+try { resetMouseCursor(); } catch { /* best-effort — screen global always present on Switch */ }
 
 log('_3: startupUserAccount=0 in NACP, localStorage intentionally untouched — no profile dialog');
 if (__DEBUG__) try {
@@ -92,11 +98,20 @@ try {
                 S.editingKeymap.sticks = {};
                 for (const dir of ['lUp','lDown','lLeft','lRight','rUp','rDown','rLeft','rRight'] as const) {
                         const b = S.globalKeymap.sticks[dir];
-                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label };
+                        if (b) S.editingKeymap.sticks[dir] = { keyCode: b.keyCode, label: b.label, vkey: b.vkey };
                 }
         }
         log(`_11: loadKeyMap ok, ${S.globalKeymap.buttons.filter((b) => b !== 'none').length} active bindings`);
 } catch (error) { log(`_11: loadKeyMap failed: ${error instanceof Error ? error.message : String(error)}`); S.keymapValid = false; }
+
+// Load the persisted mouse-speed slider value (pause menu → Another…). Default 5.
+try {
+        const raw = Switch.readFileSync('sdmc:/switch/burialnx/mouse-settings.json');
+        if (raw) {
+                const value = JSON.parse(new TextDecoder().decode(raw));
+                if (typeof value?.speed === 'number') S.mouseSpeed = Math.max(1, Math.min(10, Math.round(value.speed)));
+        }
+} catch { /* defaults to 5 */ }
 
 try {
         if (S.library.lastPlayed) {

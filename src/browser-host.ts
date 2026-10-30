@@ -85,7 +85,21 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         // Only the primary game canvas may draw directly to the physical screen.
                         if (directScreen && !this.canvas && this.w === screen.width && this.h === screen.height) { this.canvas = screen; this.direct = true; }
                 }
-                getContext(kind: string) {
+                getContext(kind: string, ...args: any[]) {
+                        // WebGL contexts: pass through to the underlying OffscreenCanvas/screen
+                        // WITHOUT proxying. PIXI.js v4 (RPG Maker MV) calls getContext('webgl')
+                        // via PIXI.autoDetectRenderer — if this returns a real WebGL context, it
+                        // uses the GPU-accelerated WebGLRenderer (far faster than Canvas2D). If the
+                        // underlying canvas doesn't support WebGL, null is returned and PIXI falls
+                        // back to Canvas2D — no regression. The 2d Proxy below is NOT applied to
+                        // WebGL contexts (it's specific to CanvasRenderingContext2D).
+                        if (kind === 'webgl' || kind === 'webgl2' || kind === 'experimental-webgl') {
+                                const target = this.canvas || this.surface();
+                                if (target && typeof (target as any).getContext === 'function') {
+                                        return (target as any).getContext(kind, ...args);
+                                }
+                                return null;
+                        }
                         if (kind !== '2d') return null;
                         if (this.context) return this.context;
                         const target = this.surface().getContext('2d');

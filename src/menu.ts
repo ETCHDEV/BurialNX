@@ -1,5 +1,6 @@
 export type MenuItem = 'continue' | 'save' | 'load' | 'keymap' | 'another' | 'back' | 'quit'
-        | 'saves' | 'import' | 'resolution' | 'fps' | 'mod' | 'direct' | 'snapshot' | 'language';
+        | 'saves' | 'import' | 'resolution' | 'fps' | 'mod' | 'direct' | 'snapshot' | 'language'
+        | 'mouseSpeed';
 
 /** Controller-only overlay state. */
 export class PauseMenu {
@@ -8,6 +9,8 @@ export class PauseMenu {
         selected = 0;
         page: 1 | 2 = 1;
         languageCycle = 0;
+        /** -1 / 0 / +1 — set by Left/Right while the mouseSpeed item is selected; consumed by the frame loop. */
+        mouseSpeedDelta = 0;
         private pressed: boolean[] = Array(16).fill(false);
         private start: number | undefined;
         private armed = true;
@@ -17,8 +20,8 @@ export class PauseMenu {
         constructor(debug: boolean) {
                 this.itemsPage1 = ['continue', 'save', 'load', 'keymap', 'another', 'quit'];
                 this.itemsPage2 = debug
-                        ? ['saves', 'import', 'resolution', 'fps', 'mod', 'direct', 'snapshot', 'language', 'back']
-                        : ['saves', 'import', 'resolution', 'fps', 'mod', 'language', 'back'];
+                        ? ['saves', 'import', 'resolution', 'fps', 'mouseSpeed', 'mod', 'direct', 'snapshot', 'language', 'back']
+                        : ['saves', 'import', 'resolution', 'fps', 'mouseSpeed', 'mod', 'language', 'back'];
         }
         get currentItems(): MenuItem[] { return this.page === 1 ? this.itemsPage1 : this.itemsPage2; }
         get blocksInput() { return this.open || this.waitForRelease; }
@@ -36,12 +39,17 @@ export class PauseMenu {
                 let action: MenuItem | null = null;
                 const items = this.currentItems;
                 this.languageCycle = 0;
+                this.mouseSpeedDelta = 0;
                 if (this.open) {
                         if (just(12)) this.selected = (this.selected + items.length - 1) % items.length;
                         if (just(13)) this.selected = (this.selected + 1) % items.length;
                         if (items[this.selected] === 'language') {
                                 if (just(14)) this.languageCycle = -1;
                                 if (just(15)) this.languageCycle = 1;
+                        }
+                        if (items[this.selected] === 'mouseSpeed') {
+                                if (just(14)) this.mouseSpeedDelta = -1;
+                                if (just(15)) this.mouseSpeedDelta = 1;
                         }
                         if (justCancel()) {
                                 if (this.page === 2) { this.page = 1; this.selected = 4; }
@@ -54,6 +62,7 @@ export class PauseMenu {
                                 else if (action === 'back') { this.page = 1; this.selected = 4; action = null; }
                                 else if (action === 'continue' || action === 'save' || action === 'load') { this.open = false; this.waitForRelease = true; }
                                 else if (action === 'language') { this.languageCycle = 1; action = null; }
+                                else if (action === 'mouseSpeed') action = null;  // slider: Left/Right only, A is a no-op
                         }
                 } else if (this.waitForRelease && !down(confirmIndex) && !down(cancelIndex) && !down(12) && !down(13)) this.waitForRelease = false;
                 for (let index = 0; index < 16; index++) this.pressed[index] = down(index);

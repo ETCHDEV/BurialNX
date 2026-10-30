@@ -157,13 +157,15 @@ test('setButton returns a new immutable map', async () => {
   assert.equal(before.buttons[0], 'cancel');
 });
 
-test('applyKeyMap honors remapped buttons and fills defaults', async () => {
+test('applyKeyMap honors remapped buttons and leaves none unmapped', async () => {
   const km = await loadKeymapModule();
   const runtime = { Input: {} };
   km.applyKeyMap(runtime, km.setButton(km.DEFAULT_KEYMAP, 0, 'ok'));
   assert.equal(runtime.Input.gamepadMapper[0], 'ok');
-  // Unmapped defaults still bind menu/dpad.
-  assert.equal(runtime.Input.gamepadMapper[9], 'menu');
+  // Buttons set to 'none' (like Plus at index 9 in DEFAULT_KEYMAP) are NOT mapped —
+  // no defaults are injected, so 'none' = truly silent (no signal leaks to the game).
+  assert.equal(runtime.Input.gamepadMapper[9], undefined);
+  // Explicitly mapped buttons (like D-up at index 12 = 'up') are mapped.
   assert.equal(runtime.Input.gamepadMapper[12], 'up');
 });
 

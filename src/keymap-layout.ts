@@ -6,10 +6,13 @@ export const KEYMAP_COLORS: Record<string, string> = {
         control: '#f0883e', tab: '#f0883e', escape: '#f85149',
         pageup: '#d2a8ff', pagedown: '#d2a8ff',
         up: '#56d364', down: '#56d364', left: '#56d364', right: '#56d364',
+        // Mouse movement = cyan, mouse clicks = orange/amber.
+        mup: '#39d0d8', mdown: '#39d0d8', mleft: '#39d0d8', mright: '#39d0d8',
+        lmb: '#f0883e', rmb: '#f5b85a',
         none: '#6e7681',
 };
 
-export interface KeyDef { label: string; keyCode: number; x: number; y: number; w: number; h: number; }
+export interface KeyDef { label: string; keyCode: number; x: number; y: number; w: number; h: number; vkey?: import('./keymap').VirtualKey; }
 export const KEYBOARD_LAYOUT: KeyDef[] = [
         { label: 'Esc', keyCode: 27, x: 0, y: 0, w: 1, h: 1 },
         { label: 'F1', keyCode: 112, x: 2, y: 0, w: 1, h: 1 }, { label: 'F2', keyCode: 113, x: 3, y: 0, w: 1, h: 1 },
@@ -62,19 +65,36 @@ export const KEYBOARD_LAYOUT: KeyDef[] = [
         { label: '←', keyCode: 37, x: 15.5, y: 5.3, w: 1.5, h: 1 }, { label: '↓', keyCode: 40, x: 17, y: 5.3, w: 1.5, h: 1 },
         { label: '→', keyCode: 39, x: 18.5, y: 5.3, w: 1.5, h: 1 },
         { label: 'none', keyCode: 0, x: 1, y: 0, w: 1, h: 1 },
+        // Joystick action buttons — 3 rows so they don't crowd the mouse-control group
+        // on the right. Row 1 (y=7.7): ok/cancel/shift/menu/pageup (5 buttons).
+        // Row 2 (y=8.7): pagedown/escape/tab/control (4 buttons).
+        // Row 3 (y=9.7): up/down/left/right (4 buttons, moved here from row 2).
         { label: 'ok', keyCode: -1, x: -0.9, y: 7.7, w: 2.4, h: 1 },
         { label: 'cancel', keyCode: -1, x: 1.5, y: 7.7, w: 2.4, h: 1 },
         { label: 'shift', keyCode: -1, x: 3.9, y: 7.7, w: 2.4, h: 1 },
         { label: 'menu', keyCode: -1, x: 6.3, y: 7.7, w: 2.4, h: 1 },
         { label: 'pageup', keyCode: -1, x: 8.7, y: 7.7, w: 2.4, h: 1 },
-        { label: 'pagedown', keyCode: -1, x: 11.1, y: 7.7, w: 2.4, h: 1 },
-        { label: 'escape', keyCode: -1, x: 13.5, y: 7.7, w: 2.4, h: 1 },
-        { label: 'tab', keyCode: -1, x: 0.3, y: 8.7, w: 2.4, h: 1 },
-        { label: 'up', keyCode: -1, x: 2.7, y: 8.7, w: 2.4, h: 1 },
-        { label: 'down', keyCode: -1, x: 5.1, y: 8.7, w: 2.4, h: 1 },
-        { label: 'left', keyCode: -1, x: 7.5, y: 8.7, w: 2.4, h: 1 },
-        { label: 'right', keyCode: -1, x: 9.9, y: 8.7, w: 2.4, h: 1 },
-        { label: 'control', keyCode: -1, x: 12.3, y: 8.7, w: 2.4, h: 1 },
+        { label: 'pagedown', keyCode: -1, x: 0.3, y: 8.7, w: 2.4, h: 1 },
+        { label: 'escape', keyCode: -1, x: 2.7, y: 8.7, w: 2.4, h: 1 },
+        { label: 'tab', keyCode: -1, x: 5.1, y: 8.7, w: 2.4, h: 1 },
+        { label: 'control', keyCode: -1, x: 7.5, y: 8.7, w: 2.4, h: 1 },
+        { label: 'up', keyCode: -1, x: 0.3, y: 9.7, w: 2.4, h: 1 },
+        { label: 'down', keyCode: -1, x: 2.7, y: 9.7, w: 2.4, h: 1 },
+        { label: 'left', keyCode: -1, x: 5.1, y: 9.7, w: 2.4, h: 1 },
+        { label: 'right', keyCode: -1, x: 7.5, y: 9.7, w: 2.4, h: 1 },
+        // Mouse-control picker tiles — right-bottom, 2 rows × 3 cols, placed after
+        // the joystick action buttons. The "Mouse Control" caption is drawn in
+        // renderKeyboardPicker above this group. Movement tiles use an "M" prefix +
+        // arrow glyph (M↑/M↓/M←/M→) to distinguish them from keyboard arrow keys;
+        // click tiles use LMB/RMB. vkey carries the real VirtualKey (label is a glyph).
+        // Top row:  LMB       M↑(mup)   RMB
+        // Bot row:  M←(mleft) M↓(mdown) M→(mright)
+        { label: 'LMB', keyCode: -1, vkey: 'lmb', x: 15.0, y: 8.7, w: 1.6, h: 1 },
+        { label: 'M↑', keyCode: -1, vkey: 'mup', x: 16.7, y: 8.7, w: 1.6, h: 1 },
+        { label: 'RMB', keyCode: -1, vkey: 'rmb', x: 18.4, y: 8.7, w: 1.6, h: 1 },
+        { label: 'M←', keyCode: -1, vkey: 'mleft', x: 15.0, y: 9.7, w: 1.6, h: 1 },
+        { label: 'M↓', keyCode: -1, vkey: 'mdown', x: 16.7, y: 9.7, w: 1.6, h: 1 },
+        { label: 'M→', keyCode: -1, vkey: 'mright', x: 18.4, y: 9.7, w: 1.6, h: 1 },
 ];
 
 /** RPG Maker MV default keyMapper: keyCode → virtual key (number keys mapped to 'ok'). */
@@ -86,13 +106,15 @@ export const KEYCODE_TO_VKEY: Record<number, VirtualKey> = {
 };
 
 let _allPickKeys: { label: string; vkey: VirtualKey; keyCode: number }[] | null = null;
-/** Combined pickable list of keyboard keys + virtual-key buttons (lazy-init). */
+/** Combined pickable list of keyboard keys + virtual-key buttons (lazy-init).
+ *  For keyCode===-1 tiles, the KeyDef.vkey field (if present) overrides the label as the vkey,
+ *  so a tile can show a glyph label ('M↑') while binding the real VirtualKey ('mup'). */
 export function getAllPickKeys() {
         if (!_allPickKeys) _allPickKeys = KEYBOARD_LAYOUT.map(k => {
                 if (k.keyCode === -1) {
-                        return { label: k.label, vkey: k.label as VirtualKey, keyCode: 0 };
+                        return { label: k.label, vkey: (k.vkey ?? k.label) as VirtualKey, keyCode: 0 };
                 }
-                return { label: k.label, vkey: KEYCODE_TO_VKEY[k.keyCode] || ('none' as VirtualKey), keyCode: k.keyCode };
+                return { label: k.label, vkey: (k.vkey ?? KEYCODE_TO_VKEY[k.keyCode] ?? 'none') as VirtualKey, keyCode: k.keyCode };
         });
         return _allPickKeys;
 }

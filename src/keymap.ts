@@ -4,7 +4,8 @@ import { safeSdPath } from './settings';
 export type VirtualKey =
         | 'ok' | 'cancel' | 'shift' | 'control' | 'tab' | 'escape'
         | 'menu' | 'pageup' | 'pagedown'
-        | 'up' | 'down' | 'left' | 'right' | 'none';
+        | 'up' | 'down' | 'left' | 'right' | 'none'
+        | 'mup' | 'mdown' | 'mleft' | 'mright' | 'lmb' | 'rmb';
 
 /** Logical names for the 16 standard Web Gamepad button indices. */
 export const BUTTON_NAMES: readonly string[] = Object.freeze([
@@ -28,13 +29,53 @@ export function displayToButtonIndex(displayPos: number): number {
 export const VIRTUAL_KEYS: readonly VirtualKey[] = Object.freeze([
         'none', 'ok', 'cancel', 'shift', 'control', 'tab', 'escape', 'menu', 'pageup', 'pagedown',
         'up', 'down', 'left', 'right',
+        'mup', 'mdown', 'mleft', 'mright', 'lmb', 'rmb',
 ]);
 
+/** Virtual keys that drive the on-screen mouse cursor instead of RPG Maker's Input. */
+export const MOUSE_ACTIONS: readonly VirtualKey[] = Object.freeze([
+        'mup', 'mdown', 'mleft', 'mright', 'lmb', 'rmb',
+]);
+
+/** Mouse movement directions (cursor motion), excludes click buttons. */
+export const MOUSE_MOVE_ACTIONS: readonly VirtualKey[] = Object.freeze([
+        'mup', 'mdown', 'mleft', 'mright',
+]);
+
+/** Mouse click buttons (LMB / RMB). */
+export const MOUSE_CLICK_ACTIONS: readonly VirtualKey[] = Object.freeze([
+        'lmb', 'rmb',
+]);
+
+/** Friendly display labels for the mouse virtual keys.
+ *  Movements use an "M" prefix + arrow glyph (M↑/M↓/M←/M→) so they are visually
+ *  distinct from the keyboard arrow keys (↑↓←→); clicks use LMB/RMB. */
+export const MOUSE_DISPLAY: Readonly<Record<string, string>> = Object.freeze({
+        mup: 'M↑', mdown: 'M↓', mleft: 'M←', mright: 'M→', lmb: 'LMB', rmb: 'RMB',
+});
+
+/** True if `key` is any mouse action (movement or click). */
+export function isMouseAction(key: unknown): key is VirtualKey {
+        return key === 'mup' || key === 'mdown' || key === 'mleft' || key === 'mright' || key === 'lmb' || key === 'rmb';
+}
+
+/** True if `key` drives cursor movement (mup/mdown/mleft/mright). */
+export function isMouseMoveAction(key: unknown): boolean {
+        return key === 'mup' || key === 'mdown' || key === 'mleft' || key === 'mright';
+}
+
+/** True if `key` drives a mouse click (lmb/rmb). */
+export function isMouseClickAction(key: unknown): boolean {
+        return key === 'lmb' || key === 'rmb';
+}
+
 export interface StickBinding {
-        /** JavaScript keyCode (e.g. 87 for 'W', 83 for 'S'). */
+        /** JavaScript keyCode (e.g. 87 for 'W', 83 for 'S'). 0 for virtual-action / mouse bindings. */
         keyCode: number;
-        /** Display label (e.g. 'W', 'S', 'A', 'D'). */
+        /** Display label (e.g. 'W', 'S', 'A', 'D', 'M↑'). */
         label: string;
+        /** Virtual key name for keyCode===0 bindings (e.g. 'ok', 'mup'). Keyboard keys leave this undefined. */
+        vkey?: string;
 }
 
 export interface KeyMap {
@@ -159,19 +200,20 @@ export function saveKeyMap(fs: KeyMapAccess, map: KeyMap): boolean {
         } catch (error) { console.error(`Could not save key map: ${String(error)}`); return false; }
 }
 
-/** Apply the user's remap to RPG Maker MV's Input.gamepadMapper. */
+/** Apply the user's remap to RPG Maker MV's Input.gamepadMapper. Mouse-action bindings
+ *  are skipped here (they drive the on-screen cursor via mouse-input.ts, not RPG Maker's Input).
+ *  Buttons set to 'none' are left unmapped — RPG Maker MV's _updateGamepadState checks
+ *  gamepadMapper[j] and only fires if the entry exists, so 'none' = truly silent.
+ *  No default fallbacks are injected — if the user explicitly unmapped a button, it
+ *  must stay unmapped (previously D-pad/Minus were force-added, leaking signals). */
 export function applyKeyMap(runtime: any, map: KeyMap): void {
         if (!runtime?.Input) return;
         const mapper: Record<number, string> = {};
         map.buttons.forEach((key, index) => {
                 if (map.keyCodes && map.keyCodes[index]) return;
+                if (isMouseAction(key)) return;
                 if (key !== 'none') mapper[index] = key;
         });
-        if (mapper[9] === undefined) mapper[9] = 'menu';
-        if (mapper[12] === undefined) mapper[12] = 'up';
-        if (mapper[13] === undefined) mapper[13] = 'down';
-        if (mapper[14] === undefined) mapper[14] = 'left';
-        if (mapper[15] === undefined) mapper[15] = 'right';
         runtime.Input.gamepadMapper = mapper;
 }
 

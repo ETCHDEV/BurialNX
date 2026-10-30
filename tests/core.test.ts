@@ -165,8 +165,8 @@ test('release menu excludes debug actions and closes only with B', () => {
         menu.step(press(1), 2001);
         // Now on page 2.
         assert.equal(menu.page, 2);
-        // Page 2: saves, import, resolution, fps, mod, language, back (no snapshot/direct in release)
-        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mod', 'language', 'back']);
+        // Page 2: saves, import, resolution, fps, mouseSpeed, mod, language, back (no snapshot/direct in release)
+        assert.deepEqual(menu.currentItems, ['saves', 'import', 'resolution', 'fps', 'mouseSpeed', 'mod', 'language', 'back']);
         // B goes back to page 1.
         menu.step(press(0), 2002);
         assert.equal(menu.page, 1);

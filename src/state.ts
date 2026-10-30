@@ -101,6 +101,16 @@ export interface AppState {
         exitInProgress: boolean;
 
         frameLoggedFirst: boolean;
+
+        // Virtual mouse cursor (driven by joycon → mouse-action bindings; see mouse-input.ts).
+        mouseX: number;
+        mouseY: number;
+        mouseLmbDown: boolean;
+        mouseRmbDown: boolean;
+        mouseVisible: boolean;
+        /** Mouse-speed slider value (1..10). Effective speed = MOUSE_SPEED × (mouseSpeed × 0.3) × ramp.
+         *  Default 5 → multiplier 1.5. Adjusted in the pause menu under "Another…". */
+        mouseSpeed: number;
 }
 
 /** Construct the singleton state object shared across every loader module. */
@@ -194,6 +204,13 @@ export function createState(debug: boolean): AppState {
                 exitInProgress: false,
 
                 frameLoggedFirst: false,
+
+                mouseX: 640,
+                mouseY: 360,
+                mouseLmbDown: false,
+                mouseRmbDown: false,
+                mouseVisible: false,
+                mouseSpeed: 5,
         };
 }
 
