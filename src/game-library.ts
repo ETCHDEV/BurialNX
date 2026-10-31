@@ -13,6 +13,10 @@ export interface ExperimentalSettings {
         dirtyRenderSkip?: boolean;
         presentCache?: boolean;
         canvasNodeSkip?: boolean;
+        smoothingOff?: boolean;
+        skipPresent?: boolean;
+        eventUpdateSkip?: boolean;
+        spriteRenderSkip?: boolean;
 }
 
 /** Names of the experimental toggle fields, in the order they appear on the pause menu's
@@ -20,6 +24,7 @@ export interface ExperimentalSettings {
 export const EXPERIMENTAL_FIELDS = [
         'skipFadeBlur', 'skipFadeFill', 'windowLayerSkip', 'windowBitmapReuse',
         'textureGcIdle', 'dirtyRenderSkip', 'presentCache', 'canvasNodeSkip',
+        'smoothingOff', 'skipPresent', 'eventUpdateSkip', 'spriteRenderSkip',
 ] as const;
 
 /** Persisted description of one added game: id, name, root, saves, cover, keymap, language. */
@@ -38,6 +43,8 @@ export interface LibraryEntry {
         lastPlayed?: number;
         /** Per-game language preference: a .cld code (e.g. 'ru') or '' for English. */
         language?: string;
+        /** Per-game FPS-counter overlay toggle (pause menu → "FPS: on/off"). Default off. */
+        fps?: boolean;
         /** Per-game FPS-experimental toggles. When absent all are off (defaults). */
         experimental?: ExperimentalSettings;
 }
@@ -88,6 +95,7 @@ export function parseLibrary(text: string): LibraryFile {
                 if (keymap !== undefined) entry.keymap = keymap;
                 if (typeof raw.lastPlayed === 'number' && Number.isFinite(raw.lastPlayed) && raw.lastPlayed > 0) entry.lastPlayed = raw.lastPlayed;
                 if (typeof raw.language === 'string') entry.language = raw.language;
+                if (typeof raw.fps === 'boolean') entry.fps = raw.fps;
                 if (raw.experimental !== undefined && raw.experimental !== null && typeof raw.experimental === 'object') {
                         const exp: ExperimentalSettings = {};
                         for (const key of EXPERIMENTAL_FIELDS) {

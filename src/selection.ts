@@ -65,6 +65,16 @@ export function setExperimentalSettings(gameRoot: string, exp: ExperimentalSetti
         }
 }
 
+/** Save the per-game FPS-counter overlay toggle to the library file. */
+export function setGameFps(gameRoot: string, fps: boolean): void {
+        const id = libraryIdFromRoot(gameRoot);
+        const entry = S.library.games.find((g) => g.id === id);
+        if (entry) {
+                const updated: LibraryEntry = { ...entry, fps };
+                if (rememberLibrary(updated)) { S.currentEntry = updated; }
+        }
+}
+
 export function currentSelection(saves: SaveLocation | undefined = S.saveLocation): GameSelection {
         if (!S.selectedGame) throw new Error('No game selected');
         return { root: S.selectedGame, sharedSaves: S.sharedSaves, mod: S.selectedMod || null, ...(saves ? { saves } : {}) };
@@ -79,6 +89,7 @@ export function loadEntryIntoState(entry: LibraryEntry) {
         if (S.saveLocation && !validSaveLocation(S.saveLocation, entry.root, S.selectedMod || null)) S.saveLocation = undefined;
         S.saved = toSelection(entry);
         S.currentEntry = entry;
+        S.menu.fps = !!entry.fps;
         // Apply this game's saved per-game experimental FPS toggles to the live S flags.
         // (Defaults: all off when the entry has no saved experimental set.)
         const exp = entry.experimental ?? {};
@@ -90,6 +101,10 @@ export function loadEntryIntoState(entry: LibraryEntry) {
         S.dirtyRenderSkip = !!exp.dirtyRenderSkip;
         S.presentCache = !!exp.presentCache;
         S.canvasNodeSkip = !!exp.canvasNodeSkip;
+        S.smoothingOff = !!exp.smoothingOff;
+        S.skipPresent = !!exp.skipPresent;
+        S.eventUpdateSkip = !!exp.eventUpdateSkip;
+        S.spriteRenderSkip = !!exp.spriteRenderSkip;
 }
 
 export function startOrChooseSaves() {

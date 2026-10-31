@@ -532,6 +532,41 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         finally { if (canvas) canvas.preserveSize = false; }
                 };
         }
+        // --- B1: skip Game_Event.update for static events (toggle S.eventUpdateSkip) ---
+        // See docs/doc/fps-optimizations.md. Per-game, default off.
+        const gameEventProto = runtime.Game_Event?.prototype;
+        const gameCharacterBase = runtime.Game_CharacterBase?.prototype;
+        if (gameEventProto && gameCharacterBase && typeof gameEventProto.update === 'function' && !gameEventProto.__bnxEventSkip) {
+                gameEventProto.__bnxEventSkip = true;
+                const origEventUpdate = gameEventProto.update;
+                gameEventProto.update = function() {
+                        if (!S.eventUpdateSkip) return origEventUpdate.apply(this, arguments);
+                        // Skip only fully-static events: not moving/jumping, not auto-trigger
+                        // (trigger !== 3), parallel interpreter not running, not already
+                        // starting. Auto-trigger events still need checkEventTriggerAuto every
+                        // frame (their conditions can change via switches/variables).
+                        if (this._trigger !== 3
+                                && !this.isMoving() && !this.isJumping()
+                                && !(this._interpreter && this._interpreter.isRunning())
+                                && !this.isStarting()) {
+                                return;
+                        }
+                        return origEventUpdate.apply(this, arguments);
+                };
+        }
+
+        // --- D1: Sprite._renderCanvas early-return for invisible/transparent sprites (toggle S.spriteRenderSkip) ---
+        // See docs/doc/fps-optimizations.md. Per-game, default off.
+        const spriteCtor = runtime.Sprite;
+        if (spriteCtor && spriteCtor.prototype && typeof spriteCtor.prototype._renderCanvas === 'function' && !spriteCtor.prototype.__bnxSpriteSkip) {
+                spriteCtor.prototype.__bnxSpriteSkip = true;
+                const origSpriteRenderCanvas = spriteCtor.prototype._renderCanvas;
+                spriteCtor.prototype._renderCanvas = function(renderer: any) {
+                        if (!S.spriteRenderSkip) return origSpriteRenderCanvas.apply(this, arguments);
+                        if (!this.visible || !this.renderable || this.worldAlpha <= 0) return;
+                        return origSpriteRenderCanvas.apply(this, arguments);
+                };
+        }
         const storage = runtime.StorageManager;
         if (!sharedSaves && typeof storage?.webStorageKey === 'function') {
                 const original = storage.webStorageKey;
@@ -988,6 +1023,7 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         // every frame. 'full' never skips.
                         if (mode === 'blink-skip' && blinkOnly && !fallbackDue) {
                                 if ((newTime - lastBlinkRenderTime) < blinkMs) {
+                                        S.lastFrameRendered = false;
                                         this.requestUpdate();
                                         return;
                                 }
@@ -1000,6 +1036,7 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         if (renderNow && S.frameSkip > 0 && !fallbackDue && !msgBusy && !transitioning) {
                                 stableSkipCount++;
                                 if (stableSkipCount <= S.frameSkip) {
+                                        S.lastFrameRendered = false;
                                         this.requestUpdate();
                                         return;
                                 }
@@ -1008,6 +1045,9 @@ export function installGameCompatibility(runtime: any, root: string, sharedSaves
                         if (renderNow) {
                                 this.renderScene();
                                 lastRenderTime = newTime;
+                                S.lastFrameRendered = true;
+                        } else {
+                                S.lastFrameRendered = false;
                         }
                         this.requestUpdate();
                 };

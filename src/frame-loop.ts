@@ -11,7 +11,7 @@ import { overrideKeymapForSaveLoadScene, isSaveLoadKeymapActive } from './save-l
 import { pollButtonBindings } from './stick-bindings';
 import { pollMouseInput, renderMouseCursor, hasMouseMovementBinding } from './mouse-input';
 import { libraryTileCount, libraryNavigateRow } from './library-nav';
-import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection, setExperimentalSettings } from './selection';
+import { loadEntryIntoState, startOrChooseSaves, chooseSaves, remember, rememberLibrary, setGameLanguage, getGameLanguage, validSaveLocation, currentSelection, setExperimentalSettings, setGameFps } from './selection';
 import { getAllPickKeys, findNearestKey } from './keymap-layout';
 import { openKeymapEditor, applyPreset, saveEditingKeymap, handleKeymapTouch, mergedKeymap } from './keymap-editor';
 import { menuButtonIndicesFor, faceButtonLetter, displayToButtonIndex } from './keymap';
@@ -632,6 +632,9 @@ export function frame(now: number) {
                                 try { const value = !S.directNext; (Switch as any).writeFileSync('sdmc:/switch/burialnx/debug-settings.json', JSON.stringify({ directScreen: value })); S.directNext = value; log('Direct-screen setting saved; restart required.'); }
                                 catch (error) { log(`Could not save direct-screen setting: ${String(error)}`); }
                         }
+                        if (action === 'fps' && S.selectedGame) {
+                                try { setGameFps(S.selectedGame, S.menu.fps); } catch { /* best-effort */ }
+                        }
                         if (action === 'snapshot') { log(`Snapshot: scene=${S.runtime.SceneManager?._scene?.constructor?.name || 'unknown'}, fps=${S.fps.toFixed(1)}`); snapshotRuntimeLog(); }
                         if (S.menu.languageCycle !== 0 && S.selectedGame && S.languageEntries.length > 0) {
                                 const codes = S.languageEntries.map((e) => e.code).concat(['']);
@@ -681,12 +684,19 @@ export function frame(now: number) {
                                                         windowLayerSkip: S.windowLayerSkip, windowBitmapReuse: S.windowBitmapReuse,
                                                         textureGcIdle: S.textureGcIdle, dirtyRenderSkip: S.dirtyRenderSkip,
                                                         presentCache: S.presentCache, canvasNodeSkip: S.canvasNodeSkip,
+                                                        smoothingOff: S.smoothingOff, skipPresent: S.skipPresent,
+                                                        eventUpdateSkip: S.eventUpdateSkip, spriteRenderSkip: S.spriteRenderSkip,
                                                 });
                                         } catch (error) { log(`Could not save experimental settings: ${error instanceof Error ? error.message : String(error)}`); }
                                 }
                                 try { S.runtime.SoundManager?.playCursor?.(); } catch { /* best-effort */ }
                         }
-                        S.host?.present();
+                        // A3 (toggle S.skipPresent): skip present() when render was skip'ed and no
+                        // overlay is active. See docs/doc/fps-optimizations.md.
+                        const overlayActive = S.menu.blocksInput || S.menu.fps || (S.mouseVisible && !S.menu.blocksInput);
+                        if (!(S.skipPresent && !S.lastFrameRendered && !overlayActive)) {
+                                S.host?.present();
+                        }
                         if (S.menu.blocksInput || !S.host?.direct()) hud();
                         // Draw the virtual mouse cursor on top of the game frame + HUD.
                         // Hidden while the pause menu is open (it uses d-pad navigation).

@@ -160,6 +160,16 @@ export interface AppState {
          *  the surface per spec). ON = skip when unchanged (faster); OFF = stock (always
          *  assign, always clear). Default OFF. */
         canvasNodeSkip: boolean;
+        /** A2 (toggle smoothingOff): nearest downscale for present(). Default OFF. */
+        smoothingOff: boolean;
+        /** A3 (toggle skipPresent): skip present() when render was skip'ed + no overlay. Default OFF. */
+        skipPresent: boolean;
+        /** B1 (toggle eventUpdateSkip): skip Game_Event.update for static events. Default OFF. */
+        eventUpdateSkip: boolean;
+        /** D1 (toggle spriteRenderSkip): Sprite._renderCanvas early-return for invisible sprites. Default OFF. */
+        spriteRenderSkip: boolean;
+        /** Internal: true if renderScene() ran this frame (read by A3). Not a user toggle. */
+        lastFrameRendered: boolean;
 }
 
 /** Construct the singleton state object shared across every loader module. */
@@ -271,6 +281,11 @@ export function createState(debug: boolean): AppState {
                 dirtyRenderSkip: false,
                 presentCache: false,
                 canvasNodeSkip: false,
+                smoothingOff: false,
+                skipPresent: false,
+                eventUpdateSkip: false,
+                spriteRenderSkip: false,
+                lastFrameRendered: false,
         };
 }
 

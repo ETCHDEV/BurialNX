@@ -304,7 +304,12 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                                 if (dx > 0) screenContext.fillRect(0, dy, dx, dh);
                                 if (dx + dw < sw) screenContext.fillRect(dx + dw, dy, sw - (dx + dw), dh);
                         }
+                        // A2 (toggle S.smoothingOff): nearest downscale for the present() draw.
+                        // See docs/doc/fps-optimizations.md. Restored after so other draws are unaffected.
+                        const prevSmooth = screenContext.imageSmoothingEnabled;
+                        if (S.smoothingOff) screenContext.imageSmoothingEnabled = false;
                         screenContext.drawImage(gameCanvas.surface(), 0, 0, gw, gh, dx, dy, dw, dh);
+                        if (S.smoothingOff) screenContext.imageSmoothingEnabled = prevSmooth;
                 },
         };
 }

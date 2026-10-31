@@ -207,10 +207,10 @@ test('pause menu page 3 (Experimental) holds every FPS toggle and flips on A / L
         menu.step(null, 1002); // release
         menu.step(press(1), 1003); // A → page 3
         assert.equal(menu.page, 3, 'A on experimental enters page 3');
-        // Page 3 has every FPS item: the slider + cycler + 8 on/off toggles.
-        assert.deepEqual(menu.currentItems, ['frameSkip', 'messageRender', 'skipFadeBlur', 'skipFadeFill',
-                'windowLayerSkip', 'windowBitmapReuse', 'textureGcIdle',
-                'dirtyRenderSkip', 'presentCache', 'canvasNodeSkip']);
+        // Page 3 (Experimental 1/2) has the slider + cycler + 5 on/off toggles + 'more'.
+        assert.deepEqual(menu.currentItems, ['frameSkip', 'messageRender',
+                'windowLayerSkip', 'windowBitmapReuse',
+                'dirtyRenderSkip', 'presentCache', 'canvasNodeSkip', 'more']);
         // A on a toggle item arms toggleExperimental with that field name.
         menu.selected = menu.currentItems.indexOf('windowLayerSkip');
         menu.step(null, 1004); // release
@@ -240,6 +240,109 @@ test('pause menu page 3 (Experimental) holds every FPS toggle and flips on A / L
         assert.equal(menu.messageRenderDelta, 1, 'messageRender uses messageRenderDelta');
         assert.equal(menu.toggleExperimental, null, 'messageRender does not arm toggleExperimental');
         // Restore the buttons buffer so the shared-menu test invariant holds.
+        (menu as any).pressed = buttonsBuffer;
+});
+
+test('pause menu page 4 (Experimental 2/2) holds the second batch and navigates back to page 3', () => {
+        const buttonsBuffer = Array.from({ length: 16 }, () => ({ pressed: false }));
+        const press = (id: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === id }));
+        const menu = new PauseMenu(false);
+        // Open → page 2 → experimental → page 3 → more → page 4.
+        menu.step(press(8), 0); menu.step(press(8), 801);
+        menu.selected = 4; // 'another'
+        menu.step(press(1), 1001); // A → page 2
+        menu.selected = menu.currentItems.indexOf('experimental');
+        menu.step(null, 1002);
+        menu.step(press(1), 1003); // A → page 3
+        menu.selected = menu.currentItems.indexOf('more');
+        menu.step(null, 1004);
+        menu.step(press(1), 1005); // A → page 4
+        assert.equal(menu.page, 4, 'A on more enters page 4');
+        // Page 4 (Experimental 2/2) has the 3 moved toggles + 4 second-batch toggles + 'back'.
+        assert.deepEqual(menu.currentItems, ['skipFadeBlur', 'skipFadeFill', 'textureGcIdle',
+                'smoothingOff', 'skipPresent', 'eventUpdateSkip', 'spriteRenderSkip', 'back']);
+        // A on a page-4 toggle arms toggleExperimental with that field name.
+        menu.selected = menu.currentItems.indexOf('eventUpdateSkip');
+        menu.step(null, 1006);
+        menu.step(press(1), 1007); // A
+        assert.equal(menu.toggleExperimental, 'eventUpdateSkip', 'A arms eventUpdateSkip');
+        // Left/Right also arm the toggle.
+        menu.step(null, 1008);
+        menu.step(press(14), 1009); // Left
+        assert.equal(menu.toggleExperimental, 'eventUpdateSkip', 'Left arms the toggle');
+        // B from page 4 returns to page 3 with the cursor on 'more'.
+        menu.step(null, 1010);
+        menu.step(press(0), 1011); // B
+        assert.equal(menu.page, 3, 'B from page 4 returns to page 3');
+        assert.equal(menu.selected, menu.itemsPage3.indexOf('more'), 'cursor on more after B');
+        // 'back' entry on page 4 also returns to page 3.
+        menu.page = 4; menu.selected = menu.currentItems.indexOf('back');
+        menu.step(null, 1012);
+        menu.step(press(1), 1013); // A on 'back'
+        assert.equal(menu.page, 3, 'A on back returns to page 3');
+        assert.equal(menu.selected, menu.itemsPage3.indexOf('more'), 'cursor on more after back');
+        (menu as any).pressed = buttonsBuffer;
+});
+
+test('tapping Minus while the menu is open closes it back to the game (quick close)', () => {
+        const buttonsBuffer = Array.from({ length: 16 }, () => ({ pressed: false }));
+        const press = (id: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === id }));
+        const menu = new PauseMenu(false);
+        // Open the menu (hold Minus).
+        menu.step(press(8), 0); menu.step(press(8), 801);
+        assert.equal(menu.open, true, 'menu is open');
+        // Tap Minus (release then press) → closes the menu back to the game.
+        menu.step(null, 802); // release
+        menu.step(press(8), 803); // tap Minus
+        assert.equal(menu.open, false, 'tapping Minus closes the menu');
+        assert.equal(menu.waitForRelease, true, 'waitForRelease armed to debounce the close');
+        // The page is NOT reset — reopening lands back on the same page (see next test).
+        assert.equal(menu.page, 1, 'page preserved on quick close (was page 1)');
+        (menu as any).pressed = buttonsBuffer;
+});
+
+test('reopening the menu returns to the last-opened page (remember page)', () => {
+        const buttonsBuffer = Array.from({ length: 16 }, () => ({ pressed: false }));
+        const press = (id: number) => Array.from({ length: 16 }, (_, n) => ({ pressed: n === id }));
+        const menu = new PauseMenu(false);
+        // Open → page 2 → experimental → page 3 → more → page 4.
+        menu.step(press(8), 0); menu.step(press(8), 801);
+        menu.selected = 4; // 'another'
+        menu.step(press(1), 1001); // A → page 2
+        menu.selected = menu.currentItems.indexOf('experimental');
+        menu.step(null, 1002);
+        menu.step(press(1), 1003); // A → page 3
+        menu.selected = menu.currentItems.indexOf('more');
+        menu.step(null, 1004);
+        menu.step(press(1), 1005); // A → page 4
+        assert.equal(menu.page, 4, 'navigated to page 4');
+        // Quick-close with Minus tap.
+        menu.step(null, 1006);
+        menu.step(press(8), 1007); // tap Minus → close
+        assert.equal(menu.open, false, 'menu closed');
+        assert.equal(menu.lastPage, 4, 'lastPage remembered as 4');
+        // Reopen (hold Minus) → lands on page 4, not page 1.
+        menu.step(null, 1008); // release
+        menu.step(press(8), 1100); menu.step(press(8), 1901); // hold to reopen
+        assert.equal(menu.open, true, 'menu reopened');
+        assert.equal(menu.page, 4, 'reopen lands on last-opened page (4), not page 1');
+        // Close on page 3 → reopen lands on page 3.
+        menu.selected = menu.currentItems.indexOf('back');
+        menu.step(null, 1902);
+        menu.step(press(1), 1903); // A on back → page 3
+        assert.equal(menu.page, 3, 'back returns to page 3');
+        menu.step(null, 1904);
+        menu.step(press(8), 1905); // tap Minus → close
+        assert.equal(menu.open, false, 'menu closed from page 3');
+        assert.equal(menu.lastPage, 3, 'lastPage remembered as 3');
+        menu.step(null, 1906);
+        menu.step(press(8), 2000); menu.step(press(8), 2801); // hold to reopen
+        assert.equal(menu.open, true, 'menu reopened again');
+        assert.equal(menu.page, 3, 'reopen lands on page 3');
+        // dismiss() resets to page 1 (used by the quit / error path).
+        menu.dismiss();
+        assert.equal(menu.page, 1, 'dismiss resets to page 1');
+        assert.equal(menu.lastPage, 1, 'dismiss resets lastPage to 1');
         (menu as any).pressed = buttonsBuffer;
 });
 

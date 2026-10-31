@@ -313,6 +313,76 @@ The patch redefines the `opacity` setter on `ScreenSprite.prototype` so that whe
 
 ---
 
+## A2 — Smoothing off (nearest downscale for present)
+
+**File:** `src/browser-host.ts`, `present()`; toggle `S.smoothingOff`
+
+**What it does:** `present()` downscales the 1600×1000 game canvas to the 1280×720 screen via `screenContext.drawImage`. Stock uses Skia's bilinear sampling (`imageSmoothingEnabled = true`, quality low). This patch sets `imageSmoothingEnabled = false` around the draw so Skia uses nearest-neighbor instead, then restores the previous value so HUD / pause-menu draws are unaffected.
+
+**Effect:** Nearest is cheaper than bilinear at downscale; small FPS gain, slightly pixelier image. No layout change.
+
+**Risk:** None — purely a sampling-mode toggle for one draw call.
+
+**Revert:** Remove the `prevSmooth` / `imageSmoothingEnabled` lines around the `drawImage` in `browser-host.ts` `present()`.
+
+---
+
+## A3 — Skip present when render was skip'ed
+
+**File:** `src/frame-loop.ts`; toggle `S.skipPresent`; internal `S.lastFrameRendered` (set by the patch-G `updateMain`)
+
+**What it does:** On frames where the game render was skip'ed (dirty-flag / blink-skip → `S.lastFrameRendered = false`) AND no overlay is active (pause menu closed, FPS counter off, mouse cursor hidden), `present()` is skipped entirely. The screen already shows the previous frame (game canvas unchanged), so re-running `drawImage` + the letterbox `fillRect` is pure waste.
+
+**Effect:** Removes one GPU-texture `drawImage` (1600×1000 → 1280×720) plus up to 4 letterbox `fillRect`s per skipped frame. Biggest win on stable scenes (dialogue, idle map), where patch G / blink-skip skip most frames.
+
+**Risk:** Low. The overlay guard (`overlayActive`) ensures the screen is redrawn whenever the pause menu / FPS counter / mouse cursor needs it. If the screen appears to "freeze" while an overlay is up, the guard is wrong — but the guard covers all three overlay sources.
+
+**Revert:** Remove the `overlayActive` / `if (!(S.skipPresent && ...))` wrapper around `S.host?.present()` in `frame-loop.ts`. Stock calls `present()` every frame.
+
+---
+
+## B1 — Event update skip (static events)
+
+**File:** `src/game-compat.ts`; toggle `S.eventUpdateSkip`
+
+**What it does:** `Game_Map.updateEvents` runs `event.update()` on every event every frame. `Game_Event.update` = `Game_Character.update` (physics) + `checkEventTriggerAuto` (auto-trigger conditions) + `updateParallel` (interpreter). For a fully-static event (not moving, not jumping, trigger ≠ 3/auto, no running parallel interpreter, not already starting), all three are no-ops — but they still cost a function call + branch per event per frame. On a 137-event map (e.g. wwwNEET) that is 137 no-op updates per frame.
+
+The patch skips `update()` entirely for those static events. Auto-trigger events (trigger === 3) still update every frame because their conditions (switches / variables) can change at any time. Events with a running parallel interpreter still update. Events that are moving / jumping / starting still update.
+
+**Effect:** Cuts ~80% of the per-frame `updateEvents` cost on a map with many decorative / static events. This is the update-phase bottleneck, not the render phase — so it stacks with the render-skip patches (G, blink-skip).
+
+**Risk:** Low. The skip conditions are conservative: any event that could change state still updates. The only risk is a plugin that mutates event state from outside `update()` (e.g. a `Game_Event.prototype.customMethod` that the game calls directly) — but such a plugin would also need the event to update to apply its effect, and the event would still update if it is moving / auto / parallel / starting. If an event appears "stuck", turn this toggle off.
+
+**Revert:** Remove the block guarded by `__bnxEventSkip` in `game-compat.ts`. Stock `Game_Event.update` runs unmodified.
+
+---
+
+## D1 — Sprite render skip (invisible sprites)
+
+**File:** `src/game-compat.ts`; toggle `S.spriteRenderSkip`
+
+**What it does:** `PIXI.Container.renderCanvas` already skips children that are `!visible` or `worldAlpha <= 0`, but `Sprite._renderCanvas` itself does not re-check — so a sprite reached via a custom render path (a plugin that calls `_renderCanvas` directly, or a sprite whose `worldAlpha` dropped to 0 after the parent check) still walks the full `CanvasSpriteRenderer.render` path (matrix math, blend-mode set, `drawImage`). This patch adds an early-return at the top of `Sprite._renderCanvas` for `!visible || !renderable || worldAlpha <= 0`.
+
+**Effect:** Small — PIXI's Container check already handles the common case. This only catches the edge cases. ~1-3 FPS on scenes with many hidden sprites.
+
+**Risk:** None. The early-return matches exactly what PIXI would do anyway (skip invisible sprites); it just does it one level earlier.
+
+**Revert:** Remove the block guarded by `__bnxSpriteSkip` in `game-compat.ts`.
+
+---
+
+## Per-game FPS-counter overlay
+
+**File:** `src/game-library.ts` (`LibraryEntry.fps`), `src/selection.ts` (`setGameFps`, applied in `loadEntryIntoState`), `src/frame-loop.ts` (persist on toggle)
+
+**What it does:** The pause-menu "FPS: on/off" toggle is now **per-game** — stored on the library entry as `fps?: boolean`, applied to `S.menu.fps` when a game is loaded, and persisted back when toggled. Each game remembers whether it wants the FPS counter visible.
+
+**Default:** off. A game with no saved `fps` field behaves as stock (counter off until toggled).
+
+**Revert:** Remove the `fps` field from `LibraryEntry`, its parse in `parseLibrary`, `setGameFps` in `selection.ts`, the `S.menu.fps = !!entry.fps` line in `loadEntryIntoState`, and the `action === 'fps'` persist block in `frame-loop.ts`.
+
+---
+
 ## Quick revert: disable ALL optimizations
 
 If any optimization breaks a game and you need a clean baseline immediately:

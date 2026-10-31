@@ -44,7 +44,8 @@ export function renderPauseMenu(): void {
         const labels: Record<string, string> = {
                 continue: 'Resume', save: 'Save', load: 'Load',
                 keymap: 'Edit joycon key bindings',
-                another: 'Another...', experimental: 'Experimental...', back: 'Back',
+                another: 'Another...', experimental: 'Experimental...',
+                more: 'More...', back: 'Back',
                 quit: quitLabel,
                 saves: 'Choose save location', import: 'Import Steam saves',
                 resolution: `Display: ${S.fit ? 'fit' : 'native'}`,
@@ -58,8 +59,8 @@ export function renderPauseMenu(): void {
         const letters = menuLetters();
         const topBar = `BurialNX  |  Up/Down: select  ${letters.confirm}: choose  ${letters.cancel}: back/close`
                 + (S.menu.fps ? `  |  ${S.fps.toFixed(1)} FPS` : '');
-        // Panel sized to the largest page (page 3 Experimental has 10 items; page 2 has
-        // up to 10 in debug; page 1 has 6). Keeps the panel a consistent height across pages.
+        // Panel sized to the largest page (Experimental pages have 8 items each; page 2
+        // has up to 10 in debug; page 1 has 6).
         const maxItems = 10;
         const itemH = 26;
         const topH = 30;
@@ -97,6 +98,8 @@ export function renderPauseMenu(): void {
                 windowLayerSkip: 'WindowLayer skip', windowBitmapReuse: 'Window Bitmap reuse',
                 textureGcIdle: 'Texture GC idle', dirtyRenderSkip: 'Dirty render-skip',
                 presentCache: 'Present cache', canvasNodeSkip: 'CanvasNode skip',
+                smoothingOff: 'Smoothing off', skipPresent: 'Skip present',
+                eventUpdateSkip: 'Event update skip', spriteRenderSkip: 'Sprite render skip',
         };
         let maxLabelW = 0;
         for (let i = 0; i < items.length; i++) {
@@ -166,7 +169,9 @@ export function renderPauseMenu(): void {
                 } else if (items[i] === 'skipFadeBlur' || items[i] === 'skipFadeFill'
                         || items[i] === 'windowLayerSkip' || items[i] === 'windowBitmapReuse'
                         || items[i] === 'textureGcIdle' || items[i] === 'dirtyRenderSkip'
-                        || items[i] === 'presentCache' || items[i] === 'canvasNodeSkip') {
+                        || items[i] === 'presentCache' || items[i] === 'canvasNodeSkip'
+                        || items[i] === 'smoothingOff' || items[i] === 'skipPresent'
+                        || items[i] === 'eventUpdateSkip' || items[i] === 'spriteRenderSkip') {
                         // On/off toggle (A or Left/Right flips; persisted per-game by the frame loop).
                         // See docs/doc/fps-optimizations.md for the patch each one controls.
                         const label = labelFor[items[i] as string] || (items[i] as string);
@@ -195,6 +200,15 @@ export function renderPauseMenu(): void {
                 } else {
                         S.ctx.fillText(prefix + labels[items[i]], panelX + padding, y);
                 }
+        }
+        // Hint on the Experimental pages (page 3 / 4): tap Minus to close the menu back to
+        // the game without navigating to page 1. Gray, right-aligned, bottom-right corner.
+        if (S.menu.page === 3 || S.menu.page === 4) {
+                S.ctx.fillStyle = '#6e7681';
+                S.ctx.font = '14px sans-serif';
+                S.ctx.textAlign = 'right'; S.ctx.textBaseline = 'alphabetic';
+                S.ctx.fillText("tap '-' to fast close menu", panelX + panelW - padding, panelY + panelH - 6);
+                S.ctx.textAlign = 'left';
         }
         S.ctx.restore();
 }
