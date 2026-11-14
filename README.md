@@ -1,122 +1,142 @@
-# BurialNX
+# ⚰️ BurialNX
 
-An optimized Nintendo Switch homebrew runtime environment for **TCOAAL**,
-built around nx.js and a targeted RPG Maker MV
-compatibility host.
+**Independent Switch homebrew loader for RPG Maker MV Games**
 
-## Project Scope & Compatibility
+BurialNX is a Nintendo Switch homebrew application built on [nx.js](https://github.com/tofuness/nx.js) that runs RPG Maker MV games on the Switch. It is not a general-purpose RPG Maker player — it is specifically tested on *The Coffin of Andy and Leyley* (TCOAAL).
 
-> [!IMPORTANT]
-> **BurialNX is a specialized loader, not a universal RPG Maker MV player.**
-> Its runtime behavior and compatibility code are tailored to TCOAAL's
-> specific memory demands, asset layout, and plugin footprint. Other RPG Maker
-> MV deployments are not supported, and compatibility with every version or
-> mod of TCOAAL is not guaranteed.
+---
 
-The project loads an independently supplied game deployment; it is **not a
-decompilation or recreation of the game**. Gameplay has been reported working
-on Switch, but additional hardware, game versions, and configurations require
-testing. Back up saves before use.
+## 📸 Screenshots
 
-BurialNX was informed by the earlier
-[TCOAALBrowserLoader](https://github.com/Kidev-org/TCOAALBrowserLoader)
-implementation. The original desktop deployment uses [NW.js](https://nwjs.io/);
-BurialNX uses [nx.js](https://github.com/TooTallNate/nx.js) instead, without
-the Switch WebApplet. The earlier loader and game behavior were inspected;
-this is not a clean-room implementation. OpenAI Codex assisted with
-investigation, implementation, tests, and documentation. See
-[AGENTS.md](AGENTS.md), [WORKING.md](WORKING.md), and [NOTICE.md](NOTICE.md).
+### Library
+![Library](docs/screenshots/library.jpg)
 
-## Technical Highlights
+Browse your game library with cover thumbnails. Reorder games with **L/R** shoulder buttons.
 
-- **Switch runtime integration:** Runs the game's JavaScript through nx.js,
-  which builds on libnx, and supplies the browser-facing interfaces required by
-  the game. The packaged application does not need Node.js on the console.
-- **Memory-aware optimization:** A bounded 16 MiB cache reduces repeated
-  reads of small assets and map data; nearby map data can be warmed in idle
-  scenes. Large audio files are excluded. The renderer reuses appropriate
-  canvas surfaces to reduce allocation churn.
-- **File-system routing:** Resolves game resources and TCOAAL's hashed asset
-  paths from a user-selected SD-card directory, with an optional unpacked mod
-  overlay. Loader settings stay separate from game files; saves use the
-  explicitly selected storage location.
-- **Input and display:** Maps Switch controller input to game-facing controls,
-  provides fit/native display modes, and offers a long-press Minus menu for
-  loader settings and FPS display.
-- **Diagnostics:** An optional debug build exposes progress, runtime logs,
-  and diagnostic snapshots for investigating compatibility and performance.
+### Game Options
+![Game Options](docs/screenshots/game-options.jpg)
 
-## Installation and Usage
+Per-game settings: cover, keymap, mod, saves, language, and forwarder management.
 
-1. Download `burialnx.nro` from a project release or build it using
-   [Building & Debugging](<Building & Debugging.md>). A separate
-   `burialnx-debug.nro` is available for troubleshooting. No game content is
-   needed to build the loader.
-2. Copy the NRO to `sdmc:/switch/burialnx/` on a homebrew-enabled Switch.
-   Launch it in application mode rather than the memory-limited Album applet
-   mode, and select your Switch user.
-3. Copy your own legally obtained TCOAAL game files to the SD card. For
-   example, the folder layout can be:
+### Keymap Editor
+![Keymap Editor](docs/screenshots/keymap.jpg)
 
-   ```text
-   sdmc:/switch/burialnx/burialnx.nro
-   sdmc:/games/TCOAAL/
-   ├── save/                  # optional existing PC saves
-   └── www/
-       ├── index.html
-       ├── js/rpg_core.js
-       ├── data/
-       └── img/
-   ```
+Full visual keyboard picker — remap any joycon button to any keyboard key or gamepad action. Per-game keymaps with presets.
 
-   This is an example, not a fixed game path. In the picker, highlight the game
-   folder containing `www/` and press X. A folder directly containing
-   `index.html` and `js/rpg_core.js` also works. Use Up/Down to highlight, A
-   to open a folder, and B to go back. Press Y instead of X when selecting a
-   game only if you need the earlier loader's shared save keys.
-4. Choose Switch user save data, an existing separate SD-card folder, or
-   explicitly select a game-folder save location. For game-folder saves, press
-   Y and choose either `save/` next to `www/` or `www/save/`. The exact path
-   is shown before selection. A missing save folder is created on launch;
-   saving in-game writes there, including to existing slots. Back it up first.
-   For Switch or separate SD storage, you can optionally import compatible
-   Steam saves into an **empty** destination; the import is skipped when no
-   save slots are found. The release build remembers the selected game and
-   save location, prompting again if unavailable. The debug build asks for
-   the game, mod, and save location on startup.
+### In-Game Pause Menu
+![Pause Menu](docs/screenshots/pause-menu.jpg)
 
-Hold Minus during gameplay to open the loader menu; navigate with Up/Down and
-A, and close with B. The menu provides the game's load screen, display mode,
-FPS display, save-location selection, Steam-save import, and mod selection.
-Save-location and mod changes require restarting and do not move existing
-saves. To load a mod, select an unpacked folder whose paths match the game's
-`www/` tree; its files take precedence. Select Y for no mod. Archives are not
-supported. Use only trusted games and mods: their scripts run with native
-runtime privileges, and the loader is not a security sandbox. See
-[SECURITY.md](SECURITY.md).
+Hold **Minus** in-game to access the pause menu: save, load, edit keymap, switch language, or return to library.
 
-Switch saves belong to the selected user and application ID; an SD or game
-save folder is shared between users. Do not use the same game-folder saves on
-PC and Switch at the same time. Game-path-specific Switch save keys depend on
-the selected path, so moving the game can change which saves appear. Loader settings are in
-`sdmc:/switch/burialnx/settings.json`; they are not save files. Back up saves
-with a trusted save manager before testing or changing storage. See
-[Building & Debugging](<Building & Debugging.md>) for log collection and
-reporting instructions. Debug diagnostics are stored under
-`sdmc:/switch/burialnx/LOGS/`; nx.js may also write
-`sdmc:/switch/nxjs-debug.log`.
+### In-Game Options
+![Options](docs/screenshots/options.jpg)
 
-**Known limitation:** The Credits scene can hang or crash on Switch. Its title
-menu entry is disabled and script requests to open it are skipped as a
-temporary safeguard; this safeguard has been tested in desktop simulation but
-still needs verification on Switch. Other versions and mods may encounter
-additional issues.
+Options are fully translated — Always Dash, BGM/SFX Volume, On/Off — using the language pack's translation tables.
 
-## Legal Disclaimer
+---
 
-BurialNX is an independent homebrew project and is not affiliated with or
-endorsed by the game's creators, Nintendo, Valve, or Steam. No game assets,
-game files, ROMs, or proprietary Nintendo SDK code are included. Obtain game
-files and mods legally and verify your right to use and distribute any artwork
-or other third-party material. See [NOTICE.md](NOTICE.md) for licensing and
-attribution information; this disclaimer is not legal advice.
+## ✨ Features
+
+### 🎮 Library & Game Management
+- **Multi-game library** with JSON persistence on the SD card
+- **Cover thumbnails** — auto-extracted from .exe/.ico, or pick your own PNG/JPG/GIF/WebP
+- **Game reordering** — move games up/down with L/R shoulder buttons
+- **Rename games** — type a custom name, or pick one from a folder/file
+- **Mod support** — select a mod folder, enable/disable per-game
+- **Save management** — Switch user data, SD card, or game folder; import Steam saves
+
+### 🌍 Localization (.cld files in games)
+- **`.cld` language pack** loading — text, embedded font, translated images
+- **Full translation** — menu items, dialogue, options (Always Dash → Всегда бежать, BGM Volume → Громкость музыки, On/Off → Вкл./Выкл.)
+- **YEP_MessageCore override** — dialogue windows use the localized font with Cyrillic glyphs
+- **Language switching** — cycle languages with L/R in pause menu or library settings
+- **Preference persisted** in library.json (works in forwarder NROs with saveData=0)
+
+### 🎨 Visual
+- **Selection border** renders on top of cover images
+- **Cover format support** — PNG, JPG, JPEG, GIF, WebP, ICO, EXE (auto-detect from magic bytes)
+- **Marquee scrolling** for long game names
+- **Touch screen** support for part of UI navigation - Key Remapping.
+
+### 🕹️ Key Remapping
+- **Visual keyboard picker** — 60+ keys, navigate with D-pad or touch
+- **Per-game keymaps** — override the global default per game
+- **Stick bindings** — L-stick and R-stick directions map to keys
+- **Presets** — L/ZL/R/ZR apply common configurations instantly
+
+### 📦 Forwarder NROs
+- **Self-contained forwarder** — baked-in game ID, no chain-loading
+- **Auto-naming** — folder/file based on sanitized game name (spaces → underscores)
+- **Rename on game rename** — forwarder folder + .nro are renamed automatically
+- **Clean deletion** — removes .nro, folder, and leftover files
+
+### 🔧 Technical
+- **Node.js / NW.js compatibility** — polyfills `require`, `process`, `Buffer`, `nw` globals
+- **Audio panning** — StereoPanner fallback for nx.js's missing createPanner
+- **Exit crash fix** — removes beforeunload listener before Switch.exit (prevents infinite recursion)
+- **Memory management** — explicit GC after forwarder build (frees 54 MB)
+- **Debug build** — extra logging, diagnostic snapshots, numbered log files
+
+---
+
+## 🚀 Installation
+
+### Requirements
+- Nintendo Switch with Atmosphère or hbmenu
+- SD card
+
+### Steps
+1. Download `BurialNX-*.nro` from [Releases](../../releases)
+2. Copy to `sdmc:/switch/burialnx/burialnx.nro`
+3. Launch from hbmenu
+4. Select "Add Game" and browse to your game's `www` folder
+5. Play!
+
+### Game Setup
+- Game must have `www/index.html` and `www/js/rpg_core.js`
+- Place `.cld` language packs in `www/languages/`
+- Cover images: place in the game folder or use auto-detect from .exe
+
+---
+
+## 🎯 Controls
+
+| Button | Action |
+|--------|--------|
+| **D-Pad** | Navigate library/options |
+| **A** | Select / Play / Confirm |
+| **B** | Back / Cancel |
+| **X** | Game options (in library) |
+| **Y** | Add game |
+| **L / R** | Reorder games (library) / Cycle language (pause menu & options) |
+| **Minus** | Pause menu (hold in-game) |
+| **Plus** | Quit (hold) |
+
+---
+
+## 🏗️ Building from Source
+
+### Prerequisites
+- Node.js 18+
+- npm
+
+### Build
+```bash
+git clone https://github.com/greg6821-debug/BurialNX.git
+cd BurialNX
+npm install
+npm test          # 148 tests
+npm run build     # → burialnx.nro
+npm run build -- --debug  # → burialnx-debug.nro
+```
+
+### GitHub Actions
+This repo includes a manual build workflow. Go to **Actions → "Build NRO" → Run workflow**, enter a version tag, and GitHub builds the .nro and creates a release automatically.
+
+---
+
+## 📜 License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+BurialNX is an independent homebrew project. It is not affiliated with or endorsed by the creators of The Coffin of Andy and Leyley. All game content belongs to their respective owners.

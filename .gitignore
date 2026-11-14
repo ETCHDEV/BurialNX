@@ -12,3 +12,6 @@ mods/
 # Supply artwork locally only after confirming redistribution rights.
 icon.jpg
 icon.png
+# Temp dir used by tools/test.mjs to load the forwarder.test.ts bundle
+# (needs to be inside the project so Node can resolve `esbuild`).
+.test-tmp/

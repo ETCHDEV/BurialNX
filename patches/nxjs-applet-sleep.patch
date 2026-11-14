@@ -1,0 +1,83 @@
+diff --git a/source/applet.cc b/source/applet.cc
+index aceec02..b1d1a33 100644
+--- a/source/applet.cc
++++ b/source/applet.cc
+@@ -5,6 +5,57 @@ using namespace v8;
+ 
+ namespace {
+ 
++// === Sleep / wake detection via applet focus-state hook =================
++// nx.js's main loop (source/main.cc) pumps libnx's appletMainLoop() every
++// iteration. appletMainLoop() processes OS applet messages, including
++// AppletMessage_FocusStateChanged, and invokes any registered AppletHook
++// callbacks for AppletHookType_OnFocusState. When the console enters Sleep
++// Mode the applet goes OutOfFocus (the hook fires); on wake it returns to
++// InFocus (the hook fires again). The hook callback runs INSIDE
++// appletMainLoop()'s message processing on wake — BEFORE the loop iteration
++// returns to JS — so a JS poll of the flag (appletConsumeSleepWake, exposed
++// below) reliably observes the transition.
++//
++// Why a hook (not a poll of appletGetFocusState): the main loop is BLOCKED
++// while the applet is suspended (sleep), so the OutOfFocus state is never
++// observed from a JS-side poll, and on wake only the InFocus message is
++// processed (a before/after poll sees InFocus both times). The hook captures
++// the OutOfFocus→InFocus transition regardless, because libnx invokes it
++// while processing the wake message.
++//
++// A synchronous load stall (the game's Scene_Boot / first map-data load, the
++// cause of the original false-positive "restart mid-load" bug) NEVER changes
++// the applet focus state, so the hook never fires for it — zero false
++// positives. This is the deterministic signal BurialNX's sleep-detect.ts
++// prefers over the steady-frame heuristic fallback.
++static volatile bool g_sleep_woke = false;
++static AppletFocusState g_last_focus = AppletFocusState_InFocus;
++static AppletHookCookie g_applet_hook_cookie;
++
++static void nx_applet_hook_cb(AppletHookType type, AppletHookParam *param, void * /*arg*/) {
++	if (type == AppletHookType_OnFocusState) {
++		AppletFocusState fs = param ? param->focus_state : AppletFocusState_InFocus;
++		// A wake is: we were NOT in focus (sleeping / background) and now we are.
++		if (fs == AppletFocusState_InFocus && g_last_focus != AppletFocusState_InFocus) {
++			g_sleep_woke = true;
++		}
++		g_last_focus = fs;
++	}
++	// Other hook types (OnOperationMode, OnPerformanceMode, OnExitRequest) are
++	// not sleep signals — ignore them.
++}
++
++void nx_applet_consume_sleep_wake(const FunctionCallbackInfo<Value> &info) {
++	Isolate *iso = info.GetIsolate();
++	bool woke = g_sleep_woke;
++	g_sleep_woke = false;
++	info.GetReturnValue().Set(Boolean::New(iso, woke));
++}
++
++void nx_applet_get_focus_state(const FunctionCallbackInfo<Value> &info) {
++	info.GetReturnValue().Set(Integer::New(info.GetIsolate(), (int)appletGetFocusState()));
++}
++
+ void nx_applet_illuminance(const FunctionCallbackInfo<Value> &info) {
+ 	Isolate *iso = info.GetIsolate();
+ 	float illuminance = 0.0f;
+@@ -39,10 +90,20 @@ void nx_applet_set_media_playback_state(
+ } // namespace
+ 
+ void nx_init_applet(Isolate *iso, Local<Object> init_obj) {
++	// Register the focus-state hook ONCE, at runtime init (before the main
++	// loop starts). appletHook is idempotent for a given cookie+type; this is
++	// the only registration site. The cookie is static so it lives for the
++	// process lifetime.
++	appletHook(&g_applet_hook_cookie, AppletHookType_OnFocusState,
++	           nx_applet_hook_cb, nullptr);
++
+ 	NX_SET_FUNC(init_obj, "appletIlluminance", nx_applet_illuminance);
+ 	NX_SET_FUNC(init_obj, "appletGetAppletType", nx_applet_get_applet_type);
+ 	NX_SET_FUNC(init_obj, "appletGetOperationMode",
+ 	            nx_applet_get_operation_mode);
+ 	NX_SET_FUNC(init_obj, "appletSetMediaPlaybackState",
+ 	            nx_applet_set_media_playback_state);
++	NX_SET_FUNC(init_obj, "appletGetFocusState", nx_applet_get_focus_state);
++	NX_SET_FUNC(init_obj, "appletConsumeSleepWake",
++	            nx_applet_consume_sleep_wake);
+ }

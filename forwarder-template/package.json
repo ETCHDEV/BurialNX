@@ -1,0 +1,19 @@
+{
+  "name": "burialnx-forwarder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BurialNX per-game forwarder template (chain-launches burialnx.nro with --game <id>).",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "node ../tools/build-forwarder-template.mjs"
+  },
+  "nacp": {
+    "id": "01a144e6a07a0100",
+    "title": "BurialNX Forwarder",
+    "author": "BurialNX contributors",
+    "userAccountSaveDataSize": "0",
+    "version": "0.1.0"
+  },
+  "devDependencies": {}
+}
