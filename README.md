@@ -9,7 +9,6 @@ BurialNX is a Nintendo Switch homebrew application built on [nx.js](https://gith
 ## 📸 Screenshots
 
 ### Library
-![Library](docs/screenshots/library.jpg)
 
 Browse your game library with cover thumbnails. Reorder games with **L/R** shoulder buttons.
 
