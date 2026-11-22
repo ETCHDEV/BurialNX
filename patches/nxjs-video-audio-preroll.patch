@@ -1,0 +1,40 @@
+--- a/source/media-decoder.cc
++++ b/source/media-decoder.cc
+@@ -592,7 +592,14 @@
+ 	if (m->fmt->duration != AV_NOPTS_VALUE && m->fmt->duration > 0)
+ 		m->duration = (double)m->fmt->duration / AV_TIME_BASE;
+ 
+-	m->thread = std::thread(decode_thread_main, m);
++	// A movie's audio-graph node is created on the JS thread AFTER open
++	// resolves. Starting the worker first may consume and silently discard
++	// audio packets before the node exists (including Opus/AAC priming).
++	// In the audio path, publish both the pointer and graph rate by thread
++	// creation below, before the first av_read_frame. Silent video can start
++	// prebuffering immediately, without waiting for a nonexistent sink.
++	if (m->astream < 0)
++		m->thread = std::thread(decode_thread_main, m);
+ 	return m;
+ 
+ fail:
+@@ -608,11 +615,21 @@
+ 
+ void nx_media_set_audio_node(nx_media_t *m, nx_audio_node *node,
+                              double sample_rate) {
++	// Main-thread operation. Once decoding has started, the worker owns its
++	// stream configuration. An intentionally silent play() cannot be turned
++	// into a racy late attach; callers must attach before play().
++	if (m->thread.joinable())
++		return;
+ 	m->audio_node = node;
+ 	m->audio_out_rate = sample_rate;
++	m->thread = std::thread(decode_thread_main, m);
+ }
+ 
+ void nx_media_play(nx_media_t *m) {
++	// Explicit playback with no audio sink (e.g. a headless caller) is
++	// permitted. The normal Video binding attaches its node first.
++	if (!m->thread.joinable())
++		m->thread = std::thread(decode_thread_main, m);
+ 	if (m->playing.load())
+ 		return;
+ 	m->clock_anchor = std::chrono::steady_clock::now();

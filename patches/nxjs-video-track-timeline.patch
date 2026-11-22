@@ -1,0 +1,408 @@
+--- a/source/audio-graph.h
++++ b/source/audio-graph.h
+@@ -126,6 +126,14 @@
+ 	std::atomic<uint64_t> stream_read_pos{0};
+ 	// When false the node outputs silence and consumes nothing (pause).
+ 	std::atomic<bool> stream_playing{false};
++	// Only media streams opt in. Positions in the PCM FIFO count actual samples;
++	// this separate clock counts output-device frames, including silent holes.
++	// A bounded timestamp per queued sample (384 KB at 48 kHz) lets a future
++	// packet wait for its own PTS without allocating silence proportional to a gap.
++	std::unique_ptr<int64_t[]> stream_due;
++	std::atomic<int64_t> stream_output_frame{0};
++	std::atomic<bool> stream_primed{false};
++	std::atomic<uint64_t> stream_seek_request{0}, stream_seek_ack{0};
+ };
+ 
+ struct nx_audio_graph {
+@@ -189,6 +197,12 @@
+ // Write up to `frames` interleaved stereo frames; returns frames written.
+ uint32_t nx_audio_stream_write(nx_audio_node *n, const float *interleaved,
+                                uint32_t frames);
++// Configure before connecting the producer, publish timestamped stereo PCM and
++// reset the timeline atomically with the FIFO on a decoder-thread seek.
++void nx_audio_stream_enable_timing(nx_audio_node *n);
++uint32_t nx_audio_stream_write_timed(nx_audio_node *n, const float *interleaved,
++                                     uint32_t frames, int64_t due_frame);
++void nx_audio_stream_reposition(nx_audio_node *n, int64_t at_frame);
+ // Gate consumption (false = output silence, consume nothing, clock frozen).
+ void nx_audio_stream_set_playing(nx_audio_node *n, bool playing);
+ // Total frames consumed by the render thread (the media clock).
+--- a/source/audio-graph.cc
++++ b/source/audio-graph.cc
+@@ -268,6 +268,27 @@
+ 		return;
+ 	uint64_t read = n->stream_read_pos.load(std::memory_order_relaxed);
+ 	uint64_t write = n->stream_write_pos.load(std::memory_order_acquire);
++	if (n->stream_due) {
++		// Rendering holds the graph mutex. A pause/seek never consumes the future
++		// queue; gaps and the trailer output silence but advance the DEVICE clock.
++		if (!n->stream_primed.load(std::memory_order_acquire) ||
++		    n->stream_seek_ack.load(std::memory_order_acquire) !=
++		        n->stream_seek_request.load(std::memory_order_acquire)) return;
++		auto cursor = n->stream_output_frame.load(std::memory_order_relaxed);
++		uint32_t i = 0;
++		while (i < (uint32_t)Q && read < write) {
++			uint32_t k = (uint32_t)(read % n->stream_capacity);
++			int64_t ahead = n->stream_due[k] - (cursor + i);
++			if (ahead > 0) { i += (uint32_t)std::min<int64_t>(ahead, Q - i); continue; }
++			++read;
++			if (ahead < 0) continue; // late after a real decoder underrun/overlap
++			n->bus[0][i] = n->stream_ring[k * 2];
++			n->bus[1][i++] = n->stream_ring[k * 2 + 1];
++		}
++		n->stream_read_pos.store(read, std::memory_order_release);
++		n->stream_output_frame.store(cursor + Q, std::memory_order_release);
++		return;
++	}
+ 	uint32_t avail = (uint32_t)(write - read);
+ 	uint32_t frames = avail < (uint32_t)Q ? avail : (uint32_t)Q;
+ 	const float *ring = n->stream_ring.get();
+@@ -376,7 +397,8 @@
+ 	// Sources not reachable from the destination still progress through their
+ 	// schedule (so `ended` fires even for unconnected/indirect sources).
+ 	for (nx_audio_node *n : g->nodes) {
+-		if (n->type == NX_AUDIO_NODE_BUFFER_SOURCE &&
++		if ((n->type == NX_AUDIO_NODE_BUFFER_SOURCE ||
++		     (n->type == NX_AUDIO_NODE_STREAM_SOURCE && n->stream_due)) &&
+ 		    n->processed_quantum != g->quantum_id)
+ 			process_node(g, n, t0);
+ 	}
+@@ -632,8 +654,20 @@
+ 	return n->stream_capacity - (uint32_t)(write - read);
+ }
+ 
+-uint32_t nx_audio_stream_write(nx_audio_node *n, const float *interleaved,
+-                               uint32_t frames) {
++void nx_audio_stream_enable_timing(nx_audio_node *n) {
++	auto due = std::make_unique<int64_t[]>(n->stream_capacity);
++	std::lock_guard<std::mutex> lock(n->graph->mutex);
++	n->stream_due = std::move(due);
++}
++
++void nx_audio_stream_reposition(nx_audio_node *n, int64_t frame) {
++	std::lock_guard<std::mutex> lock(n->graph->mutex);
++	n->stream_read_pos.store(n->stream_write_pos.load(std::memory_order_relaxed), std::memory_order_release);
++	n->stream_output_frame.store(frame, std::memory_order_release);
++}
++
++uint32_t nx_audio_stream_write_timed(nx_audio_node *n, const float *interleaved,
++                                     uint32_t frames, int64_t due_frame) {
+ 	if (!n->stream_ring)
+ 		return 0;
+ 	uint64_t read = n->stream_read_pos.load(std::memory_order_acquire);
+@@ -644,11 +678,18 @@
+ 	float *ring = n->stream_ring.get();
+ 	for (uint32_t i = 0; i < frames; i++) {
+ 		uint32_t idx = (uint32_t)((write + i) % n->stream_capacity);
++		if (n->stream_due) n->stream_due[idx] = due_frame + i;
+ 		ring[idx * 2] = interleaved[i * 2];
+ 		ring[idx * 2 + 1] = interleaved[i * 2 + 1];
+ 	}
+ 	n->stream_write_pos.store(write + frames, std::memory_order_release);
+ 	return frames;
++}
++
++uint32_t nx_audio_stream_write(nx_audio_node *n, const float *interleaved,
++                               uint32_t frames) {
++	return nx_audio_stream_write_timed(n, interleaved, frames,
++	    (int64_t)n->stream_write_pos.load(std::memory_order_relaxed));
+ }
+ 
+ void nx_audio_stream_set_playing(nx_audio_node *n, bool playing) {
+--- a/source/media-decoder.cc
++++ b/source/media-decoder.cc
+@@ -13,7 +13,9 @@
+ #include <libswscale/swscale.h>
+ }
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <chrono>
+ #include <condition_variable>
+ #include <math.h>
+@@ -36,8 +38,7 @@
+ // Present a frame when its PTS is within this much of the clock (one frame of
+ // slack at 24 fps is ~41 ms; this is just sub-frame jitter tolerance).
+ constexpr double PRESENT_EPSILON = 0.001;
+-// Snap the wall clock to the audio clock when they drift further than this.
+-constexpr double AV_RESYNC_THRESHOLD = 0.05;
++// A timed stream advances on output quanta, including silence, without periodic backward snaps.
+ 
+ struct video_slot {
+ 	uint8_t *bgra = nullptr;
+@@ -82,16 +83,17 @@
+ 	nx_audio_node *audio_node = nullptr;
+ 	double audio_out_rate = 48000;
+ 	std::vector<float> audio_scratch;
+-	// Mapping from the stream node's consumed-frame counter to media time:
+-	// audio_time(consumed) = audio_pts_base + (consumed - audio_base) / rate.
+-	std::atomic<bool> audio_clock_valid{false};
+-	std::atomic<double> audio_pts_base{0};
+-	std::atomic<uint64_t> audio_base{0};
++	// Worker-only PTS for the next PCM output frame; smooth container timestamp
++	// rounding, but never concatenate genuinely discontinuous audio.
++	int64_t next_audio_due = -1;
++	uint64_t worker_seek_tag = 0;
++	std::atomic<double> video_end_pts{0};
+ 
+ 	// ---- clock (main thread only) ----
+ 	double clock_base = 0;
+ 	std::chrono::steady_clock::time_point clock_anchor;
+ 	bool clock_running = false;
++	bool ever_played = false; // distinguish real pause from pre-first-frame readiness
+ 
+ 	// ---- presentation quality counters (main thread only) ----
+ 	uint64_t presented_frames = 0;
+@@ -193,6 +195,23 @@
+ 	return true;
+ }
+ 
++// Convert seconds to a signed output-sample coordinate; refuse impossible
++// timestamps before integer conversion (corrupt local files are not trusted).
++int64_t to_sample(double seconds, double rate) {
++	if (!std::isfinite(seconds)) return 0;
++	return (int64_t)llround(std::clamp(seconds, -1e9, 1e9) * rate);
++}
++
++void acknowledge_seek(nx_media *m) {
++	std::lock_guard<std::mutex> guard(m->ctl_mutex);
++	if (m->seek_requested.load(std::memory_order_acquire)) return;
++	if (m->audio_node) {
++		if (m->audio_node->stream_seek_request.load() != m->worker_seek_tag) return;
++		m->audio_node->stream_seek_ack.store(m->worker_seek_tag, std::memory_order_release);
++	}
++	m->seeking.store(false, std::memory_order_release);
++}
++
+ // Blocks until a ring slot is free, then converts `frame` to BGRA into it.
+ // Returns false if interrupted (quit/seek).
+ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
+@@ -218,6 +237,15 @@
+ 	sws_scale(m->sws, frame->data, frame->linesize, 0, frame->height, dst,
+ 	          dst_stride);
+ 	slot->pts = pts;
++#if LIBAVUTIL_VERSION_MAJOR >= 58
++	auto ticks = frame->duration;
++#else
++	auto ticks = frame->pkt_duration;
++#endif
++	double interval = ticks > 0 ? ticks * av_q2d(m->fmt->streams[m->vstream]->time_base) : m->vframe_dur;
++	if (std::isfinite(pts) && std::isfinite(interval) && interval > 0)
++		m->video_end_pts.store(pts + interval, std::memory_order_release);
++	if (m->audio_node) m->audio_node->stream_primed.store(true, std::memory_order_release);
+ 	m->vwrite.store(w + 1, std::memory_order_release);
+ 	return true;
+ }
+@@ -225,7 +253,7 @@
+ // Resample an audio frame to interleaved stereo f32 at the output rate and
+ // push it into the stream node (blocking on backpressure). Returns false if
+ // interrupted.
+-bool enqueue_audio(nx_media *m, AVFrame *frame, double pts) {
++bool enqueue_audio(nx_media *m, AVFrame *frame, double pts, bool no_timestamp) {
+ 	if (!m->swr) {
+ 		AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+ 		int ret = swr_alloc_set_opts2(
+@@ -237,6 +265,7 @@
+ 			return false;
+ 		}
+ 	}
++	int64_t initial_delay = swr_get_delay(m->swr, (int64_t)m->audio_out_rate);
+ 	int64_t max_out = av_rescale_rnd(
+ 	    swr_get_delay(m->swr, frame->sample_rate) + frame->nb_samples,
+ 	    (int64_t)m->audio_out_rate, frame->sample_rate, AV_ROUND_UP);
+@@ -248,21 +277,19 @@
+ 	if (got <= 0)
+ 		return true;
+ 
+-	if (!m->audio_clock_valid.load(std::memory_order_relaxed)) {
+-		// First audio after open/seek: anchor the audio clock at this
+-		// frame's PTS and the node's current write position.
+-		m->audio_base.store(
+-		    m->audio_node->stream_write_pos.load(std::memory_order_relaxed),
+-		    std::memory_order_relaxed);
+-		m->audio_pts_base.store(pts, std::memory_order_relaxed);
+-		m->audio_clock_valid.store(true, std::memory_order_release);
+-	}
+-
++	// The output samples include the resampler's previously delayed input.
++	int64_t due = to_sample(pts, m->audio_out_rate) - initial_delay;
++	if (m->next_audio_due >= 0 && (no_timestamp ||
++	    llabs(due - m->next_audio_due) <= (int64_t)(0.002 * m->audio_out_rate)))
++		due = m->next_audio_due;
++	m->next_audio_due = due + got;
+ 	const float *src = m->audio_scratch.data();
+ 	uint32_t remaining = (uint32_t)got;
+ 	while (remaining > 0) {
+ 		uint32_t wrote =
+-		    nx_audio_stream_write(m->audio_node, src, remaining);
++		    nx_audio_stream_write_timed(m->audio_node, src, remaining, due);
++		if (wrote) m->audio_node->stream_primed.store(true, std::memory_order_release);
++		due += wrote;
+ 		src += (size_t)wrote * 2;
+ 		remaining -= wrote;
+ 		if (remaining > 0 && !decode_wait(m))
+@@ -298,11 +325,10 @@
+ 			continue;
+ 		}
+ 		bool ok = is_video ? enqueue_video(m, frame, pts)
+-		                   : enqueue_audio(m, frame, pts);
+-		if (is_video && ok && m->seeking.load(std::memory_order_relaxed) &&
+-		    seek_drop_until >= 0) {
+-			// First on-target frame after a seek: the seek is complete.
+-			m->seeking.store(false, std::memory_order_release);
++		                   : enqueue_audio(m, frame, pts, frame->pts == AV_NOPTS_VALUE && frame->best_effort_timestamp == AV_NOPTS_VALUE);
++		if (ok && seek_drop_until >= 0 && m->seeking.load(std::memory_order_acquire)) {
++			// An audio-only trailer may have no further video frame to complete a seek.
++			acknowledge_seek(m);
+ 		}
+ 		av_frame_unref(frame);
+ 		if (!ok)
+@@ -347,14 +373,20 @@
+ 
+ // Handle a user-requested seek (decode thread).
+ void do_seek(nx_media *m, double *seek_drop_until) {
+-	double target = m->seek_target.load();
++	double target;
++	{
++		std::lock_guard<std::mutex> guard(m->ctl_mutex);
++		target = m->seek_target.load();
++		if (m->audio_node) m->worker_seek_tag = m->audio_node->stream_seek_request.load();
++	}
++	m->next_audio_due = -1;
++	m->video_end_pts.store(0, std::memory_order_release);
+ 	// Discard everything queued: the main thread is guaranteed not to touch
+ 	// the video ring while `seeking` is true.
+ 	m->vread.store(0, std::memory_order_relaxed);
+ 	m->vwrite.store(0, std::memory_order_relaxed);
+ 	if (m->audio_node) {
+-		nx_audio_stream_flush(m->audio_node);
+-		m->audio_clock_valid.store(false, std::memory_order_relaxed);
++		nx_audio_stream_reposition(m->audio_node, to_sample(target, m->audio_out_rate));
+ 	}
+ 	m->loop_offset = 0;
+ 	m->eof.store(false);
+@@ -366,8 +398,8 @@
+ 	*seek_drop_until = target;
+ 	m->present_force.store(true);
+ 	if (m->vstream < 0) {
+-		// No video track: nothing will flip `seeking` in receive_frames.
+-		m->seeking.store(false);
++		// No video track: accept the new cursor immediately.
++		acknowledge_seek(m);
+ 	}
+ }
+ 
+@@ -409,6 +441,7 @@
+ 				m->loop_offset += advance;
+ 				continue;
+ 			}
++			if (m->seeking.load(std::memory_order_acquire)) acknowledge_seek(m);
+ 			m->eof.store(true);
+ 			continue;
+ 		}
+@@ -447,28 +480,15 @@
+ // ---------------------------------------------------------------------------
+ 
+ double clock_now(nx_media *m) {
+-	double t = m->clock_base;
+-	if (m->clock_running) {
+-		t += std::chrono::duration<double>(
+-		         std::chrono::steady_clock::now() - m->clock_anchor)
+-		         .count();
+-	}
+-	// Slave to the audio clock when audio is flowing.
+-	if (m->clock_running && m->audio_node &&
+-	    m->audio_clock_valid.load(std::memory_order_acquire)) {
+-		uint64_t consumed = nx_audio_stream_consumed(m->audio_node);
+-		uint64_t base = m->audio_base.load(std::memory_order_relaxed);
+-		if (consumed > base) {
+-			double at = m->audio_pts_base.load(std::memory_order_relaxed) +
+-			            (double)(consumed - base) / m->audio_out_rate;
+-			if (fabs(at - t) > AV_RESYNC_THRESHOLD) {
+-				m->clock_base = at;
+-				m->clock_anchor = std::chrono::steady_clock::now();
+-				t = at;
+-			}
+-		}
+-	}
+-	return t;
++	if (!m->clock_running) return m->clock_base;
++	if (m->audio_node) {
++		// Actual 48 kHz output frames, not just frames with real PCM. Once the
++		// audio track ends, silence is still being submitted and time must move
++		// forward. Sample PTS separately determine which queued audio is audible.
++		return (double)m->audio_node->stream_output_frame.load(std::memory_order_acquire) / m->audio_out_rate;
++	}
++	return m->clock_base + std::chrono::duration<double>(
++	    std::chrono::steady_clock::now() - m->clock_anchor).count();
+ }
+ 
+ } // namespace
+@@ -579,6 +599,11 @@
+ 	if (m->astream >= 0) {
+ 		AVCodecParameters *par = m->fmt->streams[m->astream]->codecpar;
+ 		m->actx = avcodec_alloc_context3(acodec);
++		// Demuxed packet timestamps are in AVStream time_base. The decoder needs
++		// this to advance the first frame's PTS along with codec skip_samples
++		// (e.g. Opus pre-skip). Otherwise trimmed PCM keeps a negative packet PTS
++		// and incorrectly loses its first samples a second time on presentation.
++		if (m->actx) m->actx->pkt_timebase = m->fmt->streams[m->astream]->time_base;
+ 		if (!m->actx ||
+ 		    avcodec_parameters_to_context(m->actx, par) < 0 ||
+ 		    avcodec_open2(m->actx, acodec, NULL) < 0) {
+@@ -620,6 +645,7 @@
+ 	// into a racy late attach; callers must attach before play().
+ 	if (m->thread.joinable())
+ 		return;
++	if (node) nx_audio_stream_enable_timing(node);
+ 	m->audio_node = node;
+ 	m->audio_out_rate = sample_rate;
+ 	m->thread = std::thread(decode_thread_main, m);
+@@ -634,6 +660,7 @@
+ 		return;
+ 	m->clock_anchor = std::chrono::steady_clock::now();
+ 	m->clock_running = true;
++	m->ever_played = true;
+ 	m->playing.store(true);
+ 	if (m->audio_node)
+ 		nx_audio_stream_set_playing(m->audio_node, true);
+@@ -643,7 +670,10 @@
+ void nx_media_pause(nx_media_t *m) {
+ 	if (!m->playing.load())
+ 		return;
+-	m->clock_base = clock_now(m);
++	// The seek target is already public while the worker is resetting the
++	// underlying audio FIFO. Never freeze the old cursor into a paused seek.
++	m->clock_base = m->seeking.load(std::memory_order_acquire)
++	    ? m->seek_target.load() : clock_now(m);
+ 	m->clock_running = false;
+ 	m->playing.store(false);
+ 	if (m->audio_node)
+@@ -655,7 +685,10 @@
+ 		seconds = 0;
+ 	if (m->duration > 0 && seconds > m->duration)
+ 		seconds = m->duration;
+-	// Stop presentation/clock reads of the ring first.
++	// Stop consumption and keep request/ack epochs independent of play/pause.
++	// A superseded asynchronous seek cannot re-enable audio for an old target.
++	std::lock_guard<std::mutex> guard(m->ctl_mutex);
++	if (m->audio_node) m->audio_node->stream_seek_request.fetch_add(1, std::memory_order_release);
+ 	m->seeking.store(true, std::memory_order_release);
+ 	m->clock_base = seconds;
+ 	m->clock_anchor = std::chrono::steady_clock::now();
+@@ -731,7 +764,12 @@
+ 	if (m->vwrite.load(std::memory_order_acquire) !=
+ 	    m->vread.load(std::memory_order_relaxed))
+ 		return false;
+-	if (m->audio_node && m->audio_clock_valid.load()) {
++	// Keep the final picture (including longer final exposures) on screen for
++	// its actual display interval. The paused preroll readiness check used by
++	// beta.7's canplay state must not depend on a clock that has not started.
++	if (m->ever_played && clock_now(m) + 1e-6 < m->video_end_pts.load(std::memory_order_acquire))
++		return false;
++	if (m->audio_node) {
+ 		uint64_t written =
+ 		    m->audio_node->stream_write_pos.load(std::memory_order_acquire);
+ 		if (nx_audio_stream_consumed(m->audio_node) < written)

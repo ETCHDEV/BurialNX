@@ -1,0 +1,46 @@
+{
+  "release": "0.1.6-cg.6",
+  "target": "Nintendo Switch AArch64, static PIE / NRO",
+  "upstream": "https://github.com/TooTallNate/nx.js",
+  "upstreamTag": "v1.0.0-beta.7",
+  "commit": "a649611a1a4daca09924cd1a436c7ca786f91592",
+  "patch": "patches/nxjs-video-audio-preroll.patch",
+  "patchSha256": "64b781ca40a6cd97214059dea5f8a865e0a3a2544f89c698015996c79f89fbce",
+  "upstreamMediaDecoderSha256": "63f1fc541f57dc44b802e99744e2e0f824d9f99668cc6c8402c529c13a5a2327",
+  "patchedMediaDecoderSha256": "ba3568226f639d12c0b820de662bcb8d09437438c8f11c5c4188c699d2761ced",
+  "pinnedUpstreamRuntimeExe": "3fbafb0da26d7ba6e8a2c1be208d575559419b231365debda5046a81ed8df1a6",
+  "unpatchedLocalControlExe": "3ab5409949ad2629ebb2eef46b657a1e546520c22e1e7fb1cd5cfa156468debe",
+  "fixedExeSha256": "d19416181cc10974ac8b44f902fb0232f032f78e38021f7dbce1dcc3c2834cb6",
+  "prerollGzipSha256": "aed903bf861be6e7baaa9dda3522dfeda60b2c4646a7d7dc9557101247d92874",
+  "rawProgramBytes": 55603200,
+  "standaloneRuntimeNroSha256": "c12f27fa3e1f36adbaa72b0866029fcb552495e13309f1f1491eb86baf557b61",
+  "secondDirectoryStandaloneNroByteIdentical": true,
+  "armElfBuildId": "a7fa807f9fe38328a28c9573fc1d7ddb530c5fc1",
+  "runtimeJsContentsUnchanged": true,
+  "toolVersions": {
+    "gcc": "devkita64-gcc 15.2.0-7",
+    "binutils": "devkita64-binutils 2.45.1-2",
+    "libnx": "4.12.0-1",
+    "switch-ffmpeg": "7.1-5",
+    "switch-libjpeg-turbo": "2.1.2-2"
+  },
+  "macHostToolsVerifiedWithDkpReleaseSignatures": true,
+  "upstreamPinnedSdkImage": "ghcr.io/tootallnate/pacman-packages@sha256:92880d77878639768fe3696800104d68de1dfec65802bf7915689dd7bd718e53",
+  "sourcePackage": {
+    "ffmpegRecipeCommit": "5cf3a4da7665a04032565a3e788656cb485dd279",
+    "ffmpegSha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6",
+    "ffmpegConfiguredWithGPL": true,
+    "nxjsArchiveSha256": "0477b6b094b69984f97cac3f2a84fef352e2e7bdb01387596425662b2a7622d3"
+  },
+  "hardwarePlaybackObserved": false,
+  "previousReleaseExeSha256": "b3f8593f44e22d0281d94c7a51bbfe96072f48ab1ee81eb7efa2998f84ffdbf4",
+  "patchedSourceSha256": {
+    "media-decoder.cc": "ba3568226f639d12c0b820de662bcb8d09437438c8f11c5c4188c699d2761ced",
+    "media-decoder.h": "2f9d816880b9ed51f101fa7fbc32bf4666ef434faecddc2d1306b59556ea9d22",
+    "audio-graph.cc": "a1c56f338022d3a6ea93893555c29da9c92473e121007d53ce1734d803afbe96",
+    "audio-graph.h": "f0ae69e9ef63357e520b7e9869097ecc5392121cb3ec32422dcf263008eb8c1c"
+  },
+  "timelinePatch": "patches/nxjs-video-track-timeline.patch",
+  "timelinePatchSha256": "95581fdc088cbce4e7f1378bb46e3f871f9e868f59afa8e616855b8ede47b672",
+  "nativeCoreUnchangedSince": "0.1.6-cg.5"
+}

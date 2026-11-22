@@ -51,6 +51,7 @@ export function frame(now: number) {
                         requestAnimationFrame(frame);
                         return;
                 }
+                S.host?.setMovieSuspended(S.phase !== 'game' || S.menu.blocksInput);
                 const woke = detectWakeThisFrame(Date.now());
                 if (woke) {
                         if (S.phase === 'game' || S.phase === 'notice') {
@@ -693,8 +694,10 @@ export function frame(now: number) {
                         }
                         // A3 (toggle S.skipPresent): skip present() when render was skip'ed and no
                         // overlay is active. See docs/doc/fps-optimizations.md.
-                        const overlayActive = S.menu.blocksInput || S.menu.fps || (S.mouseVisible && !S.menu.blocksInput);
-                        if (!(S.skipPresent && !S.lastFrameRendered && !overlayActive)) {
+                        const overlayActive = S.menu.blocksInput || S.menu.fps || (S.mouseVisible && !S.menu.blocksInput) || S.host?.needsMoviePresent();
+                        // A game may draw its first post-movie scene after host.present() via
+                        // a plugin rAF. Never suppress a real, unpresented offscreen change.
+                        if (!S.skipPresent || S.lastFrameRendered || overlayActive || S.host?.hasUnpresentedGameFrame()) {
                                 S.host?.present();
                         }
                         if (S.menu.blocksInput || !S.host?.direct()) hud();

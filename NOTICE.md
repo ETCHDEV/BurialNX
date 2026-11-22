@@ -12,7 +12,7 @@ prior project and is not a source of game redistribution permission. This is
 not a clean-room implementation or a legal opinion.
 
 nx.js is MIT-licensed; see [LICENSES/nx.js-MIT.txt](LICENSES/nx.js-MIT.txt).
-The fat NRO includes a prebuilt nx.js runtime and its bundled components. Their
+The cg.5 fat NRO embeds a locally cross-compiled nx.js v1.0.0-beta.7 runtime with the patches `patches/nxjs-video-audio-preroll.patch` and `patches/nxjs-video-track-timeline.patch`; see `runtime/README.md` for source and build information. Its bundled components retain their separate licenses. Their
 own third-party licenses and any corresponding-source or notice requirements
 must be checked against the exact packaged runtime before a public binary
 release. Build-time dependencies and their licenses are recorded in

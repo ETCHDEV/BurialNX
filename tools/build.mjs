@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { prepareIcon } from './icon.mjs';
 import { patchNacpDefaults } from './nacp-patch.mjs';
+import { checkVideoRuntime, installVideoRuntime } from './check-video-runtime.mjs';
 
 const flags = process.argv.slice(2);
 if (flags.some((flag) => flag !== '--debug' && flag !== '--default-icon')) throw new Error('Usage: npm run build -- [--debug] [--default-icon]');
@@ -93,7 +94,8 @@ try {
   // probe) and src/forwarder.ts (writeNacpForwarderDefaults) — the main
   // app and forwarders now use the same no-profile-dialog behavior.
   const builtNroPath = join(staging, 'burialnx.nro');
-  const nroBuf = Buffer.from(readFileSync(builtNroPath));
+  const nroBuf = installVideoRuntime(readFileSync(builtNroPath));
+  console.log(await checkVideoRuntime(nroBuf));
   console.log(patchNacpDefaults(nroBuf));
   writeFileSync(builtNroPath, nroBuf);
 

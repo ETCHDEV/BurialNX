@@ -1,4 +1,6 @@
 import { assetPath, type Reader } from './library';
+import { createMovieLayer } from './video-element';
+import { createMovieResolver, createAudioResolver, type MovieResolver } from './video-source';
 import { LocalRequest } from './request';
 import { ScriptQueue } from './script-queue';
 import { viewport } from './runtime-plan';
@@ -29,7 +31,7 @@ export function resourceFetch(assets: Reader, nativeFetch: typeof fetch, log: (s
 }
 
 /** Build the minimal browser host (document, XHR, fetch, Image) RPG Maker MV needs. */
-export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s: string) => void, pngFix = false, directScreen = true, reportRequestError?: (error: Error, responseText: string) => void) {
+export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s: string) => void, pngFix = false, directScreen = true, reportRequestError?: (error: Error, responseText: string) => void, resolveMovie: MovieResolver = createMovieResolver(assets), resolveSound: MovieResolver = createAudioResolver(assets)) {
         let document: any;
         let gameCanvas: CanvasNode | undefined;
         const screenContext = screen.getContext('2d')!;
@@ -55,8 +57,10 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 textContent = '';
                 constructor(public tagName: string) { super(); }
                 appendChild(child: Node) {
+                        if (child.tagName === 'SOURCE' && child.parentNode) child.parentNode.removeChild(child);
                         child.parentNode = this;
                         this.children.push(child);
+                        if (child.tagName === 'SOURCE' && (this instanceof movies.MovieNode || this instanceof voices.MovieNode)) this.sourcesChanged();
                         if (this === document.body && child instanceof CanvasNode && child.id === 'GameCanvas') {
                                 gameCanvas = child;
                                 child.useScreen();
@@ -66,12 +70,26 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         }
                         return child;
                 }
-                removeChild(child: Node) { const index = this.children.indexOf(child); if (index >= 0) this.children.splice(index, 1); child.parentNode = null; return child; }
+                removeChild(child: Node) {
+                        const index = this.children.indexOf(child); if (index >= 0) this.children.splice(index, 1); child.parentNode = null;
+                        if (child instanceof movies.MovieNode || child instanceof voices.MovieNode) void Promise.resolve().then(() => { if (!child.parentNode) child.pause(); });
+                        return child;
+                }
                 remove() { this.parentNode?.removeChild(this); }
                 setAttribute(name: string, value: string) { this.attributes[name] = String(value); }
                 getAttribute(name: string) { return this.attributes[name] ?? null; }
                 getElementsByTagName(name: string): Node[] { const tag = name.toUpperCase(); return this.children.flatMap((node) => [node, ...node.getElementsByTagName(name)]).filter((node) => tag === '*' || node.tagName === tag); }
                 getBoundingClientRect() { return { x: 0, y: 0, left: 0, top: 0, right: screen.width, bottom: screen.height, width: screen.width, height: screen.height }; }
+        }
+        class SourceNode extends Node {
+                onerror: ((event:Event)=>void)|null = null;
+                constructor(){super('SOURCE');this.addEventListener('error',e=>this.onerror?.call(this,e));}
+                get src(){return this.getAttribute('src') || '';}
+                set src(value:string){this.setAttribute('src',String(value));}
+                get type(){return this.getAttribute('type') || '';}
+                set type(value:string){this.setAttribute('type',String(value));}
+                setAttribute(name:string,value:string){super.setAttribute(name.toLowerCase(),value);if(this.parentNode instanceof movies.MovieNode || this.parentNode instanceof voices.MovieNode)this.parentNode.sourcesChanged();}
+                removeAttribute(name:string){delete this.attributes[name.toLowerCase()];}
         }
         class CanvasNode extends Node {
                 private w = 300; private h = 150;
@@ -175,7 +193,8 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         };
                         ctx.drawImage = function(image: any, ...args: any[]) {
                                 owner.revision++;
-                                return target.drawImage(image instanceof CanvasNode ? image.surface() : image, ...args);
+                                const source = image instanceof CanvasNode ? image.surface() : image instanceof movies.MovieNode ? image.drawable() : image;
+                                if (source) return target.drawImage(source, ...args);
                         };
                         for (const key of ['clearRect', 'strokeRect', 'fillText', 'strokeText', 'putImageData', 'fill', 'stroke']) {
                                 const fn = (target as any)[key];
@@ -190,15 +209,51 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 src = ''; async = false; onload: (() => void) | null = null; onerror: ((error: unknown) => void) | null = null;
                 constructor() { super('SCRIPT'); }
         }
-        class MediaNode extends Node {
-                src = ''; paused = true; currentTime = 0; duration = 0; volume = 1; playbackRate = 1;
-                muted = false; loop = false; autoplay = false; ended = false; readyState = 4; videoWidth = 0; videoHeight = 0;
-                play() { this.paused = false; return Promise.resolve(); }
-                pause() { this.paused = true; }
-                load() { this.dispatchEvent(new Event('loadeddata')); }
-                canPlayType() { return 'probably'; }
-        }
         const head = new Node('HEAD'), body = new Node('BODY');
+        const movies = createMovieLayer(Node, resolveMovie, (globalThis as any).Video, log, () => body);
+        // Session snapshot/teardown restores the original global afterward. Capture
+        // the nx.js Audio constructor BEFORE installing the HTML-style constructor.
+        const originalAudio=(globalThis as any).Audio;
+        const nativeAudio=originalAudio && Object.prototype.hasOwnProperty.call(originalAudio,'__burialNativeAudio') ? originalAudio.__burialNativeAudio : originalAudio;
+        const voices=createMovieLayer(Node,resolveSound,nativeAudio,log,()=>body,true);
+        Object.defineProperty(voices.MovieNode,'__burialNativeAudio',{value:nativeAudio});
+        let wasMovieVisible = false;
+        // The loader and MV callbacks have independent rAF order. The last
+        // movie-clear pass can precede a *later* game/plugin canvas write.
+        // Track the pixels actually copied, not just SceneManager.renderScene.
+        let presentedCanvas: CanvasNode | undefined;
+        let presentedGameRevision = -1;
+        let beforeDirectMovie: OffscreenCanvas | undefined;
+        function paintMovie(freshGameFrame = false) {
+                const visible = movies.visible();
+                if (!visible && !wasMovieVisible) return;
+                const sw = screen.width, sh = screen.height;
+                if (!visible) {
+                        wasMovieVisible = false;
+                        if (freshGameFrame) beforeDirectMovie=undefined;
+                        if (beforeDirectMovie) {
+                                screenContext.save();
+                                try {
+                                        screenContext.setTransform(1,0,0,1,0,0); screenContext.globalAlpha=1; screenContext.globalCompositeOperation='source-over';
+                                        screenContext.drawImage(beforeDirectMovie,0,0);
+                                } finally { screenContext.restore(); beforeDirectMovie=undefined; }
+                        }
+                        return;
+                }
+                if (!wasMovieVisible && gameCanvas?.direct) {
+                        try {
+                                beforeDirectMovie=new OffscreenCanvas(sw,sh);
+                                beforeDirectMovie.getContext('2d')!.drawImage(screen,0,0);
+                        } catch { beforeDirectMovie=undefined; } // a later game render also restores direct mode
+                }
+                wasMovieVisible = true;
+                // MV centers the video element in its game viewport, not across an
+                // unrelated 16:9 display. Preserve both 4:3 game bars and movie bars.
+                const gw=gameCanvas?.width || sw, gh=gameCanvas?.height || sh;
+                const aw=fitScreen ? sw : Math.min(sw,gw), ah=fitScreen ? sh : Math.min(sh,gh);
+                const box=viewport(gw,gh,aw,ah);
+                if (box) movies.paint(screenContext,box.x+(sw-aw)/2,box.y+(sh-ah)/2,box.width,box.height);
+        }
         document = new (class extends EventTarget {
                 readyState = 'complete'; title = ''; currentScript: ScriptNode | null = null;
                 head = head; body = body; documentElement = new Node('HTML');
@@ -207,7 +262,9 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         switch (tag.toLowerCase()) {
                                 case 'canvas': return new CanvasNode();
                                 case 'script': return new ScriptNode();
-                                case 'audio': case 'video': return new MediaNode(tag.toUpperCase());
+                                case 'audio': return new voices.MovieNode();
+                                case 'video': return new movies.MovieNode();
+                                case 'source': return new SourceNode();
                                 default: return new Node(tag.toUpperCase());
                         }
                 }
@@ -235,7 +292,7 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         return request;
                 }
         }
-        Object.assign(globalThis, { document, XMLHttpRequest: XHR, HTMLElement: Node, HTMLCanvasElement: CanvasNode,
+        Object.assign(globalThis, { document, XMLHttpRequest: XHR, HTMLElement: Node, HTMLCanvasElement: CanvasNode, HTMLVideoElement: movies.MovieNode, HTMLSourceElement: SourceNode, HTMLAudioElement: voices.MovieNode, Audio: voices.MovieNode,
                 location: { href: 'game:/index.html', pathname: '/index.html', search: '', hash: '', reload() {} },
                 innerWidth: screen.width, innerHeight: screen.height, devicePixelRatio: 1 });
         for (const name of ['moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'focus', 'blur', 'close']) if (typeof (globalThis as any)[name] !== 'function') (globalThis as any)[name] = () => {};
@@ -272,8 +329,15 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                 settled() { return queue.settled(); },
                 direct() { return !!gameCanvas?.direct; },
                 toggleFit() { fitScreen = !fitScreen; return fitScreen; },
+                setMovieSuspended(value:boolean) { movies.setSuspended(value); voices.setSuspended(value); },
+                needsMoviePresent() { return wasMovieVisible || movies.visible(); },
+                hasUnpresentedGameFrame() {
+                        return !!gameCanvas && !gameCanvas.direct && (gameCanvas !== presentedCanvas || gameCanvas.revision !== presentedGameRevision);
+                },
+                paintMovie,
+                dispose() { movies.dispose(); voices.dispose(); beforeDirectMovie=undefined; wasMovieVisible=false; },
                 present() {
-                        if (!gameCanvas || gameCanvas.direct) return;
+                        if (!gameCanvas || gameCanvas.direct) { paintMovie(); return; }
                         const sw = screen.width, sh = screen.height;
                         const gw = gameCanvas.width, gh = gameCanvas.height;
                         const width = fitScreen ? sw : Math.min(sw, gw);
@@ -309,7 +373,9 @@ export function createBrowserHost(assets: Reader, filter: ScriptFilter, log: (s:
                         const prevSmooth = screenContext.imageSmoothingEnabled;
                         if (S.smoothingOff) screenContext.imageSmoothingEnabled = false;
                         screenContext.drawImage(gameCanvas.surface(), 0, 0, gw, gh, dx, dy, dw, dh);
+                        presentedCanvas = gameCanvas; presentedGameRevision = gameCanvas.revision;
                         if (S.smoothingOff) screenContext.imageSmoothingEnabled = prevSmooth;
+                        paintMovie();
                 },
         };
 }

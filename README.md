@@ -6,6 +6,16 @@ BurialNX is a Nintendo Switch homebrew application built on [nx.js](https://gith
 
 ---
 
+## Local cutscene build: 0.1.6-cg.6
+
+cg.6 preserves the cg.5 ARM64 runtime and also sends separate game audio elements through the native audio decoder. [独立配音自测](docs/separate-audio-zh.md).
+
+cg.5 keeps the movie running if the last audio sample precedes the last picture, and holds the final picture while a longer audio track finishes. Includes an original unequal-track MV event check. [片尾测试说明](docs/track-tails-zh.md).
+
+cg.4 also fixes native startup audio packet loss: decoding starts after the audio node is installed (no silence padding or seek workaround). [Native sources & reproducible build](runtime/README.md).
+
+This local fork of v0.1.6 connects MV's `GameVideo` to the pinned nx.js native video decoder and audio graph. Supports detached `<video><source>` inputs for MV's stock PixiJS 4.5.4 CanvasRenderer. The card includes standalone fullscreen and in-scene sprite checks. [Sprite verification](docs/pixi-movies-zh.md). [安装、测试与限制（中文）](docs/movie-playback-zh.md). Hardware validation is still required for a particular game/console; this is not an upstream release.
+
 ## 📸 Screenshots
 
 ### Library
@@ -122,10 +132,10 @@ Options are fully translated — Always Dash, BGM/SFX Volume, On/Off — using t
 
 ### Build
 ```bash
-git clone https://github.com/greg6821-debug/BurialNX.git
+# From this source tree (the upstream tag by itself does not include the movie fix):
 cd BurialNX
-npm install
-npm test          # 148 tests
+npm ci
+npm test          # includes target-game and movie-host regression tests
 npm run build     # → burialnx.nro
 npm run build -- --debug  # → burialnx-debug.nro
 ```

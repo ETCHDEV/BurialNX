@@ -13,6 +13,7 @@ export const realExit: ((() => void) | null) =
 
 /** Stop the running game and release audio, frame loop, image buffers, realm globals, then GC. */
 export function teardownGame() {
+        try { S.host?.dispose(); } catch (e) { log(`Movie teardown: ${String(e)}`); }
         try { S.runtime.AudioManager?.stopBgm?.(); } catch { /* best-effort */ }
         try { S.runtime.AudioManager?.stopBgs?.(); } catch { /* best-effort */ }
         try { S.runtime.AudioManager?.stopMe?.(); } catch { /* best-effort */ }

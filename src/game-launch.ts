@@ -2,6 +2,7 @@ import { S } from './state';
 import { log } from './log';
 import { setLoadingProgress, resetLoading } from './loading-screen';
 import { beginGameSession } from './game-session';
+import { createMovieResolver, createAudioResolver } from './video-source';
 import { gameAssets } from './game-assets';
 import type { Reader } from './library';
 import { scriptPlan, startGame } from './runtime-plan';
@@ -89,7 +90,9 @@ export async function launch() {
                         imageReader = assets;
                 }
                 setLoadingProgress(0.20, 'Preparing runtime host…');
-                S.host = createBrowserHost(imageReader, prepareGameScript, log, pngFix, S.directScreen, failRequest);
+                const mediaRoots=[S.selectedMod,S.selectedGame].filter((p):p is string=>!!p);
+                S.host = createBrowserHost(imageReader, prepareGameScript, log, pngFix, S.directScreen, failRequest,
+                        createMovieResolver(imageReader, mediaRoots), createAudioResolver(imageReader, mediaRoots));
                 try { installNodeCompat(S.runtime, (Switch as unknown as SwitchFs) ?? null, { gameRoot: S.selectedGame, log: __DEBUG__ ? log : undefined }); }
                 catch (compatError) { log(`node-compat install failed: ${compatError instanceof Error ? compatError.message : String(compatError)}`); }
                 const total = scripts.length;
@@ -139,7 +142,13 @@ export async function launch() {
                 setLoadingProgress(0.98, 'Starting game…');
                 if (S.runtime.Graphics?.render) {
                         const render = S.runtime.Graphics.render;
-                        S.runtime.Graphics.render = function() { const result = render.apply(this, arguments); hud(); return result; };
+                        S.runtime.Graphics.render = function() {
+                                const result = render.apply(this, arguments);
+                                // Game and host have separate rAF callbacks. Direct rendering can otherwise
+                                // overwrite the movie after host.present(), depending on callback order.
+                                if (S.host?.direct()) S.host.paintMovie(!!this._rendered);
+                                hud(); return result;
+                        };
                 }
                 if (S.runtime.Graphics?._createRenderer) {
                         const create = S.runtime.Graphics._createRenderer;
@@ -180,5 +189,5 @@ export async function launch() {
                 if (S.currentEntry) {
                         try { S.library = markPlayed((Switch as any) as unknown as LibraryAccess, S.library, S.currentEntry.id); } catch { /* non-fatal */ }
                 }
-        } catch (error) { fail(error); }
+        } catch (error) { S.host?.dispose(); fail(error); }
 }

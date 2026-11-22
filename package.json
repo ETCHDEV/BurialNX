@@ -1,6 +1,6 @@
 {
   "name": "burialnx",
-  "version": "0.1.5",
+  "version": "0.1.6-cg.6",
   "private": true,
   "description": "Independent Switch homebrew loader for TCOAAL",
   "type": "module",
@@ -8,6 +8,8 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "test": "node tools/test.mjs",
+    "test:movie:browser": "node tools/test-video-browser.mjs",
+    "test:movie:native": "node tools/test-video-native.mjs",
     "smoke": "node tools/smoke.mjs"
   },
   "nacp": {
